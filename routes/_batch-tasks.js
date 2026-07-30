@@ -271,17 +271,62 @@ function listTasks(filter = {}) {
   }));
 }
 
+export function recoverInterruptedItems(task) {
+  if (!task || task.status !== 'running') return [];
+
+  const completed = new Set(task.completed || []);
+  const failed = new Set((task.failed || [])
+    .map(item => typeof item === 'string' ? item : item?.id)
+    .filter(Boolean));
+  const interrupted = [
+    ...(Array.isArray(task.current_ids) ? task.current_ids : []),
+    task.current,
+  ].filter(Boolean);
+
+  const recovered = [];
+  const seen = new Set([...completed, ...failed]);
+  const pending = [];
+  for (const id of [...interrupted, ...(Array.isArray(task.pending) ? task.pending : [])]) {
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    pending.push(id);
+    if (interrupted.includes(id)) recovered.push(id);
+  }
+
+  task.pending = pending;
+  task.current = null;
+  task.current_ids = [];
+  return recovered;
+}
+
 function resumeAllTasks() {
   const all = readBatchTasks();
   let resumed = 0;
+  let changed = false;
+
   for (const id of all.order) {
     const task = all.tasks[id];
-    if (task && task.status === 'running' && task.pending.length > 0) {
+    if (!task || task.status !== 'running') continue;
+
+    const hadInterruptedMarkers = Boolean(task.current)
+      || (Array.isArray(task.current_ids) && task.current_ids.length > 0);
+    const recovered = recoverInterruptedItems(task);
+    if (hadInterruptedMarkers) {
+      task.updated_at = new Date().toISOString();
+      changed = true;
+    }
+    if (recovered.length > 0) {
+      moduleCtx?.log?.info?.(`[batch] 任务 ${id} 回收 ${recovered.length} 张中断图片`);
+    }
+
+    if (task.pending.length > 0) {
       moduleCtx?.log?.info?.(`[batch] 恢复任务 ${id}（剩余 ${task.pending.length} 张）`);
       startWorkerPool(id);
       resumed++;
     }
   }
+
+  if (changed) writeBatchTasks(all);
   if (resumed > 0) {
     moduleCtx?.log?.info?.(`[batch] 共恢复 ${resumed} 个任务`);
   }

@@ -148,7 +148,7 @@ async function logDecision(emotion, stickerId, ctx) {
 }
 
 // 纯标签匹配打分（不调模型）
-function scoreStickers(stickers, emotion, excludeIds, prefs) {
+export function scoreStickers(stickers, emotion, excludeIds, prefs) {
   const emoLower = (emotion || '').toLowerCase();
   return stickers
     .filter(s => !excludeIds.includes(s.id))

@@ -1,0 +1,12 @@
+{
+  "name": "hana-biaoqingbao-plugin",
+  "version": "0.19.4",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

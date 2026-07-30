@@ -30,12 +30,12 @@ function getServerInfo() {
   }
 }
 
-function passesFrequency(percent, randomValue = Math.random()) {
+export function passesFrequency(percent, randomValue = Math.random()) {
   const probability = Math.max(0, Math.min(100, Number(percent) || 0));
   return randomValue < probability / 100;
 }
 
-function getConditionalScenePercent(sceneFreq, preFreq) {
+export function getConditionalScenePercent(sceneFreq, preFreq) {
   if (preFreq <= 0 || sceneFreq <= 0) return 0;
   return Math.min(100, sceneFreq / preFreq * 100);
 }
