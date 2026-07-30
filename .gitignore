@@ -1,0 +1,17 @@
+_backups/
+*.bak
+*.log
+*.tmp
+*.zip
+.env
+.env.*
+Thumbs.db
+.DS_Store
+
+data/observer-debug.log
+data/bad-matches.json
+data/missing-categories.json
+data/blocked-agents.json
+
+stickers/*
+!stickers/.gitkeep

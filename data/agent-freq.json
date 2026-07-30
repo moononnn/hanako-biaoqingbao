@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "default_daily": 50,
+  "default_task": 20,
+  "agents": {}
+}
