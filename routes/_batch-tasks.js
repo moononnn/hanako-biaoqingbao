@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   STICKERS_DIR, DATA_DIR, META_FILE,
-  readMeta, tagImage, json as jsonResp,
+  readMeta, tagImage, json as jsonResp, atomicWriteJson,
 } from '../lib/shared.js';
 
 const BATCH_TASKS_FILE = path.join(DATA_DIR, 'batch-tasks.json');
@@ -22,11 +22,9 @@ function readBatchTasks() {
   }
 }
 
-// 原子写：先写临时文件再 rename，避免半写状态
+// v0.19.5 - 统一走 shared 的原子写（临时文件+rename），消除重复实现
 function writeBatchTasks(d) {
-  const tmp = BATCH_TASKS_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(d, null, 2), 'utf-8');
-  fs.renameSync(tmp, BATCH_TASKS_FILE);
+  atomicWriteJson(BATCH_TASKS_FILE, d);
 }
 
 function saveTask(task) {
@@ -40,6 +38,21 @@ function saveTask(task) {
     all.order = all.order.slice(0, 50);
   }
   writeBatchTasks(all);
+}
+
+// v0.19.5 - 串行写回队列：多个 worker 同时完成后各自读改写，后写会覆盖前写的更新；
+// 用 promise 链把「重新读取 → 变更 → 保存」串行化，避免丢更新
+let taskWriteChain = Promise.resolve();
+function queuedSave(taskId, mutator) {
+  taskWriteChain = taskWriteChain.then(() => {
+    const t = getTask(taskId);
+    if (!t) return;
+    mutator(t);
+    saveTask(t);
+  }).catch(e => {
+    moduleCtx?.log?.error?.(`[batch] 任务 ${taskId} 写回失败:`, e.message);
+  });
+  return taskWriteChain;
 }
 
 function migrateAppliedState() {
@@ -184,31 +197,32 @@ async function workerLoop(taskId, workerIdx) {
       result = { ok: false, error: e.message };
     }
 
-    // 写回结果（重新读，避免被其他 worker 覆盖）
-    const t = getTask(taskId);
-    if (!t || t.status !== 'running') return;
-    t.results[stickerId] = result;
-    if (result.ok) {
-      t.completed.push(stickerId);
-    } else {
-      t.failed.push({ id: stickerId, error: result.error, raw: result.raw || null });
-    }
-    // v0.15.1 - 从 current_ids 数组移除
-    if (Array.isArray(t.current_ids)) {
-      t.current_ids = t.current_ids.filter(id => id !== stickerId);
-    } else {
-      t.current = null; // 兼容旧数据
-    }
-    t.updated_at = new Date().toISOString();
-    saveTask(t);
+    // 写回结果（v0.19.5 - 走串行队列，mutator 执行前重新读最新任务，避免多 worker 覆盖彼此更新）
+    await queuedSave(taskId, (t) => {
+      if (t.status !== 'running') return; // 任务已取消/完成，不再写回
+      t.results[stickerId] = result;
+      if (result.ok) {
+        t.completed.push(stickerId);
+      } else {
+        t.failed.push({ id: stickerId, error: result.error, raw: result.raw || null });
+      }
+      // v0.15.1 - 从 current_ids 数组移除
+      if (Array.isArray(t.current_ids)) {
+        t.current_ids = t.current_ids.filter(id => id !== stickerId);
+      } else {
+        t.current = null; // 兼容旧数据
+      }
+      t.updated_at = new Date().toISOString();
+    });
 
-    // 实时推送进度
+    // 实时推送进度（写回后重新读取，拿最新计数）
+    const latest = getTask(taskId);
     emitBus('biaoqingbao:batch-task-progress', {
       taskId,
       stickerId,
-      completed: t.completed.length,
-      failed: t.failed.length,
-      total: t.total,
+      completed: latest?.completed?.length || 0,
+      failed: latest?.failed?.length || 0,
+      total: latest?.total || 0,
       result,
     });
   }
@@ -323,6 +337,21 @@ function resumeAllTasks() {
       moduleCtx?.log?.info?.(`[batch] 恢复任务 ${id}（剩余 ${task.pending.length} 张）`);
       startWorkerPool(id);
       resumed++;
+    } else {
+      // v0.19.5 - 死状态兜底：最后一张写完后没来得及标 completed 就退出的任务，直接标记完成
+      task.status = 'completed';
+      task.completed_at = new Date().toISOString();
+      task.updated_at = task.completed_at;
+      changed = true;
+      moduleCtx?.log?.info?.(`[batch] 任务 ${id} 无待处理项目，直接标记为完成`);
+      emitBus('biaoqingbao:batch-task-completed', {
+        taskId: id,
+        summary: {
+          total: task.total,
+          success: (task.completed || []).length,
+          failed: (task.failed || []).length,
+        },
+      });
     }
   }
 

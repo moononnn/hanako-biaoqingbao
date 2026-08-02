@@ -1,7 +1,7 @@
-import { copyFile, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { genId } from '../lib/shared.js';
+import { genId, atomicWriteJson } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = join(__dirname, '..', 'data', 'stickers.json');
@@ -70,7 +70,8 @@ export async function execute(input, ctx) {
   };
 
   stickers.push(entry);
-  await writeFile(metaPath, JSON.stringify(stickers, null, 2), 'utf-8');
+  // v0.19.5 - 原子写，避免崩溃留下半截图库文件
+  atomicWriteJson(metaPath, stickers);
 
   return reply({
     ok: true,

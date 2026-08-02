@@ -4,6 +4,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import {
   STICKERS_DIR, DATA_DIR, META_FILE, VISION_CFG_FILE, TEXT_CFG_FILE,
   EMBEDDING_CFG_FILE, VECTORS_FILE, PREFERENCES_FILE, DECISION_LOG_FILE,
@@ -18,7 +21,7 @@ import {
   generateEmbeddings, cosineSimilarity, readVectors, writeVectors,
   readTextConfig, writeTextConfig,
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
-  json, escapeHtml, ensureDataDir,
+  json, escapeHtml, ensureDataDir, atomicWriteJson,
 } from '../lib/shared.js';
 import { extractImagesFromZip, hasImageSignature } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
@@ -218,7 +221,7 @@ export default async function registerRoutes(app, ctx) {
               cleanedRefs += (beforeP - m.preferred_ids.length) + (beforeV - m.vetoed_ids.length);
             }
           }
-          if (cleanedRefs > 0) fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2), 'utf-8');
+          if (cleanedRefs > 0) atomicWriteJson(prefsFile, prefs);
         }
       } catch {}
       try {
@@ -227,7 +230,16 @@ export default async function registerRoutes(app, ctx) {
           const bm = JSON.parse(fs.readFileSync(bmFile, 'utf-8'));
           const before = (bm.records || []).length;
           bm.records = (bm.records || []).filter(r => r.sticker_id !== id);
-          if (bm.records.length < before) fs.writeFileSync(bmFile, JSON.stringify(bm, null, 2), 'utf-8');
+          if (bm.records.length < before) atomicWriteJson(bmFile, bm);
+        }
+      } catch {}
+      // v0.19.5 - 同步清理该图的向量，避免孤儿向量污染索引与状态页
+      try {
+        const vd = readVectors();
+        if (vd.vectors && vd.vectors[id]) {
+          delete vd.vectors[id];
+          vd.generated_at = new Date().toISOString();
+          writeVectors(vd);
         }
       } catch {}
 
@@ -563,7 +575,7 @@ export default async function registerRoutes(app, ctx) {
     const action = body.action || '';
 
     if (action === 'clear_all') {
-      fs.writeFileSync(MISSING_CATS_FILE, JSON.stringify({ categories: {} }, null, 2), 'utf-8');
+      atomicWriteJson(MISSING_CATS_FILE, { categories: {} });
       return json({ ok: true, message: '已清空所有缺图提醒' });
     }
 
@@ -572,7 +584,7 @@ export default async function registerRoutes(app, ctx) {
       if (!key) return json({ ok: false, error: '缺少 key' });
       const cats = readMissingCategories();
       delete cats[key];
-      fs.writeFileSync(MISSING_CATS_FILE, JSON.stringify({ categories: cats }, null, 2), 'utf-8');
+      atomicWriteJson(MISSING_CATS_FILE, { categories: cats });
       return json({ ok: true, message: '已清除该缺图提醒' });
     }
 
@@ -756,7 +768,10 @@ export default async function registerRoutes(app, ctx) {
 
       let mapping = user.mappings.find(m => {
         if (m.context.emotion !== emotion) return false;
-        return kwList.some(k => (m.context.keywords || []).includes(k));
+        const mKws = m.context.keywords || [];
+        // v0.19.5 - 双方都无关键词也视为匹配（之前空数组 some 恒 false，导致每次反馈都新建重复 mapping）
+        if (kwList.length === 0 && mKws.length === 0) return true;
+        return kwList.some(k => mKws.includes(k)) && mKws.some(k => kwList.includes(k));
       });
 
       if (!mapping) {
@@ -778,7 +793,7 @@ export default async function registerRoutes(app, ctx) {
       mapping.weight = Math.min(10, mapping.weight + 1);
       mapping.updated_at = new Date().toISOString();
 
-      fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2), 'utf-8');
+      atomicWriteJson(prefsFile, prefs);
       return json({ ok: true, message: '偏好已更新' });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
@@ -821,9 +836,8 @@ export default async function registerRoutes(app, ctx) {
       mapping.updated_at = new Date().toISOString();
       user.updated_at = new Date().toISOString();
 
-      // 确保目录存在并写入
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2), 'utf-8');
+      // 确保目录存在并写入（原子写，避免断电/崩溃损坏）
+      atomicWriteJson(prefsFile, prefs);
       return json({ ok: true, message: '已更新' });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
@@ -861,8 +875,7 @@ export default async function registerRoutes(app, ctx) {
         prefs.users[uid].mappings = kept;
       }
       if (cleanedPrefs > 0 || cleanedMappings > 0) {
-        if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-        fs.writeFileSync(prefsFile, JSON.stringify(prefs, null, 2), 'utf-8');
+        atomicWriteJson(prefsFile, prefs);
       }
       return json({ ok: true, cleanedReferences: cleanedPrefs, cleanedMappings, message: `已清理 ${cleanedPrefs} 条引用、${cleanedMappings} 条空映射` });
     } catch (e) {
@@ -1149,18 +1162,33 @@ export default async function registerRoutes(app, ctx) {
         const embResult = await generateEmbeddings(sticker.semantic_description);
         if (embResult.ok && embResult.data[0]) {
           const vectorsData = readVectors();
-          if (!vectorsData.vectors) vectorsData.vectors = {};
-          vectorsData.vectors[sticker_id] = embResult.data[0];
-          vectorsData.generated_at = new Date().toISOString();
-          // 确保 model/dimensions 有值
-          const embCfg = readEmbeddingConfig();
-          if (!vectorsData.model) vectorsData.model = embCfg.model;
-          if (!vectorsData.dimensions) vectorsData.dimensions = embCfg.dimensions;
-          writeVectors(vectorsData);
-          vectorOk = true;
+          // v0.19.5 - 用解析后的真实 model/dimensions（schema 字段是 modelId，不能用 embCfg.model）
+          const { model: currentModel, dimensions: currentDims } = resolveEmbeddingApi();
+          if (vectorsData.model && currentModel && vectorsData.model !== currentModel) {
+            vectorError = `向量模型已更换（${vectorsData.model} → ${currentModel}），请到「生成向量」里整体重算`;
+            ctx?.log?.warn?.('[biaoqingbao] 单条重算被跳过:', vectorError);
+          } else {
+            if (!vectorsData.vectors) vectorsData.vectors = {};
+            vectorsData.vectors[sticker_id] = embResult.data[0];
+            vectorsData.generated_at = new Date().toISOString();
+            // 确保 model/dimensions 有值
+            if (!vectorsData.model) vectorsData.model = currentModel || '';
+            if (!vectorsData.dimensions) vectorsData.dimensions = currentDims || 0;
+            writeVectors(vectorsData);
+            vectorOk = true;
+          }
         } else {
           vectorError = embResult.error;
           ctx?.log?.warn?.('[biaoqingbao] 重算向量失败:', embResult.error);
+        }
+      } else {
+        // v0.19.5 - 语义描述被清空时，删除该图旧向量，避免孤儿向量
+        const vectorsData = readVectors();
+        if (vectorsData.vectors && vectorsData.vectors[sticker_id]) {
+          delete vectorsData.vectors[sticker_id];
+          vectorsData.generated_at = new Date().toISOString();
+          writeVectors(vectorsData);
+          vectorOk = true;
         }
       }
 
@@ -1527,7 +1555,9 @@ export default async function registerRoutes(app, ctx) {
       }
 
       // 默认只处理有语义描述、但还没有当前模型向量的表情包
-      const modelChanged = Boolean(existing.model && existing.model !== model);
+      // v0.19.5 - 无 model 字段的旧库视为「未知模型」，保守起见整体重算，避免新旧模型向量混库
+      const hasVectors = Object.keys(existingVectors).length > 0;
+      const modelChanged = Boolean(existing.model && existing.model !== model) || (hasVectors && !existing.model);
       const withDesc = meta.filter(s => s.semantic_description && s.semantic_description.trim())
         .filter(s => !onlyMissing || modelChanged || !existingVectors[s.id]);
       if (withDesc.length === 0) {
@@ -1536,7 +1566,8 @@ export default async function registerRoutes(app, ctx) {
 
       // 分批调用（每批 20 条，避免单次请求太大）
       const BATCH_SIZE = 20;
-      const vectors = { ...existingVectors };
+      // v0.19.5 - 模型已更换时从空集合开始，旧模型向量不再残留，避免不同维度向量混库
+      const vectors = modelChanged ? {} : { ...existingVectors };
       let processed = 0;
       let failed = 0;
       const errors = [];
@@ -1554,8 +1585,14 @@ export default async function registerRoutes(app, ctx) {
           if (result.data[j]) {
             vectors[batch[j].id] = result.data[j];
             processed++;
+          } else {
+            failed++;
           }
         }
+      }
+      // v0.19.5 - 模型已更换且全部失败时，不写回（磁盘保持原状），提示用户重试
+      if (modelChanged && processed === 0 && Object.keys(vectors).length === 0) {
+        return json({ ok: true, data: { total: withDesc.length, processed: 0, failed: withDesc.length, errors, note: '模型已更换且本次生成全部失败，未写入任何新向量（旧库保持不变），请检查模型配置后重试' } });
       }
 
       const vectorsData = {
@@ -1614,4 +1651,90 @@ export default async function registerRoutes(app, ctx) {
   } catch (e) {
     ctx?.log?.error?.('[biaoqingbao] 批量任务路由注册失败:', e.message);
   }
+
+  // ═══ GET /api/check-update — 检查 GitHub 更新（v0.19.5 分享版）═══
+  app.get('/api/check-update', async (c) => {
+    try {
+      const manifestPath = path.join(__dirname, '..', 'manifest.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
+      const currentVersion = manifest.version || '0.1.0';
+      const REPO = 'moononnn/hanako-biaoqingbao';
+
+      // 获取最新 tag（只取一个，请求最小化）
+      const resp = await fetch(`https://api.github.com/repos/${REPO}/tags?per_page=1`, {
+        headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'biaoqingbao' },
+        signal: AbortSignal.timeout(8000),
+      });
+
+      // 优雅降级：API 不可用不报错，提示暂时不可用，但仓库地址仍给出
+      if (!resp.ok) {
+        return json({
+          ok: true, success: true, current: currentVersion, latest: null, hasUpdate: false,
+          apiDown: true, // v0.19.5 - 标记：API 挂了，前端据此显示仓库地址
+          message: 'GitHub API 暂时不可用（' + resp.status + '）',
+          repoUrl: `https://github.com/${REPO}`,
+        });
+      }
+
+      const tags = await resp.json();
+      if (!tags || !Array.isArray(tags) || tags.length === 0) {
+        return json({
+          ok: true, success: true, current: currentVersion, latest: currentVersion, hasUpdate: false,
+          message: '已是最新版本 ✨',
+          repoUrl: `https://github.com/${REPO}`,
+        });
+      }
+
+      const latestTag = tags[0].name.replace(/^v/, '');
+      const hasUpdate = compareVersions(latestTag, currentVersion) > 0;
+
+      // 有更新才拉 release 正文，失败不影响主流程
+      let releaseBody = '';
+      if (hasUpdate) {
+        try {
+          const releaseResp = await fetch(`https://api.github.com/repos/${REPO}/releases/tags/${tags[0].name}`, {
+            headers: { 'Accept': 'application/vnd.github+json', 'User-Agent': 'biaoqingbao' },
+            signal: AbortSignal.timeout(5000),
+          });
+          if (releaseResp.ok) {
+            const release = await releaseResp.json();
+            releaseBody = release.body || '';
+          }
+        } catch { /* release body 获取失败不影响主流程 */ }
+      }
+
+      return json({
+        ok: true, success: true,
+        current: currentVersion,
+        latest: latestTag,
+        hasUpdate,
+        updateUrl: hasUpdate ? `https://github.com/${REPO}/releases/tag/${tags[0].name}` : null,
+        downloadUrl: hasUpdate ? `https://github.com/${REPO}/archive/refs/tags/${tags[0].name}.zip` : null,
+        repoUrl: `https://github.com/${REPO}`,
+        releaseBody,
+        message: hasUpdate
+          ? `发现新版本 v${latestTag}！当前 v${currentVersion}`
+          : '已是最新版本 ✨',
+      });
+    } catch (e) {
+      ctx?.log?.error?.('[biaoqingbao] 检查更新失败:', e.message || e);
+      return json({
+        ok: false, success: false, error: e.message || '网络不可达',
+        repoUrl: 'https://github.com/moononnn/hanako-biaoqingbao',
+      });
+    }
+  });
+}
+
+// ─── 版本号比较（semver，兼容 2 段版本号） ───
+function compareVersions(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) {
+    const va = pa[i] || 0;
+    const vb = pb[i] || 0;
+    if (va > vb) return 1;
+    if (va < vb) return -1;
+  }
+  return 0;
 }

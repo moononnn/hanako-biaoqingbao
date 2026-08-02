@@ -1,6 +1,7 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { atomicWriteJson } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = join(__dirname, '..', 'data', 'stickers.json');
@@ -53,7 +54,8 @@ export async function execute(input, ctx) {
     sticker.description = description;
   }
 
-  await writeFile(metaPath, JSON.stringify(stickers, null, 2), 'utf-8');
+  // v0.19.5 - 原子写，避免崩溃留下半截图库文件
+  atomicWriteJson(metaPath, stickers);
 
   return reply({ ok: true, data: sticker, message: `表情包「${sticker.description}」标签已更新` });
 }

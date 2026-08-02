@@ -8,9 +8,10 @@
 //   - 负向反馈记录到 preferences.json（vetoed_ids）+ bad-matches.json（兼容）
 //   - 两种反馈都记 decision-log.json
 
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveAgentId, atomicWriteJson } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
@@ -33,8 +34,7 @@ async function loadPreferences() {
 }
 
 async function savePreferences(data) {
-  await mkdir(DATA_DIR, { recursive: true }).catch(() => {});
-  await writeFile(PREFERENCES_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  atomicWriteJson(PREFERENCES_FILE, data);
 }
 
 // ── 读写决策日志 ──
@@ -47,13 +47,12 @@ async function loadDecisionLog() {
 }
 
 async function saveDecisionLog(data) {
-  await mkdir(DATA_DIR, { recursive: true }).catch(() => {});
-  await writeFile(DECISION_LOG_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  atomicWriteJson(DECISION_LOG_FILE, data);
 }
 
-// ── 获取当前 agent ID ──
+// ── 获取当前 agent ID（v0.19.5 - 统一走 resolveAgentId，与 express 一致，避免反馈落到 unknown）──
 function getAgentId(ctx) {
-  return ctx?.agentId || ctx?.agent?.id || 'unknown';
+  return resolveAgentId(null, ctx);
 }
 
 // ── 查找或创建用户的偏好映射 ──
@@ -65,10 +64,11 @@ function ensureUserMapping(prefs, agentId, emotion, keywords) {
   const kwList = keywords || [];
   const sortedKws = [...kwList].sort();
 
-  // 找已有映射（同 emotion + 关键词重叠）
+  // 找已有映射（同 emotion + 关键词重叠；v0.19.5 - 双方都无关键词也算匹配，避免重复新建）
   let mapping = user.mappings.find(m => {
     if (m.context.emotion !== emotion) return false;
     const mKws = m.context.keywords || [];
+    if (kwList.length === 0 && mKws.length === 0) return true;
     return sortedKws.some(k => mKws.includes(k)) && mKws.some(k => sortedKws.includes(k));
   });
 
@@ -192,8 +192,7 @@ export async function execute(input, ctx) {
       });
     }
     try {
-      await mkdir(DATA_DIR, { recursive: true }).catch(() => {});
-      await writeFile(BAD_MATCHES_FILE, JSON.stringify(bmData, null, 2), 'utf-8');
+      atomicWriteJson(BAD_MATCHES_FILE, bmData);
     } catch {}
 
     // 也记到缺图统计
@@ -210,7 +209,7 @@ export async function execute(input, ctx) {
         }
         mcData.categories[key].bad_match_count = (mcData.categories[key].bad_match_count || 0) + 1;
         mcData.categories[key].last_occurrence = new Date().toISOString();
-        await writeFile(MISSING_CATS_FILE, JSON.stringify(mcData, null, 2), 'utf-8');
+        atomicWriteJson(MISSING_CATS_FILE, mcData);
       } catch {}
     }
   }

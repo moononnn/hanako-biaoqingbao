@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import {
   readTextConfig, getAgentFreqSettings, consumeAgentStickerCooldown, resolveAgentId,
+  matchRitualWord, sanitizeTag,
 } from '../lib/shared.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -100,7 +101,8 @@ function detectRitual(messages) {
                .toLowerCase().trim();
   if (!text) return null;
   for (const w of RITUAL_WORDS) {
-    if (text === w || text.includes(w)) return { word: w, text };
+    // v0.19.5 - 英文短词用词边界（matchRitualWord），避免 this/while/something 误判 hi
+    if (matchRitualWord(text, w)) return { word: w, text };
   }
   return null;
 }
@@ -218,9 +220,10 @@ export default function (pi) {
         return;
       }
 
-      const emotion = data.emotion || '';
+      // v0.19.5 - 情绪词清洗（共用 sanitizeTag，去控制字符/换行/引号）
+      const emotion = sanitizeTag(data.emotion || '', 30);
       if (!emotion) {
-        appendLog(debugLogPath, `[context] has_emotion=true 但 emotion 为空，跳过`);
+        appendLog(debugLogPath, `[context] has_emotion=true 但 emotion 为空或不合规，跳过`);
         return;
       }
 

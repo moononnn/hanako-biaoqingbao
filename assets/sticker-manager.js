@@ -1,4 +1,4 @@
-// 表情包管理页面 - 前端交互 v0.15.0
+// 表情包页面 - 前端交互 v0.15.0
 // 三视图架构：首页 / 表情包库 / 偏好设置
 // 薄荷绿主色 + 樱花粉辅色
 (function () {
@@ -462,6 +462,98 @@
     okBtn.onclick = function () { close(); onConfirm(); };
     overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
     okBtn.focus();
+  }
+
+  // ═══════════════════════════════════
+  //  检查更新（v0.19.5 分享版）
+  // ═══════════════════════════════════
+  function checkUpdate() {
+    var btn = $('btn-check-update');
+    var original = btn ? btn.textContent : '';
+    if (btn) { btn.textContent = '检查中…'; btn.disabled = true; }
+    var done = function () {
+      if (btn) { btn.textContent = original; btn.disabled = false; }
+    };
+    fetch(withAuth(API + '/api/check-update'), { signal: AbortSignal.timeout(12000) })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data || data.success === false) {
+          showUpdateResult({
+            title: '❌ 检查失败',
+            body: '<div style="font-size:13px;color:var(--text-muted);margin:10px 0;line-height:1.7">' + escHtml(data ? (data.error || '未知错误') : '无响应') + '</div>',
+            repoUrl: (data && data.repoUrl) || 'https://github.com/moononnn/hanako-biaoqingbao',
+            okText: '知道了',
+          });
+          return;
+        }
+        if (!data.hasUpdate) {
+          // v0.19.5 - API 不可用（apiDown）时弹窗展示仓库地址，让用户自己去看；真无更新才轻提示
+          if (data.apiDown) {
+            showUpdateResult({
+              title: '⚠️ 暂时检查不了',
+              body: '<div style="font-size:13px;color:var(--text-muted);margin:10px 0;line-height:1.7">' + escHtml(data.message || 'GitHub API 暂时不可用') + '，可以先去仓库看看有没有新版本。</div>',
+              repoUrl: data.repoUrl || 'https://github.com/moononnn/hanako-biaoqingbao',
+              okText: '知道了',
+            });
+            return;
+          }
+          toast(data.message || '已是最新版本 ✨');
+          return;
+        }
+        // 有更新：更新卡片
+        var bodyHtml = '<div style="font-size:13px;color:var(--text);margin:10px 0;line-height:1.7">' + escHtml(data.message) + '</div>';
+        if (data.releaseBody) {
+          var release = escHtml(data.releaseBody)
+            .replace(/^###?\s+(.+)$/gm, '<strong>$1</strong>')
+            .replace(/^[-*]\s+(.+)$/gm, '· $1')
+            .replace(/\n{2,}/g, '<br><br>')
+            .replace(/\n/g, '<br>');
+          bodyHtml += '<div style="font-size:12px;color:var(--text-muted);max-height:180px;overflow-y:auto;border:1px solid var(--border-light);border-radius:8px;padding:10px;line-height:1.7">' + release + '</div>';
+        }
+        showUpdateResult({
+          title: '🎉 发现新版本',
+          body: bodyHtml,
+          actions: '<a href="' + data.downloadUrl + '" target="_blank" class="btn" style="text-decoration:none;background:var(--primary);color:#fff;border-color:var(--primary)">⬇ 下载更新</a>'
+            + '<a href="' + data.updateUrl + '" target="_blank" class="btn" style="text-decoration:none">查看详情 →</a>',
+          repoUrl: data.repoUrl,
+          okText: '稍后再说',
+        });
+      })
+      .catch(function (e) {
+        showUpdateResult({
+          title: '❌ 网络错误',
+          body: '<div style="font-size:13px;color:var(--text-muted);margin:10px 0;line-height:1.7">' + escHtml(e.message || '请求失败') + '</div>',
+          repoUrl: 'https://github.com/moononnn/hanako-biaoqingbao',
+          okText: '知道了',
+        });
+      })
+      .finally(done);
+  }
+
+  // 更新结果弹窗（失败/有更新共用）
+  function showUpdateResult(opts) {
+    var overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.style.zIndex = '100000';
+    overlay.style.display = 'flex';
+    var repoUrl = opts.repoUrl || 'https://github.com/moononnn/hanako-biaoqingbao';
+    var html = '<div class="modal-box" style="max-width:460px;position:relative">'
+      + '<h2 style="margin-top:0;font-size:16px">' + opts.title + '</h2>'
+      + opts.body;
+    if (opts.actions) {
+      html += '<div style="display:flex;gap:8px;margin-top:12px">' + opts.actions + '</div>';
+    }
+    html += '<div style="margin-top:12px;padding-top:8px;border-top:1px solid var(--border-light);font-size:11px;color:var(--text-muted);word-break:break-all">也可复制链接手动下载：<br>'
+      + '<a href="' + repoUrl + '" target="_blank" style="color:var(--primary);word-break:break-all">' + repoUrl + '</a></div>'
+      + '<button class="btn" data-update-close style="margin-top:12px;width:100%">' + (opts.okText || '知道了') + '</button>'
+      + '</div>';
+    overlay.innerHTML = html;
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay || e.target.hasAttribute('data-update-close')) {
+        overlay.remove();
+      }
+    });
+    document.body.appendChild(overlay);
   }
 
   // ═══════════════════════════════════
@@ -971,6 +1063,24 @@
     renderPreferences();
   }
 
+  // v0.19.5 - 查这条决策日志对应的反馈状态。匹配口径：
+  // 情绪包含关系（与 collectPrefsForEmotion 一致，日志与映射的情绪词可略有出入）；
+  // 关键词不作为必需条件（反馈时往往没有关键词，空对空也要能命中）。
+  // 返回 { state: 'positive'|'negative', mappingIndex } 或 null
+  function findFeedbackFor(agent, stickerId, emotion, kws) {
+    var users = (window.__PREFERENCES__ || {}).users || {};
+    var user = users[agent];
+    if (!user || !Array.isArray(user.mappings)) return null;
+    for (var i = 0; i < user.mappings.length; i++) {
+      var m = user.mappings[i];
+      var ctx = m.context || {};
+      if (!(ctx.emotion && (emotion.includes(ctx.emotion) || ctx.emotion.includes(emotion)))) continue;
+      if ((m.preferred_ids || []).includes(stickerId)) return { state: 'positive', mappingIndex: i };
+      if ((m.vetoed_ids || []).includes(stickerId)) return { state: 'negative', mappingIndex: i };
+    }
+    return null;
+  }
+
   async function renderPreferences() {
     var prefs = window.__PREFERENCES__ || { version: 1, users: {} };
     var logs = window.__DECISION_LOG__ || { version: 1, entries: [] };
@@ -1068,9 +1178,16 @@
       else html += '<span style="flex:1;min-width:0"></span>';
       html += '<span style="color:' + decColor + ';font-size:14px;flex-shrink:0">' + decLabel + '</span>';
       if (stickerLabel && e.type !== 'user_feedback') {
+        // v0.19.5 - 根据持久化偏好判断这条的反馈状态，按钮显示选中态；点选中的按钮可取消
+        var fbState = findFeedbackFor(e.agent || '', stickerLabel, emotion, kws);
+        var posActive = fbState && fbState.state === 'positive' ? ' active' : '';
+        var negActive = fbState && fbState.state === 'negative' ? ' active' : '';
+        var posTitle = fbState && fbState.state === 'positive' ? '已标记喜欢，点这里取消' : '喜欢这张，以后多发';
+        var negTitle = fbState && fbState.state === 'negative' ? '已标记不喜欢，点这里取消' : '不喜欢这张，以后少发';
         html += '<div class="pref-feedback-group">';
-        html += '<button class="pref-feedback-btn" data-act="quick-feedback" data-fb="positive" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" title="喜欢这张，以后多发">👍</button>';
-        html += '<button class="pref-feedback-btn" data-act="quick-feedback" data-fb="negative" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" title="不喜欢这张，以后少发">👎</button>';
+        // v0.19.5 - 带上决策日志里的 agent，反馈才记到正确的助手名下（否则写入 default 桶永远读不到）
+        html += '<button class="pref-feedback-btn' + posActive + '" data-act="quick-feedback" data-fb="positive" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + posTitle + '">👍</button>';
+        html += '<button class="pref-feedback-btn' + negActive + '" data-act="quick-feedback" data-fb="negative" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + negTitle + '">👎</button>';
         html += '<button class="pref-feedback-btn pref-chat-btn" data-act="open-chat" data-sticker="' + escHtml(stickerLabel) + '" title="聊聊这张图哪里不对">💬 聊聊</button>';
         html += '</div>';
       }
@@ -1194,7 +1311,21 @@
         var stickerId = btn.getAttribute('data-sticker');
         var emotion = btn.getAttribute('data-emotion') || '';
         var kws = btn.getAttribute('data-keywords') || '';
-        callQuickFeedback({ sticker_id: stickerId, feedback_type: fb, context_emotion: emotion, context_keywords: kws });
+        // v0.19.5 - 透传决策日志的 agent，反馈落到正确助手名下（否则写入 default 桶永远读不到）
+        var agent = btn.getAttribute('data-agent') || '';
+        // v0.19.5 - 已选中的按钮再点 = 取消这条反馈
+        var fbState = findFeedbackFor(agent, stickerId, emotion, kws);
+        if (fbState && fbState.state === fb) {
+          callPrefUpdate({
+            action: 'remove_from_list',
+            agent: agent,
+            mapping_index: fbState.mappingIndex,
+            list: fb === 'positive' ? 'preferred' : 'vetoed',
+            sticker_id: stickerId,
+          });
+          return;
+        }
+        callQuickFeedback({ sticker_id: stickerId, feedback_type: fb, context_emotion: emotion, context_keywords: kws, agent: agent || undefined });
         return;
       }
 
@@ -2476,6 +2607,8 @@
     // 设置按钮
     $('btn-settings').addEventListener('click', openSettings);
     $('guide-settings-btn').addEventListener('click', openSettings);
+    // v0.19.5 - 检查更新按钮
+    $('btn-check-update').addEventListener('click', checkUpdate);
 
     // 弹窗关闭按钮（通用 data-close 属性）
     document.querySelectorAll('[data-close]').forEach(function (btn) {

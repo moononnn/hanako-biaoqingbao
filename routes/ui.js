@@ -42,7 +42,7 @@ function renderPage() {
 
   return '<!DOCTYPE html>'
     + '<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">'
-    + '<title>表情包管理</title><style>'
+    + '<title>表情包</title><style>'
     // ═══ 设计令牌：薄荷绿主色 + 樱花粉辅色 ═══
     + ':root{'
     + '--bg:#eef6f2;'
@@ -317,6 +317,10 @@ function renderPage() {
     + '.pref-feedback-btn:hover{background:var(--surface-alt);border-color:var(--primary)}'
     + '.pref-feedback-btn[data-fb=positive]:hover{background:var(--success);color:#fff;border-color:var(--success)}'
     + '.pref-feedback-btn[data-fb=negative]:hover{background:var(--danger);color:#fff;border-color:var(--danger)}'
+    // v0.19.5 - 已反馈选中态：持久显示，重启后仍在
+    + '.pref-feedback-btn.active[data-fb=positive]{background:var(--success);color:#fff;border-color:var(--success);box-shadow:0 0 0 2px rgba(93,174,142,.18)}'
+    + '.pref-feedback-btn.active[data-fb=negative]{background:var(--danger);color:#fff;border-color:var(--danger);box-shadow:0 0 0 2px rgba(219,109,102,.18)}'
+    + '.pref-feedback-btn.active{opacity:1;cursor:default}'
     + '.pref-chat-btn{font-weight:500}'
     + '.pref-chat-btn:hover{background:var(--accent-light);border-color:var(--accent);color:var(--accent)}'
     // 聊天弹窗
@@ -379,6 +383,7 @@ function renderPage() {
     + '<h1>表情包</h1>'
     + '<span class="count" id="home-count">加载中</span>'
     + '<span class="spacer"></span>'
+    + '<button class="home-text-btn" id="btn-check-update" title="检查 GitHub 上的新版本">检查更新</button>'
     + '<button class="home-text-btn" id="btn-settings" title="设置">模型设置</button>'
     + '</div>'
     + '<div class="home-main">'
@@ -719,10 +724,8 @@ export default async function registerRoutes(app, ctx) {
       background: transparent;
     }
     img {
-      max-width: 100%;
-      max-height: 100%;
-      width: auto;
-      height: auto;
+      width: 100%;
+      height: 100%;
       display: block;
       object-fit: contain;
     }

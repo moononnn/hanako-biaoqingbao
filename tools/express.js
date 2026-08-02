@@ -12,12 +12,24 @@ import {
   HANA_HOME, MIME_MAP,
   readEmbeddingConfig, resolveEmbeddingApi, generateEmbeddings,
   cosineSimilarity, readVectors, getAgentFreqSettings, markAgentStickerCooldown, resolveAgentId,
+  collectPrefsForEmotion, atomicWriteJson,
 } from '../lib/shared.js';
 
 const OUTPUT_DIR_CFG = join(dataDir, 'output-dir.json');
 
-const recentlyUsed = [];
+const recentlyUsedByAgent = new Map(); // v0.19.5 - 最近使用按助手隔离，避免不同助手互相影响去重
 const MAX_RECENT = 5;
+
+function getRecent(agentId) {
+  return recentlyUsedByAgent.get(agentId) || [];
+}
+
+function pushRecent(agentId, id) {
+  const list = getRecent(agentId);
+  list.push(id);
+  if (list.length > MAX_RECENT) list.shift();
+  recentlyUsedByAgent.set(agentId, list);
+}
 
 // v0.16.0 - 情绪词向量缓存（避免同一情绪词反复调 API）
 const emotionVectorCache = new Map();
@@ -35,28 +47,15 @@ async function readVectorsCached() {
   return readVectors();
 }
 
-// 向量检索：给已有打分加向量 bonus，并补充纯向量命中
-async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
-  const vectorsData = readVectorsCached();
-  if (!vectorsData?.vectors || Object.keys(vectorsData.vectors).length === 0) return scored;
-
-  // 获取或缓存情绪词向量
-  let emotionVec = emotionVectorCache.get(emotion);
-  if (!emotionVec) {
-    emotionVec = await generateEmbedding(emotion);
-    if (emotionVec) {
-      emotionVectorCache.set(emotion, emotionVec);
-      if (emotionVectorCache.size > EMOTION_CACHE_MAX) {
-        const firstKey = emotionVectorCache.keys().next().value;
-        emotionVectorCache.delete(firstKey);
-      }
-    }
-  }
-  if (!emotionVec) return scored;
+// v0.19.5 - 向量打分纯函数（供 execute 与单元测试复用）
+// ⚠️ 副作用契约：原地修改 scored 数组（叠加 _score、补充新项）并返回同一个数组；
+// 调用方依赖此行为，改动返回值语义前必须先改 execute。
+export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, excludeIds) {
+  if (!emotionVec || !vectorMap || Object.keys(vectorMap).length === 0) return scored;
 
   // 给已有打分的表情包加向量 bonus
   for (const sticker of scored) {
-    const vec = vectorsData.vectors[sticker.id];
+    const vec = vectorMap[sticker.id];
     if (vec) {
       sticker._score += cosineSimilarity(emotionVec, vec) * 10;
     }
@@ -66,7 +65,7 @@ async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
   const scoredIds = new Set(scored.map(s => s.id));
   for (const sticker of allStickers) {
     if (scoredIds.has(sticker.id) || excludeIds.includes(sticker.id)) continue;
-    const vec = vectorsData.vectors[sticker.id];
+    const vec = vectorMap[sticker.id];
     if (vec) {
       const sim = cosineSimilarity(emotionVec, vec);
       if (sim > 0.35) {
@@ -77,6 +76,30 @@ async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
 
   scored.sort((a, b) => b._score - a._score);
   return scored;
+}
+
+// 向量检索：给已有打分加向量 bonus，并补充纯向量命中
+async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
+  // v0.19.5 - 修复：readVectorsCached 是 async，少了 await 会导致向量通道整体静默失效
+  const vectorsData = await readVectorsCached();
+  if (!vectorsData?.vectors || Object.keys(vectorsData.vectors).length === 0) return scored;
+
+  // 获取或缓存情绪词向量（v0.19.5 - key 带模型与维度，换模型后不会命中旧缓存）
+  const cacheKey = `${emotion}|${vectorsData.model || ''}|${vectorsData.dimensions || 0}`;
+  let emotionVec = emotionVectorCache.get(cacheKey);
+  if (!emotionVec) {
+    emotionVec = await generateEmbedding(emotion);
+    if (emotionVec) {
+      emotionVectorCache.set(cacheKey, emotionVec);
+      if (emotionVectorCache.size > EMOTION_CACHE_MAX) {
+        const firstKey = emotionVectorCache.keys().next().value;
+        emotionVectorCache.delete(firstKey);
+      }
+    }
+  }
+  if (!emotionVec) return scored;
+
+  return applyVectorBonus(scored, allStickers, emotionVec, vectorsData.vectors, excludeIds);
 }
 
 function reply(obj) {
@@ -92,21 +115,16 @@ async function getOutputDir() {
   }
 }
 
-// 偏好加载（复用 express 的逻辑）
-async function loadPreferencesFor(emotion) {
+// 偏好加载（v0.19.5 - 按 agentId 隔离：优先当前助手，旧格式兼容 users.default / 根级 mappings）
+async function loadPreferencesFor(emotion, agentId) {
   try {
     const raw = await readFile(PREFERENCES_FILE, 'utf-8');
     const data = JSON.parse(raw);
-    const result = { preferred: [], vetoed: [] };
-    for (const uid in (data.users || {})) {
-      for (const m of (data.users[uid].mappings || [])) {
-        if (m.context.emotion && emotion.includes(m.context.emotion) || m.context.emotion && m.context.emotion.includes(emotion)) {
-          result.preferred = result.preferred.concat(m.preferred_ids || []);
-          result.vetoed = result.vetoed.concat(m.vetoed_ids || []);
-        }
-      }
-    }
-    return result;
+    const users = data.users || {};
+    // 优先级：当前助手 > 旧格式 default > 更老的根级 mappings（都只取一个，不合并，避免串号）
+    const target = (agentId && users[agentId]) || users.default || (Array.isArray(data.mappings) ? { mappings: data.mappings } : null);
+    if (!target) return { preferred: [], vetoed: [] };
+    return collectPrefsForEmotion(target.mappings, emotion);
   } catch {
     return { preferred: [], vetoed: [] };
   }
@@ -136,14 +154,14 @@ async function logDecision(emotion, stickerId, ctx) {
       decision: 'accepted',
       emotion,
       sticker_id: stickerId,
-      agent: ctx?.agentId || 'unknown',
+      agent: resolveAgentId(null, ctx),  // v0.19.5 - 与选图/反馈统一口径，避免写 unknown 导致前端反馈落错桶
     };
     if (sessionId) entry.session_id = sessionId;           // v0.18.0 新增：session 指针
     if (safeSessionPath) entry.session_path = safeSessionPath; // 相对 HANA_HOME 的可迁移路径
 
     data.entries.push(entry);
     if (data.entries.length > 500) data.entries = data.entries.slice(-500);
-    await writeFile(DECISION_LOG_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    atomicWriteJson(DECISION_LOG_FILE, data);
   } catch {}
 }
 
@@ -237,9 +255,9 @@ export async function execute(input, ctx) {
     return reply({ ok: false, error: '表情包库是空的，请先添加一些表情包' });
   }
 
-  // 加载偏好
-  const prefs = await loadPreferencesFor(emotion);
-  const allExclude = [...new Set([...(exclude_ids || []), ...recentlyUsed])];
+  // 加载偏好（v0.19.5 - 传入 agentId，偏好只属于当前助手）
+  const prefs = await loadPreferencesFor(emotion, agentId);
+  const allExclude = [...new Set([...(exclude_ids || []), ...getRecent(agentId)])];
 
   // 打分匹配
   const scored = scoreStickers(stickers, emotion, allExclude, prefs);
@@ -250,7 +268,9 @@ export async function execute(input, ctx) {
     scored.push(...relaxed);
   }
 
-  // v0.16.0 - 向量检索双通道：标签打分 + 语义相似度
+  // v0.19.5 - 修复：applyVectorScoring 原地修改 scored 并返回同一个引用，
+  // 若先 length=0 再 push(...vectorScored) 会把结果一起清空（vectorScored === scored），
+  // 导致永远走到 no_match。恢复原地修改语义，不回填。
   await applyVectorScoring(scored, stickers, emotion, allExclude);
 
   if (scored.length === 0) {
@@ -285,27 +305,26 @@ export async function execute(input, ctx) {
   const ext = best.file.split('.').pop().toLowerCase();
   const mime = MIME_MAP[ext] || 'image/png';
 
-  // 防重复
-  recentlyUsed.push(best.id);
-  if (recentlyUsed.length > MAX_RECENT) recentlyUsed.shift();
-
-  // 记录决策
-  await logDecision(emotion, best.id, ctx);
+  // 防重复（v0.19.5 - 按助手独立记录；发图确认后才写，见下方）
 
   ctx?.log?.info?.(`[biaoqingbao] express 选中: ${best.description} (score=${best._score})`);
 
-  // stage 发图
+  // stage 发图（v0.19.5 - await，确保拿到 mediaItem 而非 Promise）
   let mediaItem = null;
   let stageSuccess = false;
   try {
-    mediaItem = ctx.stageFile({ filePath, sessionPath: ctx.sessionPath, label: best.description });
+    mediaItem = await ctx.stageFile({ filePath, sessionPath: ctx.sessionPath, label: best.description });
     stageSuccess = true;
   } catch (e) {
     ctx?.log?.warn?.('[biaoqingbao] stageFile 失败:', e.message);
   }
 
+  // v0.19.5 - 记录移到发图确认之后：stage 成功或降级 base64 都算已发出
+  pushRecent(agentId, best.id);
+  await logDecision(emotion, best.id, ctx);
+  markAgentStickerCooldown(agentId);
+
   if (stageSuccess && mediaItem) {
-    markAgentStickerCooldown(agentId);
     return {
       content: [{ type: 'text', text: `已发送表情包「${best.description}」（匹配度 ${best._score}）` }],
       details: {
@@ -323,7 +342,6 @@ export async function execute(input, ctx) {
     };
   }
 
-  markAgentStickerCooldown(agentId);
   return reply({
     ok: true,
     data: {
