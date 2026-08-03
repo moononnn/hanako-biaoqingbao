@@ -23,6 +23,11 @@ import {
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
   json, escapeHtml, ensureDataDir, atomicWriteJson,
 } from '../lib/shared.js';
+import {
+  DIALECT_LIST,
+  readDialectConfig, writeDialectConfig, syncDialectToIshiki, reconcileDialectToIshiki,
+  appendDialectLog, readDialectLog,
+} from '../lib/dialect.js';
 import { extractImagesFromZip, hasImageSignature } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
 
@@ -1423,6 +1428,78 @@ export default async function registerRoutes(app, ctx) {
     } catch (e) {
       return json({ ok: false, error: e.message });
     }
+  });
+
+  // ════════════════════════════════════════════════════════════════
+  //  v0.20.0 方言口音（让助手说话带方言味）
+  // ════════════════════════════════════════════════════════════════
+
+  // ── GET /api/dialect - 读取方言配置 + 方言库元数据（纯读，自愈只发生在 POST 保存后）──
+  app.get('/api/dialect', (c) => {
+    const config = readDialectConfig();
+    return json({
+      ok: true,
+      data: {
+        config,
+        dialects: DIALECT_LIST.map(d => ({ id: d.id, name: d.name, tagline: d.tagline, difficulty: d.difficulty, difficultyNote: d.difficultyNote })),
+      },
+    });
+  });
+
+  // ── POST /api/dialect - 保存方言配置（整表替换，归一化 + 同步写入/移除人格文件）──
+  app.post('/api/dialect', async (c) => {
+    try {
+      const body = await c.req.json();
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return json({ ok: false, error: '配置格式不正确' }, 400);
+      }
+      if (body.agents != null && (typeof body.agents !== 'object' || Array.isArray(body.agents))) {
+        return json({ ok: false, error: '助手方言配置格式不正确' }, 400);
+      }
+      const before = readDialectConfig();
+      const saved = writeDialectConfig(body);
+      // 记录变更（时间、从啥改成啥、变更了哪些助手），供排查用
+      try {
+        const changed = [];
+        for (const [agentId, s] of Object.entries(saved.agents)) {
+          const b = before.agents[agentId];
+          if (!b || b.dialect !== s.dialect) changed.push({ agentId, from: (b && b.dialect) || '未配置', to: s.dialect });
+        }
+        for (const [agentId, b] of Object.entries(before.agents)) {
+          if (!saved.agents[agentId]) changed.push({ agentId, from: b.dialect, to: '关闭' });
+        }
+        if (changed.length > 0) appendDialectLog({ changed, config: saved });
+      } catch (e) {
+        // 日志失败不影响保存主流程
+      }
+      // 同步写入/移除各助手的 ishiki.md（用户主动开启才写，关闭即删）
+      // 传 before 作为旧配置：否则 sync 内部读到的缓存已是新配置，关闭的助手会被漏掉
+      const syncResults = syncDialectToIshiki(saved, undefined, before);
+      const failed = Object.entries(syncResults).filter(([_, r]) => r && r.ok === false);
+      // 对配置里已开启方言的助手做二次自愈：sync 失败时再补一次，仍失败才报错
+      const repaired = reconcileDialectToIshiki(saved);
+      const stillFailed = failed.filter(([id]) => !repaired.fixed.includes(id));
+      // v0.23.0：错误信息去本地路径（fs 原始报错可能带 ishiki.md 绝对路径，不进前端）
+      const cleanErr = (msg) => String(msg || '')
+        .replace(/[A-Za-z]:\\[^\s'";，。]*/g, '<path>')
+        .replace(/\\\\[^\\\s]+\\[^\s'";，。]*/g, '<path>');
+      const message = stillFailed.length
+        ? `已保存，但 ${stillFailed.map(([id]) => id).join('、')} 的人格写入失败：${stillFailed.map(([_, r]) => cleanErr(r.error)).join('；')}（重启后不生效）`
+        : '已保存。重启 Hana 后生效，建议开一个新对话框聊天（旧对话框里可能残留旧方言味道）';
+      return json({
+        ok: true,
+        message,
+        data: saved,
+        syncFailed: stillFailed.map(([id, r]) => ({ agentId: id, error: cleanErr(r.error) })),
+      });
+    } catch (e) {
+      return json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── GET /api/dialect-log - 读取方言保存日志（最近 20 条，排查用）──
+  app.get('/api/dialect-log', (c) => {
+    return json({ ok: true, data: readDialectLog(20) });
   });
 
   // ── 兼容旧版 GET /api/blocked-agents（从全局开关读取）──

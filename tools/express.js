@@ -334,7 +334,7 @@ export async function execute(input, ctx) {
           sessionId: ctx.sessionId,
           sessionRef: ctx.sessionRef,
           sessionPath: ctx.sessionPath,
-          route: `/sticker?id=${encodeURIComponent(best.id)}&label=${encodeURIComponent(best.description)}&score=${best._score}`,
+          route: `/sticker?id=${encodeURIComponent(best.id)}&label=${encodeURIComponent(best.description)}&score=${best._score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}`,
           title: best.description,
           description: '表情包配图 · biaoqingbao',
         }

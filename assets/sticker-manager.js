@@ -1147,15 +1147,10 @@
       var stickerLabel = e.sticker_id || '';
       var decLabel = '';
       var decColor = '';
+      // v0.22.0 - 去掉 ✅⏭📌 符号，只保留用户反馈方向文字
       if (e.type === 'user_feedback') {
-        decLabel = e.feedback_type === 'positive' ? '👍' : '👎';
+        decLabel = e.feedback_type === 'positive' ? '喜欢' : '不喜欢';
         decColor = e.feedback_type === 'positive' ? 'var(--success)' : 'var(--danger)';
-      } else if (e.decision === 'accepted') {
-        decLabel = '✅'; decColor = 'var(--success)';
-      } else if (e.decision === 'rejected') {
-        decLabel = '⏭'; decColor = 'var(--text-muted)';
-      } else {
-        decLabel = '📌'; decColor = 'var(--primary)';
       }
 
       html += '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;background:var(--surface-alt);border:1px solid var(--border-light);border-radius:4px;font-size:11px;min-width:0">';
@@ -1176,7 +1171,7 @@
       if (emotion) html += '<span class="tag" style="font-size:10px;flex-shrink:0">' + escHtml(emotion) + '</span>';
       if (kws) html += '<span style="color:var(--text-muted);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(kws) + '</span>';
       else html += '<span style="flex:1;min-width:0"></span>';
-      html += '<span style="color:' + decColor + ';font-size:14px;flex-shrink:0">' + decLabel + '</span>';
+      if (decLabel) html += '<span style="color:' + decColor + ';font-size:11px;font-weight:600;flex-shrink:0">' + decLabel + '</span>';
       if (stickerLabel && e.type !== 'user_feedback') {
         // v0.19.5 - 根据持久化偏好判断这条的反馈状态，按钮显示选中态；点选中的按钮可取消
         var fbState = findFeedbackFor(e.agent || '', stickerLabel, emotion, kws);
@@ -1185,10 +1180,12 @@
         var posTitle = fbState && fbState.state === 'positive' ? '已标记喜欢，点这里取消' : '喜欢这张，以后多发';
         var negTitle = fbState && fbState.state === 'negative' ? '已标记不喜欢，点这里取消' : '不喜欢这张，以后少发';
         html += '<div class="pref-feedback-group">';
+        // v0.22.0 - 删除入口（图还在时显示），放在反馈按钮最左边
+        html += '<button class="pref-feedback-btn pref-del-btn" data-act="delete-sticker" data-sticker="' + escHtml(stickerLabel) + '" title="删除这张表情包（从库中彻底删除）">删除</button>';
         // v0.19.5 - 带上决策日志里的 agent，反馈才记到正确的助手名下（否则写入 default 桶永远读不到）
-        html += '<button class="pref-feedback-btn' + posActive + '" data-act="quick-feedback" data-fb="positive" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + posTitle + '">👍</button>';
-        html += '<button class="pref-feedback-btn' + negActive + '" data-act="quick-feedback" data-fb="negative" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + negTitle + '">👎</button>';
-        html += '<button class="pref-feedback-btn pref-chat-btn" data-act="open-chat" data-sticker="' + escHtml(stickerLabel) + '" title="聊聊这张图哪里不对">💬 聊聊</button>';
+        html += '<button class="pref-feedback-btn' + posActive + '" data-act="quick-feedback" data-fb="positive" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + posTitle + '">喜欢</button>';
+        html += '<button class="pref-feedback-btn' + negActive + '" data-act="quick-feedback" data-fb="negative" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + negTitle + '">不喜欢</button>';
+        html += '<button class="pref-feedback-btn pref-chat-btn" data-act="open-chat" data-sticker="' + escHtml(stickerLabel) + '" title="和小花聊聊这张图哪里不对">和小花聊聊</button>';
         html += '</div>';
       }
       html += '</div>';
@@ -1200,14 +1197,18 @@
       html += '<strong>还没有偏好规则</strong><br>';
       html += '产生偏好的两种方式：<br>';
       html += '① 在聊天里对某张图说"这张我喜欢"或"这图不合适"<br>';
-      html += '② 点上面决策日志里的 👍 / 👎 按钮直接反馈<br>';
+      html += '② 点上面决策日志里的「喜欢 / 不喜欢」按钮直接反馈<br>';
       html += '产生偏好后，这里会出现可手动调整的卡片。';
       html += '</div>';
     }
 
     if (allMappings.length > 0) {
-      html += '<div style="font-size:12px;color:var(--text-muted);margin:14px 0 8px">已记住的偏好（' + allMappings.length + ' 条，可手动修改）</div>';
-      html += '<div style="display:flex;flex-direction:column;gap:6px">';
+      html += '<div id="pref-toggle" style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted);margin:14px 0 8px;cursor:pointer;user-select:none">'
+        + '<span id="pref-toggle-arrow" style="display:inline-block;font-size:11px">▸</span>'
+        + '<span>已记住的偏好（' + allMappings.length + ' 条）</span>'
+        + '<span style="font-size:10px;color:var(--text-light)">点开展开</span>'
+        + '</div>';
+      html += '<div id="pref-mapping-list" style="display:none;flex-direction:column;gap:6px">';
       for (var mi = 0; mi < mappingMeta.length; mi++) {
         var meta = mappingMeta[mi];
         var m = meta.mapping;
@@ -1216,40 +1217,32 @@
         var kw = (ctx.keywords || []).join(', ');
         var pref = m.preferred_ids || [];
         var veto = m.vetoed_ids || [];
-        var weight = m.weight || 1;
         html += '<div class="pref-mapping" data-agent="' + escHtml(meta.agent) + '" data-li="' + meta.localIndex + '">';
         html += '<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap">';
         if (em) html += '<span class="tag">' + escHtml(em) + '</span>';
-        if (ctx.scene) html += '<span class="tag" style="background:#f0eee6;color:#8a8a6a">🎭' + escHtml(ctx.scene) + '</span>';
         if (kw) html += '<span style="color:var(--text-muted);flex:1;min-width:100px;overflow:hidden;text-overflow:ellipsis">' + escHtml(kw) + '</span>';
         else html += '<span style="flex:1"></span>';
-        html += '<span style="font-size:10px;color:var(--text-light);display:flex;align-items:center;gap:2px;margin-right:4px">⚖';
-        html += '<button class="pref-btn pref-btn-mini" data-act="weight-dec" title="降低权重">−</button>';
-        html += '<span class="pref-weight-val" style="min-width:14px;text-align:center;font-weight:600;color:var(--primary)">' + weight + '</span>';
-        html += '<button class="pref-btn pref-btn-mini" data-act="weight-inc" title="提高权重">+</button>';
-        html += '</span>';
-        html += '<button class="pref-btn pref-btn-danger" data-act="delete-mapping" title="删除整条映射">✕</button>';
         html += '</div>';
         if (pref.length > 0) {
           html += '<div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">';
-          html += '<span style="color:var(--success);min-width:14px;font-size:11px">👍</span>';
+          html += '<span style="color:var(--success);font-size:11px;font-weight:600;flex-shrink:0">喜欢 ' + pref.length + ' 张</span>';
           for (var pi = 0; pi < pref.length; pi++) {
             html += '<span class="pref-chip">'
               + '<img class="pref-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(pref[pi])) + '" onerror="this.style.display=\'none\'" alt="">'
-              + '<span class="pref-chip-id">' + escHtml(pref[pi]) + '</span>'
               + '<button class="pref-x" data-act="remove" data-list="preferred" data-sticker="' + escHtml(pref[pi]) + '" title="从偏好中移除">×</button>'
+              + '<button class="pref-del" data-act="delete-sticker" data-sticker="' + escHtml(pref[pi]) + '" title="删除这张表情包（从库中彻底删除）">删</button>'
               + '</span>';
           }
           html += '</div>';
         }
         if (veto.length > 0) {
           html += '<div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">';
-          html += '<span style="color:var(--danger);min-width:14px;font-size:11px">👎</span>';
+          html += '<span style="color:var(--danger);font-size:11px;font-weight:600;flex-shrink:0">不喜欢 ' + veto.length + ' 张</span>';
           for (var vi = 0; vi < veto.length; vi++) {
             html += '<span class="pref-chip pref-chip-veto">'
               + '<img class="pref-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(veto[vi])) + '" onerror="this.style.display=\'none\'" alt="">'
-              + '<span class="pref-chip-id">' + escHtml(veto[vi]) + '</span>'
               + '<button class="pref-x" data-act="remove" data-list="vetoed" data-sticker="' + escHtml(veto[vi]) + '" title="从排除中移除">×</button>'
+              + '<button class="pref-del" data-act="delete-sticker" data-sticker="' + escHtml(veto[vi]) + '" title="删除这张表情包（从库中彻底删除）">删</button>'
               + '</span>';
           }
           html += '</div>';
@@ -1301,6 +1294,17 @@
     if (!container || container.__prefBound) return;
     container.__prefBound = true;
     container.addEventListener('click', function (e) {
+      var toggleHit = e.target.closest('#pref-toggle');
+      if (toggleHit) {
+        var prefList = $('pref-mapping-list');
+        var arrow = $('pref-toggle-arrow');
+        if (prefList) {
+          var showing = prefList.style.display === 'flex';
+          prefList.style.display = showing ? 'none' : 'flex';
+          if (arrow) arrow.textContent = showing ? '▸' : '▾';
+        }
+        return;
+      }
       var btn = e.target.closest('button[data-act]');
       if (!btn) return;
       var act = btn.getAttribute('data-act');
@@ -1335,21 +1339,20 @@
         return;
       }
 
+      if (act === 'delete-sticker') {
+        var delStickerId = btn.getAttribute('data-sticker');
+        customConfirm('确定要删除表情包「' + delStickerId + '」吗？\n会从图库中彻底删除这张图片，并自动清理相关的偏好记录。', function () {
+          deleteSticker(delStickerId);
+        });
+        return;
+      }
+
       if (!card) return;
       var agent = card.getAttribute('data-agent');
       var li = parseInt(card.getAttribute('data-li'), 10);
       if (!agent || isNaN(li)) return;
 
-      if (act === 'weight-inc' || act === 'weight-dec') {
-        var weightEl = card.querySelector('.pref-weight-val');
-        var currentW = parseInt(weightEl.textContent, 10) || 1;
-        var newW = act === 'weight-inc' ? Math.min(10, currentW + 1) : Math.max(0, currentW - 1);
-        callPrefUpdate({ action: 'set_weight', agent: agent, mapping_index: li, weight: newW });
-      } else if (act === 'delete-mapping') {
-        customConfirm('确定删除这条偏好映射吗？', function () {
-          callPrefUpdate({ action: 'delete_mapping', agent: agent, mapping_index: li });
-        });
-      } else if (act === 'remove') {
+      if (act === 'remove') {
         var list = btn.getAttribute('data-list');
         var stickerId3 = btn.getAttribute('data-sticker');
         callPrefUpdate({ action: 'remove_from_list', agent: agent, mapping_index: li, list: list, sticker_id: stickerId3 });
@@ -1373,6 +1376,27 @@
       }
     } catch (err) {
       toast('反馈出错: ' + err.message, true);
+    }
+  }
+
+  // v0.22.0 - 从偏好设置直接删除表情包（二次确认后调删除接口，自动清理偏好引用/向量）
+  async function deleteSticker(id) {
+    try {
+      var resp = await fetch(withAuth(API + '/api'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'delete', id: id }),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        toast(data.message || '已删除');
+        await refreshPreferences();
+        loadStickers();
+      } else {
+        toast('删除失败: ' + (data.error || ''), true);
+      }
+    } catch (err) {
+      toast('删除出错: ' + err.message, true);
     }
   }
 
@@ -1829,6 +1853,219 @@
           toast('已保存');
         }).catch(function (error) {
           markFreqDirty();
+          toast('保存失败：' + error.message, true);
+        });
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════
+  //  v0.20.0 方言口音（让助手说话带方言味）
+  // ════════════════════════════════════════════════════════════════
+  var dialectAgentsData = [];
+  var dialectConfigData = { version: 2, agents: {} };
+  var dialectMetaData = { dialects: [] };
+  var dialectDirty = false;
+  var dialectDuplicateNames = {};
+
+  function getDialectSetting(agentId) {
+    if (!dialectConfigData.agents[agentId]) {
+      dialectConfigData.agents[agentId] = { dialect: '', enabled: false };
+    }
+    return dialectConfigData.agents[agentId];
+  }
+
+  function markDialectDirty() {
+    dialectDirty = true;
+    var status = $('dialect-save-status');
+    var button = $('save-dialect-btn');
+    if (status) { status.textContent = '有未保存的更改'; status.classList.add('is-dirty'); }
+    if (button) button.disabled = false;
+  }
+
+  function markDialectSaved() {
+    dialectDirty = false;
+    var status = $('dialect-save-status');
+    var button = $('save-dialect-btn');
+    if (status) { status.textContent = '已保存'; status.classList.remove('is-dirty'); }
+    if (button) button.disabled = true;
+  }
+
+  // 方言预览句（v0.23.0 起难度提示仅新疆话保留，其余方言不带括号标注）
+  function dialectPreviewText(dialectId) {
+    var d = null;
+    for (var i = 0; i < dialectMetaData.dialects.length; i++) {
+      if (dialectMetaData.dialects[i].id === dialectId) { d = dialectMetaData.dialects[i]; break; }
+    }
+    if (!d) return '';
+    var note = d.difficultyNote ? '（模型表现：' + d.difficultyNote + '）' : '';
+    return '开启后 ta 打字会自然带点' + d.name + '味，正事闲聊都这样' + note + ' · ' + d.tagline;
+  }
+
+  // 方言 id → 名字（渲染选择器按钮标签用）
+  function dialectName(id) {
+    for (var i = 0; i < dialectMetaData.dialects.length; i++) {
+      if (dialectMetaData.dialects[i].id === id) return dialectMetaData.dialects[i].name;
+    }
+    return id;
+  }
+
+  // v0.23.0 单控件选择器：一个按钮搞定开关+选择（选方言=开，选(不选)=关）
+  function renderDialectRow(agent) {
+    var settings = getDialectSetting(agent.id);
+    var enabled = settings.dialect && settings.enabled;
+    var showId = dialectDuplicateNames[agent.name || agent.id] > 1;
+    var html = '<div class="dialect-item' + (enabled ? '' : ' is-off') + '" data-agent-row="' + escHtml(agent.id) + '">';
+    html += '<div class="dialect-head"><span class="dialect-name">' + escHtml(agent.name || agent.id) + '</span>';
+    if (showId) html += '<span class="dialect-id">' + escHtml(agent.id) + '</span>';
+    html += '<div class="dialect-picker" data-agent-id="' + escHtml(agent.id) + '">';
+    html += '<button type="button" class="dialect-picker-btn' + (enabled ? ' is-on' : '') + '" data-act="toggle-picker">';
+    html += '<span class="dialect-picker-label">' + escHtml(enabled ? dialectName(settings.dialect) : '选个方言') + '</span>';
+    html += '<span class="dialect-picker-arrow">▾</span></button>';
+    html += '<div class="dialect-picker-menu" hidden>';
+    html += '<button type="button" data-act="pick-dialect" data-value="" class="is-none' + (!enabled ? ' is-current' : '') + '">(不选)</button>';
+    for (var i = 0; i < dialectMetaData.dialects.length; i++) {
+      var d = dialectMetaData.dialects[i];
+      html += '<button type="button" data-act="pick-dialect" data-value="' + escHtml(d.id) + '"' + (settings.dialect === d.id ? ' class="is-current"' : '') + '>' + escHtml(d.name);
+      if (d.difficultyNote) html += '<span class="dialect-picker-note">' + escHtml(d.difficultyNote) + '</span>';
+      html += '</button>';
+    }
+    html += '</div></div>';
+    html += '</div>';
+    html += '<div class="dialect-preview" id="dialect-preview-' + escHtml(agent.id) + '">' + (enabled ? escHtml(dialectPreviewText(settings.dialect)) : '挑一个方言试试，味道会显示在这里') + '</div>';
+    html += '</div>';
+    return html;
+  }
+
+  function renderDialectList() {
+    var list = $('dialect-list');
+    if (!list) return;
+    if (dialectAgentsData.length === 0) {
+      list.innerHTML = '<div style="color:var(--text-muted);font-size:13px">没有找到助手</div>';
+      return;
+    }
+    var html = '';
+    for (var i = 0; i < dialectAgentsData.length; i++) html += renderDialectRow(dialectAgentsData[i]);
+    list.innerHTML = html;
+  }
+
+  function refreshDialectRow(agentId) {
+    var list = $('dialect-list');
+    if (!list) return;
+    var rows = list.querySelectorAll('[data-agent-row]');
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].getAttribute('data-agent-row') === agentId) {
+        var agent = null;
+        for (var j = 0; j < dialectAgentsData.length; j++) {
+          if (dialectAgentsData[j].id === agentId) { agent = dialectAgentsData[j]; break; }
+        }
+        if (agent) rows[i].outerHTML = renderDialectRow(agent);
+        return;
+      }
+    }
+  }
+
+  function renderDialect() {
+    var list = $('dialect-list');
+    if (!list) return;
+    list.innerHTML = '加载中...';
+
+    Promise.all([
+      fetch(withAuth(API + '/api/agents'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      fetch(withAuth(API + '/api/dialect'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+    ]).then(function (results) {
+      var agentsResult = results[0];
+      var dialectResult = results[1];
+      if (!agentsResult.ok || !Array.isArray(agentsResult.data) || !dialectResult.ok) throw new Error('加载失败');
+      dialectAgentsData = agentsResult.data;
+      dialectConfigData = dialectResult.data.config || { version: 2, agents: {} };
+      dialectMetaData = dialectResult.data;
+      dialectDuplicateNames = {};
+      for (var i = 0; i < dialectAgentsData.length; i++) {
+        var name = dialectAgentsData[i].name || dialectAgentsData[i].id;
+        dialectDuplicateNames[name] = (dialectDuplicateNames[name] || 0) + 1;
+      }
+      markDialectSaved();
+      renderDialectList();
+      bindDialectList();
+      bindDialectSave();
+    }).catch(function () {
+      list.innerHTML = '<div style="color:var(--text-muted);font-size:13px">加载失败，请稍后重试</div>';
+    });
+  }
+
+  function bindDialectList() {
+    var list = $('dialect-list');
+    if (!list || list.dataset.bound === '1') return;
+    list.dataset.bound = '1';
+    list.addEventListener('click', function (event) {
+      var pickerBtn = event.target.closest('button[data-act="toggle-picker"]');
+      if (pickerBtn) {
+        var picker = pickerBtn.closest('.dialect-picker');
+        if (!picker) return;
+        var menu = picker.querySelector('.dialect-picker-menu');
+        var wasOpen = menu && !menu.hidden;
+        closeAllDialectMenus();
+        if (!wasOpen && menu) { menu.hidden = false; picker.classList.add('open'); }
+        return;
+      }
+      var pickBtn = event.target.closest('button[data-act="pick-dialect"]');
+      if (pickBtn) {
+        var picker2 = pickBtn.closest('.dialect-picker');
+        if (!picker2) return;
+        var agentId = picker2.getAttribute('data-agent-id');
+        if (!agentId) return;
+        var settings = getDialectSetting(agentId);
+        settings.dialect = pickBtn.getAttribute('data-value') || '';
+        settings.enabled = !!settings.dialect;
+        closeAllDialectMenus();
+        markDialectDirty();
+        refreshDialectRow(agentId);
+        return;
+      }
+    });
+    // 点击选择器外部时收起所有下拉面板
+    document.addEventListener('click', function (event) {
+      if (!event.target.closest('.dialect-picker')) closeAllDialectMenus();
+    });
+  }
+
+  function closeAllDialectMenus() {
+    var list = $('dialect-list');
+    if (!list) return;
+    var menus = list.querySelectorAll('.dialect-picker-menu');
+    for (var i = 0; i < menus.length; i++) menus[i].hidden = true;
+    var pickers = list.querySelectorAll('.dialect-picker.open');
+    for (var j = 0; j < pickers.length; j++) pickers[j].classList.remove('open');
+  }
+
+  function bindDialectSave() {
+    var saveButton = $('save-dialect-btn');
+    if (!saveButton || saveButton.dataset.bound === '1') return;
+    saveButton.dataset.bound = '1';
+    saveButton.addEventListener('click', function () {
+      if (!dialectDirty) return;
+      var status = $('dialect-save-status');
+      saveButton.disabled = true;
+      if (status) { status.textContent = '正在保存…'; status.classList.remove('is-dirty'); }
+      fetch(withAuth(API + '/api/dialect'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dialectConfigData),
+        signal: AbortSignal.timeout(5000),
+      }).then(function (response) { return response.json(); })
+        .then(function (result) {
+          if (!result.ok) throw new Error(result.error || '保存失败');
+          dialectConfigData = result.data;
+          markDialectSaved();
+          if (result.syncFailed && result.syncFailed.length) {
+            var names = result.syncFailed.map(function (f) { return f.agentId; }).join('、');
+            var reason = result.syncFailed.map(function (f) { return f.error; }).join('；');
+            toast('已保存，但 ' + names + ' 的人格写入失败：' + reason + '（重启后不生效）', true);
+          } else {
+            toast(result.message || '已保存');
+          }
+        }).catch(function (error) {
+          markDialectDirty();
           toast('保存失败：' + error.message, true);
         });
     });
@@ -2588,6 +2825,7 @@
         showView(target);
         if (target === 'preferences') initPreferencesView();
         if (target === 'agent-freq') renderAgentFreq();
+        if (target === 'dialect') renderDialect();
       });
     });
 

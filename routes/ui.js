@@ -83,11 +83,14 @@ function renderPage() {
     + '.home-header .spacer{flex:1}'
     + '.icon-btn{width:38px;height:38px;border:1px solid var(--border);border-radius:50%;background:var(--surface);cursor:pointer;color:var(--text-muted);font-size:16px;display:flex;align-items:center;justify-content:center;transition:all .2s}'
     + '.icon-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
-    // v0.17.5 - 首页主体垂直居中：absolute 定位让卡片中心对齐视口中点
-    + '#view-home{position:relative;min-height:100vh;padding:0}'
+    // v0.20.1 - 首页主体改 flex 撑开：顶部提示块靠 header、5 个卡片居中、底部反馈块靠视口底
+    + '#view-home{position:relative;min-height:100vh;padding:0;display:flex;flex-direction:column}'
+    // v0.20.1 修复：CSS 优先级覆盖 #view-home 造成 .hidden 不生效——明确定义 #view-home.hidden
+    + '#view-home.hidden{display:none}'
     + '#view-home .home-header{padding:24px 24px 0;margin-bottom:0}'
-    + '#view-home .home-main{position:absolute;top:50%;left:0;right:0;transform:translateY(-50%);width:100%;max-width:1100px;margin:0 auto;padding:0 24px;box-sizing:border-box;display:flex;flex-direction:column;gap:18px}'
-    + '#view-home .card-grid{width:100%}'
+    + '#view-home .home-main{width:100%;max-width:1100px;margin:0 auto;padding:32px 24px;box-sizing:border-box;display:flex;flex-direction:column;gap:28px;flex:1}'
+    // v0.20.1 - 5 个卡片改为横排一排，宽度自适应内容后居中，不撑满全宽（用 fit-content + 固定列宽 190px）
+    + '#view-home .card-grid{display:grid;grid-template-columns:repeat(5,190px);gap:14px;width:fit-content;max-width:100%;margin-left:auto;margin-right:auto;margin-top:auto;margin-bottom:auto}'
     // v0.17.5 - 右上角「模型设置」胶囊按钮，参考「任务 (X)」的细线胶囊样式
     + '.home-text-btn{font-size:13px;padding:5px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surface);cursor:pointer;color:var(--text-muted);font-family:inherit;display:inline-flex;align-items:center;white-space:nowrap;transition:all .15s}'
     + '.home-text-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
@@ -101,10 +104,10 @@ function renderPage() {
     + '.model-guide-note{font-size:11px;color:var(--text-light);margin-top:8px;line-height:1.6}'
     + '.model-guide-btn{padding:7px 16px;border:1px solid var(--primary);border-radius:16px;background:var(--primary);color:#fff;font-size:13px;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}'
     + '.model-guide-btn:hover{background:var(--primary-dark);border-color:var(--primary-dark);transform:translateY(-1px)}'
-    + '.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:18px}'
-    + '.entry-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:28px 24px;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}'
+    + '.card-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:20px}'
+    + '.entry-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 16px;cursor:pointer;transition:all .2s;position:relative;overflow:hidden}'
     + '.entry-card:hover{border-color:var(--primary);box-shadow:var(--shadow-hover);transform:translateY(-2px)}'
-    + '.entry-card .card-icon{width:48px;height:48px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px}'
+    + '.entry-card .card-icon{width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;margin-bottom:12px}'
     + '.entry-card[data-color=mint] .card-icon{background:var(--primary-light);color:var(--primary)}'
     + '.entry-card[data-color=pink] .card-icon{background:var(--accent-light);color:var(--accent)}'
     + '.entry-card[data-color=sage] .card-icon{background:#eef0e8;color:#7a9a6a}'
@@ -190,6 +193,8 @@ function renderPage() {
     + '.pref-chip-id{font-size:10px;color:inherit}'
     + '.pref-x{border:none;background:transparent;color:inherit;font-size:14px;cursor:pointer;padding:0 2px;line-height:1;opacity:.5;font-family:inherit}'
     + '.pref-x:hover{opacity:1;color:var(--danger)}'
+    + '.pref-del{border:1px solid transparent;background:transparent;color:var(--danger);font-size:10px;cursor:pointer;padding:0 3px;line-height:1.4;border-radius:3px;opacity:.6;font-family:inherit}'
+    + '.pref-del:hover{opacity:1;background:var(--danger-light);border-color:#e6b8b0}'
     + '.pref-mapping{padding:8px 10px;background:var(--surface-alt);border:1px solid var(--border-light);border-radius:4px;font-size:11px}'
     + '.log-thumb-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;width:28px;height:28px;flex-shrink:0;vertical-align:middle}'
     + '.log-thumb{width:28px;height:28px;border-radius:3px;object-fit:cover;border:1px solid var(--border);flex-shrink:0;cursor:zoom-in;transition:transform .15s;display:block}'
@@ -221,6 +226,36 @@ function renderPage() {
     + '.freq-save-status{flex:1;font-size:12px;color:var(--text-muted)}'
     + '.freq-save-status.is-dirty{color:var(--accent);font-weight:600}'
     + '.freq-save-bar .btn{width:auto}'
+    // v0.20.0 方言口音 / v0.23.0 单控件选择器（选即开、选(不选)即关）
+    + '.dialect-desc{font-size:12px;color:var(--text-muted);line-height:1.8;margin-bottom:14px}'
+    + '.dialect-item{padding:14px;border:1px dashed var(--border);border-radius:var(--radius);background:var(--surface-alt)}'
+    + '.dialect-item.is-off{opacity:.72}'
+    + '.dialect-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}'
+    + '.dialect-name{font-size:13px;font-weight:600;color:var(--text);flex:1}'
+    + '.dialect-id{font-size:10px;color:var(--text-light);font-family:monospace}'
+    // 选择器 pill：未选为 dashed 灰，已选为实线薄荷绿
+    + '.dialect-picker{position:relative}'
+    + '.dialect-picker-btn{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border:1px dashed var(--border);border-radius:14px;background:var(--surface);color:var(--text-muted);font-size:12px;font-family:inherit;cursor:pointer;transition:all .15s;max-width:230px}'
+    + '.dialect-picker-btn:hover{border-color:var(--primary);color:var(--primary)}'
+    + '.dialect-picker-btn.is-on{border-style:solid;border-color:var(--primary);background:var(--primary-light);color:var(--primary-dark)}'
+    + '.dialect-picker-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}'
+    + '.dialect-picker-arrow{font-size:10px;opacity:.7;transition:transform .15s}'
+    + '.dialect-picker.open .dialect-picker-arrow{transform:rotate(180deg)}'
+    // 下拉面板：与整体卡片风格统一（圆角、柔和阴影、dashed hover）
+    + '.dialect-picker-menu{position:absolute;top:calc(100% + 6px);right:0;z-index:30;min-width:184px;background:var(--surface);border:1px solid var(--border);border-radius:12px;box-shadow:0 6px 24px rgba(45,58,53,.12);padding:6px;display:flex;flex-direction:column;gap:2px}'
+    + '.dialect-picker-menu button{display:flex;align-items:center;gap:10px;padding:7px 10px;border:none;border-radius:8px;background:transparent;color:var(--text);font-size:12px;font-family:inherit;cursor:pointer;text-align:left;transition:background .12s;width:100%}'
+    + '.dialect-picker-menu button:hover{background:var(--primary-light)}'
+    + '.dialect-picker-menu button.is-current{color:var(--primary-dark);font-weight:600}'
+    + '.dialect-picker-menu button.is-current::before{content:"✓ ";font-size:11px}'
+    + '.dialect-picker-menu button.is-none{color:var(--text-muted)}'
+    + '.dialect-picker-note{font-size:10px;color:var(--text-light);font-weight:400;margin-left:auto}'
+    + '.dialect-preview{font-size:11px;color:var(--text-light);margin-top:8px;line-height:1.6;font-style:italic}'
+    + '#save-dialect-btn:disabled{cursor:not-allowed}'
+    + '.dialect-save-bar{position:sticky;bottom:10px;z-index:12;display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:rgba(250,253,251,.96);box-shadow:0 -2px 12px rgba(45,58,53,.08)}'
+    + '.dialect-save-status{flex:1;font-size:12px;color:var(--text-muted)}'
+    + '.dialect-save-status.is-dirty{color:var(--accent);font-weight:600}'
+    + '.dialect-save-bar .btn{width:auto}'
+    + '.dialect-badge{display:inline-block;padding:1px 8px;border-radius:10px;background:var(--primary-light);color:var(--primary-dark);font-size:11px;font-weight:500}'
     // 按场景关闭
     
     // ═══ 弹窗 ═══
@@ -315,14 +350,16 @@ function renderPage() {
     + '.pref-feedback-group{display:flex;gap:4px;flex-shrink:0;align-items:center}'
     + '.pref-feedback-btn{padding:3px 9px;font-size:12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface);cursor:pointer;color:var(--text-muted);font-family:inherit;line-height:1.4;transition:all .15s;flex-shrink:0}'
     + '.pref-feedback-btn:hover{background:var(--surface-alt);border-color:var(--primary)}'
-    + '.pref-feedback-btn[data-fb=positive]:hover{background:var(--success);color:#fff;border-color:var(--success)}'
-    + '.pref-feedback-btn[data-fb=negative]:hover{background:var(--danger);color:#fff;border-color:var(--danger)}'
-    // v0.19.5 - 已反馈选中态：持久显示，重启后仍在
-    + '.pref-feedback-btn.active[data-fb=positive]{background:var(--success);color:#fff;border-color:var(--success);box-shadow:0 0 0 2px rgba(93,174,142,.18)}'
-    + '.pref-feedback-btn.active[data-fb=negative]{background:var(--danger);color:#fff;border-color:var(--danger);box-shadow:0 0 0 2px rgba(219,109,102,.18)}'
+    + '.pref-feedback-btn[data-fb=positive]:hover{background:#5dae8e;color:#fff;border-color:#5dae8e}'
+    + '.pref-feedback-btn[data-fb=negative]:hover{background:#e89bb0;color:#fff;border-color:#e89bb0}'
+    // v0.19.5 - 已反馈选中态：持久显示，重启后仍在（颜色与消息卡片按钮统一）
+    + '.pref-feedback-btn.active[data-fb=positive]{background:#5dae8e;color:#fff;border-color:#5dae8e;box-shadow:0 0 0 2px rgba(93,174,142,.18)}'
+    + '.pref-feedback-btn.active[data-fb=negative]{background:#e89bb0;color:#fff;border-color:#e89bb0;box-shadow:0 0 0 2px rgba(232,155,176,.18)}'
     + '.pref-feedback-btn.active{opacity:1;cursor:default}'
-    + '.pref-chat-btn{font-weight:500}'
+    + '.pref-chat-btn{font-weight:500;margin-left:10px;color:var(--accent);border-color:rgba(232,155,176,.55)}'
     + '.pref-chat-btn:hover{background:var(--accent-light);border-color:var(--accent);color:var(--accent)}'
+    + '.pref-del-btn{color:var(--danger);border-color:#e6b8b0}'
+    + '.pref-del-btn:hover{background:var(--danger);color:#fff;border-color:var(--danger)}'
     // 聊天弹窗
     + '#chat-modal .modal-box{width:920px;max-width:94vw;height:80vh;max-height:760px;padding:0;display:flex;flex-direction:column;overflow:hidden}'
     + '#chat-modal .chat-header{padding:18px 24px 14px;border-bottom:1px solid var(--border-light);display:flex;align-items:center;gap:10px;flex-shrink:0}'
@@ -367,9 +404,14 @@ function renderPage() {
     + '#chat-modal .chat-preview-actions .btn-cancel:hover{border-color:var(--text-muted)}'
     + '#chat-modal .chat-empty{flex:1;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:13px;padding:20px;text-align:center;line-height:1.6}'
     // 响应式
+    // v0.23.1：首页 5 卡一行固定 190px 总宽 1006px，窄于该宽度时溢出；
+    // 在媒体查询里用更高优先级覆盖 #view-home .card-grid，窄屏自动换行不溢出（宽屏保持 5 卡一行）
+    + '@media(max-width:1006px){'
+    + '#view-home .card-grid{grid-template-columns:repeat(auto-fill,minmax(160px,1fr));width:100%}'
+    + '.card-grid{grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}'
+    + '}'
     + '@media(max-width:640px){'
     + '.view{padding:16px}'
-    + '.card-grid{grid-template-columns:1fr}'
     + '#sticker-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}'
     + '.modal-box{width:100vw;max-width:100vw;border-radius:0}'
     + '}'
@@ -422,6 +464,12 @@ function renderPage() {
     + '<div class="card-icon">🤖</div>'
     + '<div class="card-title">助手配图频率</div>'
     + '<div class="card-meta">控制每个助手发图的频率高低</div>'
+    + '<span class="card-arrow">→</span>'
+    + '</div>'
+    + '<div class="entry-card" data-color="pink" data-goto="dialect">'
+    + '<div class="card-icon">🗣️</div>'
+    + '<div class="card-title">方言口音</div>'
+    + '<div class="card-meta">让助手说话带点家乡味</div>'
     + '<span class="card-arrow">→</span>'
     + '</div>'
     + '</div>'
@@ -500,6 +548,22 @@ function renderPage() {
     + '<div id="agent-freq-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">加载中...</div>'
     + '<div class="freq-save-bar"><span class="freq-save-status" id="agent-freq-save-status">已保存</span>'
     + '<button class="btn btn-primary" id="save-agent-freq-btn" disabled>保存设置</button></div>'
+    + '</div>'
+    + '</div>'
+
+    // ═══════════════════════════════════
+    //  视图 5：方言口音（v0.20.0 / v0.22.0 开关式）
+    // ═══════════════════════════════════
+    + '<div class="view hidden" id="view-dialect">'
+    + '<div class="sub-header">'
+    + '<button class="back-btn" data-goto="home">← 返回</button>'
+    + '<h2>方言口音</h2>'
+    + '</div>'
+    + '<div class="pref-section">'
+    + '<div class="dialect-desc">给每位助手挑个方言就行：挑上即开，选「(不选)」即关。\n开启后会在 ta 的意识栏注入一段方言设定（关闭时自动移除），打字自然带家乡味。\n任何改动都要先保存，再<strong>重启 Hana 才生效</strong>；重启后建议新开一个对话框聊天，方言味最正。</div>'
+    + '<div id="dialect-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">加载中...</div>'
+    + '<div class="dialect-save-bar"><span class="dialect-save-status" id="dialect-save-status">已保存</span>'
+    + '<button class="btn btn-primary" id="save-dialect-btn" disabled>保存设置</button></div>'
     + '</div>'
     + '</div>'
 
@@ -709,6 +773,26 @@ export default async function registerRoutes(app, ctx) {
       return c.text('sticker file read error: ' + e.message, 500);
     }
 
+    const agent = c.req.query('agent') || '';
+    const emotion = c.req.query('emotion') || '';
+
+    // v0.22.0 - 初始反馈状态：该图在 agent+emotion 偏好映射里已记过则预置
+    let initPref = '';
+    try {
+      const prefs = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'preferences.json'), 'utf-8'));
+      const users = prefs.users || {};
+      const user = users[agent] || users.default;
+      if (user && Array.isArray(user.mappings)) {
+        const m = user.mappings.find(mp => (mp.context || {}).emotion === emotion);
+        if (m) {
+          if ((m.preferred_ids || []).includes(id)) initPref = 'positive';
+          else if ((m.vetoed_ids || []).includes(id)) initPref = 'negative';
+        }
+      }
+    } catch {}
+
+    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref }).replace(/</g, '\\u003c');
+
     return c.html(`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -717,22 +801,130 @@ export default async function registerRoutes(app, ctx) {
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; }
-    body {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      background: transparent;
+    body { display: flex; flex-direction: column; gap: 8px; padding: 6px; background: transparent; }
+    .img-card {
+      flex: 1; min-height: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px; padding: 6px;
     }
-    img {
-      width: 100%;
-      height: 100%;
-      display: block;
-      object-fit: contain;
+    .img-card img { max-width: 100%; max-height: 100%; display: block; object-fit: contain; border-radius: 6px; }
+    .fb-card {
+      position: relative; margin: 0 auto;
+      display: flex; align-items: center; gap: 8px;
+      background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px;
+      padding: 5px 12px;
     }
+    .fb-btn {
+      border: 1px solid #d5e5dd; border-radius: 999px;
+      background: transparent; cursor: pointer;
+      font-size: 12px; padding: 4px 14px;
+      color: #4a9277; transition: all .15s;
+    }
+    .fb-btn:hover { background: #e6f3ed; }
+    .fb-btn.on-love { background: #5dae8e; border-color: #5dae8e; color: #fff; }
+    .fb-btn.on-love:hover { background: #5dae8e; }
+    .fb-btn.on-hate { background: #e89bb0; border-color: #e89bb0; color: #fff; }
+    .fb-btn.on-hate:hover { background: #e89bb0; }
+    .fb-toast {
+      position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
+      background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px;
+      padding: 4px 10px; font-size: 11px; color: #2d3a35;
+      opacity: 0; transition: opacity .15s; white-space: nowrap; pointer-events: none;
+    }
+    .fb-toast.show { opacity: 1; }
   </style>
 </head>
 <body>
-  <img src="${imgBase64}" alt="表情包" />
+  <div class="img-card"><img src="${imgBase64}" alt="表情包" /></div>
+  <div class="fb-card">
+    <button class="fb-btn" id="fb-pos" type="button">喜欢</button>
+    <button class="fb-btn" id="fb-neg" type="button">不喜欢</button>
+    <span class="fb-toast" id="fb-toast"></span>
+  </div>
+  <script>window.__STICKER__ = ${STICKER_CFG};</script>
+  <script>
+    (function () {
+      var cfg = window.__STICKER__;
+      var posBtn = document.getElementById('fb-pos');
+      var negBtn = document.getElementById('fb-neg');
+      var toast = document.getElementById('fb-toast');
+      var pending = false;
+      var state = cfg.init || '';
+      var toastTimer = null;
+      function showToast(msg) {
+        toast.textContent = msg;
+        toast.classList.add('show');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () { toast.classList.remove('show'); }, 1500);
+      }
+      if (state === 'positive') { posBtn.classList.add('on-love'); showToast('之前已记过：喜欢'); }
+      if (state === 'negative') { negBtn.classList.add('on-hate'); showToast('之前已记过：不喜欢'); }
+      function setState(type) {
+        state = type;
+        posBtn.classList.toggle('on-love', type === 'positive');
+        negBtn.classList.toggle('on-hate', type === 'negative');
+        showToast(type === 'positive' ? '已记下：喜欢' : '已记下：不喜欢');
+      }
+      async function sendFb(type) {
+        if (pending) return;
+        if (state === type) { showToast('这张已经记过啦'); return; }
+        pending = true;
+        try {
+          // 从当前 iframe 地址推导插件 API 前缀（页面在 /api/plugins/biaoqingbao/sticker 下）
+          var pagePath = window.location.pathname;
+          var apiBase = pagePath.substring(0, pagePath.lastIndexOf('/'));
+          var apiUrl = apiBase + '/api/preferences/correct';
+          // 透传 iframe URL 上的插件会话凭证（Hana 页面鉴权必需）
+          var authParts = [];
+          var locParams = new URLSearchParams(window.location.search);
+          ['pluginSurfaceSession', 'pluginIframeTicket'].forEach(function (k) {
+            var v = locParams.get(k);
+            if (v) authParts.push(k + '=' + encodeURIComponent(v));
+          });
+          if (authParts.length > 0) apiUrl += '?' + authParts.join('&');
+          var res = await fetch(apiUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              agent: cfg.agent,
+              sticker_id: cfg.id,
+              context_emotion: cfg.emotion,
+              context_keywords: '',
+              feedback_type: type
+            })
+          });
+          var data = await res.json();
+          if (data.ok) setState(type);
+          else showToast('没记上：' + (data.error || '出错了'));
+        } catch (e) {
+          showToast('没记上，网络开小差了');
+        }
+        pending = false;
+      }
+      posBtn.addEventListener('click', function () { sendFb('positive'); });
+      negBtn.addEventListener('click', function () { sendFb('negative'); });
+    })();
+  </script>
+  <script>
+    // v0.22.0 - 卡片高度自适应：按图片比例上报高度，消除四周大白边
+    (function () {
+      function fitCard() {
+        var img = document.querySelector('.img-card img');
+        if (!img || !img.naturalWidth) return;
+        var ratio = img.naturalHeight / img.naturalWidth;
+        var w = window.innerWidth;
+        var target = Math.round(w * ratio) + 70;
+        target = Math.min(600, Math.max(30, target));
+        window.parent.postMessage({ type: 'resize-request', payload: { height: target } }, '*');
+      }
+      var imgEl = document.querySelector('.img-card img');
+      if (imgEl) {
+        if (imgEl.complete) fitCard();
+        else imgEl.addEventListener('load', fitCard);
+      }
+      window.addEventListener('resize', fitCard);
+    })();
+  </script>
 </body>
 </html>`, 200);
   });

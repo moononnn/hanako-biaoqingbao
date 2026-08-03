@@ -12,6 +12,8 @@ data/observer-debug.log
 data/bad-matches.json
 data/missing-categories.json
 data/blocked-agents.json
+data/dialect-config.json
+data/dialect-log.json
 
 stickers/*
 !stickers/.gitkeep
