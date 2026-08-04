@@ -418,6 +418,10 @@
     var hasAny = folderFiles.length > 0 || pastedFiles.length > 0 || (fileInput && fileInput.files && fileInput.files.length > 0);
     btn.disabled = !hasAny;
     btn.title = btn.disabled ? '先选图片/文件夹/粘贴，再点导入' : '';
+    // v0.25.0 - 粘贴了图片就不可能同时导 ZIP：隐藏「导入 ZIP」只留「导入图片」；
+    // 清掉粘贴（选文件/文件夹后选为准、关闭弹窗重置）后自动恢复显示，想导 ZIP 随时可以
+    var zipBtn = $('import-zip-btn');
+    if (zipBtn) zipBtn.hidden = pastedFiles.length > 0;
   }
 
   // v0.25.2 - 关闭导入弹窗时完整重置：粘贴、文件、文件夹、ZIP、结果提示全部清空，每次打开从头来
