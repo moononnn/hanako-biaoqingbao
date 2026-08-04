@@ -26,7 +26,7 @@ import {
   removeDialectFromIshiki,
   appendDialectLog, readDialectLog,
 } from '../lib/dialect.js';
-import { extractImagesFromZip, hasImageSignature } from '../lib/zip-images.js';
+import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
 
 function nextStickerId(meta) {
@@ -114,14 +114,20 @@ export default async function registerRoutes(app, ctx) {
       const imageData = Buffer.from(imageBase64.replace(/^data:image\/[\w.+-]+;base64,/, ''), 'base64');
       if (imageData.length === 0 || imageData.length > 20 * 1024 * 1024)
         return json({ ok: false, error: '图片为空或超过 20MB' });
-      if (!hasImageSignature(imageData, ext))
-        return json({ ok: false, error: '图片内容与文件格式不符' });
+      // v0.25.0 - 格式校验：先按扩展名查签名；不符时按真实签名识别格式入库（从群/聊天软件复制的动图常被存成 .jpg，
+      // 内容其实是 GIF——识别出来按真实格式存，动图照常动；真识别不出才拒绝）
+      let realExt = ext;
+      if (!hasImageSignature(imageData, ext)) {
+        const detected = detectImageFormat(imageData);
+        if (!detected) return json({ ok: false, error: '图片内容与文件格式不符' });
+        realExt = detected;
+      }
 
       // 入库写操作进串行队列（校验在队列外，互不阻塞）
       return await enqueueUploadWrite(async () => {
         const meta = readMeta();
         const id = nextStickerId(meta);
-        const destFile = id + '.' + ext;
+        const destFile = id + '.' + realExt;
         const destPath = path.join(STICKERS_DIR, destFile);
         try {
           fs.mkdirSync(STICKERS_DIR, { recursive: true });
