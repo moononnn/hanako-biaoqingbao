@@ -11,15 +11,15 @@
 import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveAgentId, atomicWriteJson } from '../lib/shared.js';
+import { resolveAgentId, atomicWriteJson, DATA_DIR } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const DATA_DIR = join(__dirname, '..', 'data');
-const STICKERS_FILE = join(DATA_DIR, 'stickers.json');
-const BAD_MATCHES_FILE = join(DATA_DIR, 'bad-matches.json');
-const PREFERENCES_FILE = join(DATA_DIR, 'preferences.json');
-const DECISION_LOG_FILE = join(DATA_DIR, 'decision-log.json');
-const MISSING_CATS_FILE = join(DATA_DIR, 'missing-categories.json');
+const DATA_DIR_LOCAL = DATA_DIR;
+const STICKERS_FILE = join(DATA_DIR_LOCAL, 'stickers.json');
+const BAD_MATCHES_FILE = join(DATA_DIR_LOCAL, 'bad-matches.json');
+const PREFERENCES_FILE = join(DATA_DIR_LOCAL, 'preferences.json');
+const DECISION_LOG_FILE = join(DATA_DIR_LOCAL, 'decision-log.json');
+const MISSING_CATS_FILE = join(DATA_DIR_LOCAL, 'missing-categories.json');
 
 function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };

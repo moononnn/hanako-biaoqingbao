@@ -12,12 +12,10 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import {
   readTextConfig, getAgentFreqSettings, consumeAgentStickerCooldown, resolveAgentId,
-  matchRitualWord, sanitizeTag,
+  matchRitualWord, sanitizeTag, DATA_DIR, HANA_HOME,
 } from '../lib/shared.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const HANA_HOME = process.env.HANA_HOME || join(homedir(), '.hanako');
-const DATA_DIR = join(__dirname, '..', 'data');
 const SERVER_INFO = join(HANA_HOME, 'server-info.json');
 
 // readTextConfig 从 lib/shared.js 导入

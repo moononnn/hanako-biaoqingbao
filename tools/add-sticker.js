@@ -1,11 +1,11 @@
 import { copyFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { genId, atomicWriteJson, enqueueToolWrite } from '../lib/shared.js';
+import { genId, atomicWriteJson, enqueueToolWrite, META_FILE, STICKERS_DIR } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const metaPath = join(__dirname, '..', 'data', 'stickers.json');
-const stickersDir = join(__dirname, '..', 'stickers');
+const metaPath = META_FILE;
+const stickersDir = STICKERS_DIR;
 
 const ALLOWED_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
 

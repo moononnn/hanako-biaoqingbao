@@ -1,11 +1,11 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MIME_MAP } from '../lib/shared.js';
+import { MIME_MAP, META_FILE, STICKERS_DIR } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const metaPath = join(__dirname, '..', 'data', 'stickers.json');
-const stickersDir = join(__dirname, '..', 'stickers');
+const metaPath = META_FILE;
+const stickersDir = STICKERS_DIR;
 
 function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };

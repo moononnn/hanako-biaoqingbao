@@ -6,10 +6,11 @@ import {
   collectPrefsForEmotion,
   prefsScoreBonus,
   resolveAgentId,
+  META_FILE,
 } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const metaPath = join(__dirname, '..', 'data', 'stickers.json');
+const metaPath = META_FILE;
 
 // ── emotion 语义相近组（v0.10.1）──
 // 解决「express 只认 6 大类，但识图提示词输出的是具体情绪」这个设计缺口

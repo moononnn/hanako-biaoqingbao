@@ -1,10 +1,9 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteJson } from '../lib/shared.js';
+import { atomicWriteJson, META_FILE } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
-const metaPath = join(__dirname, '..', 'data', 'stickers.json');
+const metaPath = META_FILE;
 
 function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };

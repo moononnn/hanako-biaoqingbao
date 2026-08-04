@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   DATA_DIR, VISION_CFG_FILE, TEXT_CFG_FILE, EMBEDDING_CFG_FILE,
-  HANA_HOME, MODELS_JSON, MIME_MAP,
+  HANA_HOME, MODELS_JSON, MIME_MAP, STICKERS_DIR,
   readVisionConfig, getAvailableVisionModels, getAvailableTextModels,
   readTextConfig, readEmbeddingConfig, getAvailableEmbeddingModels,
   escapeHtml,
@@ -837,7 +837,7 @@ export default async function registerRoutes(app, ctx) {
     if (!id) return c.text('missing id', 400);
 
     const META_FILE = path.join(DATA_DIR, 'stickers.json');
-    const STICKERS_DIR_LOCAL = path.join(__dirname, '..', 'stickers');
+    const STICKERS_DIR_LOCAL = STICKERS_DIR;
     let meta;
     try { meta = JSON.parse(fs.readFileSync(META_FILE, 'utf-8')); } catch { meta = []; }
     const s = meta.find(x => x.id === id);
