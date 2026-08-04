@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   DIALECTS, DIALECT_LIST,
   getDialect, buildDialectPrompt, buildDialectPersona,
+  buildDialectEcho, isWorkTalk, shouldBoostRound,
   readDialectConfig, writeDialectConfig, getAgentDialectSetting,
   applyDialectToIshiki, removeDialectFromIshiki, readDialectFromIshiki,
   syncDialectToIshiki, reconcileDialectToIshiki,
@@ -168,7 +169,7 @@ test('配置：老版三档浓度自动迁移为 enabled（light/normal/heavy �
     b: { dialect: 'henan', enabled: true },
     c: { dialect: 'taiwan', enabled: true },
   });
-  assert.equal(read.version, 2);
+  assert.equal(read.version, 3);
 });
 
 test('配置：读写往返一致（新格式）', () => {
@@ -408,4 +409,128 @@ test('方言库：每种方言例句里包含标志词的味道（抽查）', ()
       assert.ok(joined.includes(w), `${id} 例句应包含「${w}」`);
     }
   }
+});
+
+// ── v0.24.0 加强版（四川话首发精修）──
+
+test('加强版文案：四川话存在、身份化、零指令词、含语气词情绪表与正事分寸', () => {
+  assert.ok(DIALECTS.sichuan.personaAdvanced, '四川话应有 personaAdvanced');
+  const advanced = buildDialectPersona('sichuan', 'on', 'advanced');
+  const normal = buildDialectPersona('sichuan', 'on');
+  assert.ok(advanced, '加强版文案不应为空');
+  assert.notEqual(advanced, normal, '加强版应与普通版不同');
+  assert.ok(advanced.length > normal.length, '加强版应比普通版更厚');
+  assert.ok(advanced.includes('土生土长的四川人'), '应为身份化断言');
+  assert.ok(advanced.includes('情绪的开关'), '应含语气词情绪表（川剧变脸式）');
+  assert.ok(advanced.includes('香腾了'), '应含程度补语示范');
+  assert.ok(advanced.includes('要得不'), '正事示例应含正反问句式');
+  assert.ok(advanced.includes('夸张的词收着用'), '应说明正事分寸（收夸张词不收方言）');
+  assert.ok(advanced.includes('方言只是你的措辞'), '应含质量声明');
+  for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
+    assert.ok(!advanced.includes(bad), `加强版不应含指令词「${bad}」`);
+  }
+});
+
+test('加强版支持范围：当前仅四川话有加强文案，其余方言 advanced 回退普通文案', () => {
+  for (const id of DIALECT_LIST.map(d => d.id)) {
+    if (id === 'sichuan') continue;
+    assert.ok(!DIALECTS[id].personaAdvanced, `${id} 暂不应有加强文案`);
+    assert.equal(buildDialectPersona(id, 'on', 'advanced'), buildDialectPersona(id, 'on'), `${id} advanced 应回退普通文案`);
+  }
+});
+
+test('配置归一化：boost 开关保留，旧 mode=advanced 迁移为 boost，非法值降级', () => {
+  useTempConfig();
+  const config = writeDialectConfig({
+    version: 2,
+    agents: {
+      a: { dialect: 'sichuan', enabled: true, mode: 'advanced' },   // 旧加强版 → 迁移为 boost
+      b: { dialect: 'sichuan', enabled: true, mode: 'normal' },      // 普通 → 无 boost
+      c: { dialect: 'dongbei', enabled: true, mode: 'advanced' },    // 无精修文案的方言也保留（动态回响）
+      d: { dialect: 'sichuan', enabled: true, mode: 'max' },         // 非法值 → 无 boost
+      e: { dialect: 'sichuan', enabled: true, boost: true },         // 新开关式直接保留
+      f: { dialect: 'sichuan', enabled: true, boost: false },        // 显式关闭 → 不写
+    },
+  });
+  assert.deepEqual(config.agents, {
+    a: { dialect: 'sichuan', enabled: true, boost: true },
+    b: { dialect: 'sichuan', enabled: true },
+    c: { dialect: 'dongbei', enabled: true, boost: true },
+    d: { dialect: 'sichuan', enabled: true },
+    e: { dialect: 'sichuan', enabled: true, boost: true },
+    f: { dialect: 'sichuan', enabled: true },
+  });
+});
+
+test('applyDialectToIshiki：mode=advanced 写入加强版文案，切回 normal 写普通文案', () => {
+  const root = makeTempAgentsRoot();
+  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'advanced');
+  const persona = readDialectFromIshiki('hanako', root);
+  assert.ok(persona.includes('情绪的开关'), '加强版应写入加强文案');
+  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'normal');
+  const persona2 = readDialectFromIshiki('hanako', root);
+  assert.ok(persona2.includes('说话本能') && !persona2.includes('情绪的开关'), '切回普通版应写普通文案');
+});
+
+test('syncDialectToIshiki：配置 boost=true 时同步写入加强版文案', () => {
+  useTempConfig();
+  const root = makeTempAgentsRoot();
+  const config = { version: 3, agents: { hanako: { dialect: 'sichuan', enabled: true, boost: true } } };
+  writeDialectConfig(config);
+  syncDialectToIshiki(config, root);
+  const persona = readDialectFromIshiki('hanako', root);
+  assert.ok(persona.includes('情绪的开关'), '应写入加强版文案');
+  assert.ok(persona.includes('土生土长的四川人'), '身份化断言应保留');
+});
+
+// ── v0.25.0 加强版开关 = 动态回响层 ──
+
+test('buildDialectEcho：身份化锚点句 + 随机例句（50% 概率），零指令词', () => {
+  const noEx = buildDialectEcho('sichuan', 0.7);
+  assert.ok(noEx.includes('你打字带着四川话味，这轮也照常。'), '应含身份化锚点句');
+  assert.ok(!noEx.includes('像「'), 'random>=0.5 不应附例句');
+
+  const withEx = buildDialectEcho('sichuan', 0.3);
+  assert.ok(withEx.includes('像「'), 'random<0.5 应附例句');
+  const ex = withEx.match(/像「(.+?)」那样/);
+  assert.ok(ex && DIALECTS.sichuan.examples.includes(ex[1]), '例句应来自该方言例句库');
+
+  for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
+    assert.ok(!noEx.includes(bad), `锚点句不应含指令词「${bad}」`);
+    assert.ok(!withEx.includes(bad), `含例句回声不应含指令词「${bad}」`);
+  }
+  assert.equal(buildDialectEcho('nope', 0.3), '', '无效方言应返回空串');
+});
+
+test('isWorkTalk：技术/工作关键词命中正事，闲聊放行', () => {
+  const work = [
+    '帮我看看这个代码 bug',
+    '插件报错了，日志贴给你',
+    '把新版本部署到服务器',
+    '这个 API 接口返回不对',
+    'git 提交冲突了怎么办',
+    '测试用例跑不过',
+    '帮我写个 npm 脚本',
+    '数据库配置改一下',
+  ];
+  for (const t of work) assert.ok(isWorkTalk(t), `「${t}」应判为正事`);
+
+  const chat = [
+    '今天天气真好呀',
+    '晚上吃啥',
+    '想你啦',
+    '哈哈哈哈笑死我了',
+    '',
+    null,
+  ];
+  for (const t of chat) assert.ok(!isWorkTalk(t), `「${t}」不应判为正事`);
+});
+
+test('shouldBoostRound：前 8 条消息必注入，之后按 40% 概率衰减', () => {
+  assert.equal(shouldBoostRound(0, 0.99), true, 'warmup 内任意随机值都注入');
+  assert.equal(shouldBoostRound(8, 0.99), true, '边界：第 8 条仍在 warmup 内');
+  assert.equal(shouldBoostRound(9, 0.3), true, 'warmup 后 random<0.4 注入');
+  assert.equal(shouldBoostRound(9, 0.9), false, 'warmup 后 random>=0.4 跳过');
+  assert.equal(shouldBoostRound(-1), false, '非法长度不注入');
+  assert.equal(shouldBoostRound(NaN), false, 'NaN 长度不注入');
 });

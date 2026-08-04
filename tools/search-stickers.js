@@ -1,6 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  PREFERENCES_FILE,
+  collectPrefsForEmotion,
+  prefsScoreBonus,
+  resolveAgentId,
+} from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = join(__dirname, '..', 'data', 'stickers.json');
@@ -64,6 +70,17 @@ export async function execute(input, ctx) {
   const scenes = scene ? scene.split(',').map(s => s.trim()).filter(Boolean) : [];
   const excludeSet = new Set(exclude_ids || []);
 
+  // v0.25.2 - 候选列表也吃偏好惩罚：vetoed/累计不喜欢的图不排前面（与 express 选图口径一致，避免「先 search 再 express」链路里不喜欢的图以最高分出现误导助手）
+  let prefs = { preferred: [], vetoed: [], dislikes: {} };
+  try {
+    const agentId = resolveAgentId(null, ctx);
+    const pRaw = await readFile(PREFERENCES_FILE, 'utf-8');
+    const pData = JSON.parse(pRaw);
+    const users = pData.users || {};
+    const target = (agentId && users[agentId]) || users.default || (Array.isArray(pData.mappings) ? { mappings: pData.mappings } : null);
+    if (target) prefs = collectPrefsForEmotion(target.mappings, emotions.join(','));
+  } catch {}
+
   const scored = stickers
     .filter(s => !excludeSet.has(s.id))
     .map(sticker => {
@@ -120,6 +137,9 @@ export async function execute(input, ctx) {
       if (emotions.length === 0 && kwList.length === 0 && scenes.length === 0) {
         score = Math.random() * 0.99;
       }
+
+      // v0.25.2 - 偏好加权：不喜欢的图降权（与 express 的 prefsScoreBonus 同一系数）
+      score += prefsScoreBonus(sticker.id, prefs);
 
       return { sticker, score, matchDetails };
     });

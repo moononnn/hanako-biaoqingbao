@@ -33,6 +33,24 @@
 
   var API = baseUrl();
 
+  // v0.25.0 - 统一 fetch 封装：所有请求默认带超时，避免慢请求挂死 UI（按钮永久禁用/loading 永转）
+  // 超时优先级：opts.timeout 显式指定 > 按 url 推断的类别超时 > 默认 15s
+  // 已有 signal 的调用（上传 60s / ZIP 120s / 检查更新 12s 等）保持原样不动
+  function apiFetch(url, opts) {
+    opts = opts || {};
+    var timeout = opts.timeout;
+    if (!timeout) {
+      if (/\/api\/(batch-auto-tag|auto-tag|auto-tag-id|sticker\/chat)/.test(url)) timeout = 90000; // 识图/聊天（模型可能思考很久）
+      else if (/\/api\/(embedding-test|generate-embeddings)/.test(url)) timeout = 60000;          // embedding 生成
+      else if (/\/api\/batch-task/.test(url)) timeout = 10000;                                      // 批量任务轮询
+      else timeout = 15000;                                                                          // 普通 API
+    }
+    var init = {};
+    for (var k in opts) if (k !== 'timeout') init[k] = opts[k];
+    if (!init.signal) init.signal = AbortSignal.timeout(timeout);
+    return fetch(url, init);
+  }
+
   // ═══════════════════════════════════
   //  DOM 工具
   // ═══════════════════════════════════
@@ -79,7 +97,43 @@
     document.querySelectorAll('.view').forEach(function (v) { v.classList.add('hidden'); });
     var view = $('view-' + name);
     if (view) view.classList.remove('hidden');
+    if (name === 'library') syncFitToggle();
     window.scrollTo(0, 0);
+  }
+
+  // v0.24.0 - 图库页：小图自适应拨动开关
+  function syncFitToggle() {
+    var t = $('sticker-fit-toggle');
+    if (!t) return;
+    var cfg = window.__DISPLAY_CONFIG__ || {};
+    var on = cfg.smallImageFit !== false;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+  async function toggleStickerFit() {
+    var t = $('sticker-fit-toggle');
+    if (!t) return;
+    var next = !t.classList.contains('on');
+    t.classList.toggle('on', next);
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/display-config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ smallImageFit: next }),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        window.__DISPLAY_CONFIG__ = data.data;
+        t.setAttribute('aria-checked', next ? 'true' : 'false');
+        toast(next ? '小图自适应已开启：小图也会放大填满' : '小图自适应已关闭：小图保持原尺寸');
+      } else {
+        t.classList.toggle('on', !next);
+        toast('保存失败: ' + (data.error || '出错了'), true);
+      }
+    } catch (e) {
+      t.classList.toggle('on', !next);
+      toast('保存出错: ' + e.message, true);
+    }
   }
 
   // ═══════════════════════════════════
@@ -95,7 +149,7 @@
     try {
       var url = withAuth(API + '/api/list');
       if (emotion) url += (url.indexOf('?') >= 0 ? '&' : '?') + 'emotion=' + encodeURIComponent(emotion);
-      var resp = await fetch(url);
+      var resp = await apiFetch(url);
       if (!resp.ok) {
         showError('加载列表失败 HTTP ' + resp.status);
         return;
@@ -211,14 +265,14 @@
     var ids = Array.from(new Set(stickerIds || [])).filter(Boolean);
     if (ids.length === 0) { toast('没有需要识图的图片', true); return null; }
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-auto-tag'), {
+      var resp = await apiFetch(withAuth(API + '/api/batch-auto-tag'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sticker_ids: ids, concurrency: Math.min(ids.length, 5) }),
       });
       var data = await resp.json();
       if (!data.ok) { toast('创建任务失败: ' + (data.error || ''), true); return null; }
-      toast(options.message || ('已加入后台任务，共 ' + ids.length + ' 张'));
+      toast(options.message || ('已创建识图任务，共 ' + ids.length + ' 张'));
       await checkBatchTasks();
       if (options.openDetail) openBatchTaskDetail(data.data.taskId);
       return data.data.taskId;
@@ -228,23 +282,71 @@
     }
   }
 
+  // v0.25.1 - 编辑器里的「AI 重新识图」改为同步：识别结果直接填进编辑表单，用户确认后保存。
   async function handleAutoTagEditor() {
     var id = $('edit-id').value;
     if (!allStickers.some(function (s) { return s.id === id; })) return;
     var btn = $('editor-autotag-btn');
     btn.disabled = true;
-    btn.textContent = '加入中...';
-    await enqueueTagTask([id], { message: '已加入后台识图任务' });
-    btn.disabled = false;
-    btn.textContent = 'AI 重新识图';
+    btn.textContent = '识别中...';
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/auto-tag-id'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: id, preview: true }),
+        signal: AbortSignal.timeout(90000),
+      });
+      var data = await resp.json();
+      if (data.ok && data.data) {
+        var sug = data.data;
+        if (sug.description) $('edit-desc').value = sug.description;
+        $('edit-emotion').value = (sug.emotion || []).join(', ');
+        $('edit-scene').value = (sug.scene || []).join(', ');
+        $('edit-keywords').value = (sug.keywords || []).join(', ');
+        toast('识别完成，标签已填进表单（点保存生效）');
+      } else {
+        toast('识图失败: ' + (data.error || ''), true);
+      }
+    } catch (e) {
+      toast('识图出错: ' + e.message, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'AI 重新识图';
+    }
   }
 
+  // v0.25.1 - 卡片上的「识图」按钮：当场识别、当场应用，不再绕后台任务。
   async function retagSticker(sticker) {
-    customConfirm('把「' + sticker.description + '」作为新任务加入后台识图？识别完成后可在后台任务里确认应用。', function () { doRetag(sticker); });
-  }
-
-  async function doRetag(sticker) {
-    await enqueueTagTask([sticker.id], { message: '已加入后台识图任务' });
+    var btn = document.querySelector('.retag-btn[data-id="' + sticker.id + '"]');
+    if (btn) { btn.disabled = true; btn.textContent = '识别中...'; }
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/auto-tag-id'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: sticker.id }),
+        signal: AbortSignal.timeout(90000),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        if (data.data) {
+          if (data.data.description) sticker.description = data.data.description;
+          if (data.data.semantic_description) sticker.semantic_description = data.data.semantic_description;
+          sticker.tags = sticker.tags || {};
+          if (Array.isArray(data.data.emotion)) sticker.tags.emotion = data.data.emotion;
+          if (Array.isArray(data.data.scene)) sticker.tags.scene = data.data.scene;
+          if (Array.isArray(data.data.keywords)) sticker.tags.keywords = data.data.keywords;
+        }
+        sticker.tagged_at = new Date().toISOString();
+        toast('识图完成，标签已应用');
+        applyFilter();
+      } else {
+        toast('识图失败: ' + (data.error || ''), true);
+      }
+    } catch (e) {
+      toast('识图出错: ' + e.message, true);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '识图'; }
+    }
   }
 
   // ═══════════════════════════════════
@@ -273,67 +375,201 @@
     result.hidden = true;
   }
 
-  async function handleUpload() {
+  // v0.25.1 - 文件夹导入：选整个文件夹，自动筛出里面的表情包图片
+  var folderFiles = [];
+  var UPLOAD_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'];
+
+  // v0.25.1 - 粘贴导入：Ctrl+V 的图片相当于选中图片（快捷单张，再粘贴会替换）
+  var pastedFiles = [];
+  var lastPasteUrl = null;
+  var pasteZoneReady = false; // 必须先点击粘贴区（步骤引导），再按 Ctrl+V
+
+  function updateUploadPickHint() {
+    var hint = $('upload-file-hint');
+    if (!hint) return;
+    var fi = $('upload-file');
+    var fileCount = (fi && fi.files ? fi.files.length : 0) + pastedFiles.length;
+    var autoTag = $('upload-auto-tag') && $('upload-auto-tag').checked;
+    if (pastedFiles.length > 0) {
+      hint.textContent = '已粘贴 1 张图片' + (autoTag ? '，导入后会自动开始 AI 识图。' : '，点「导入图片」开始。');
+    } else if (fileCount > 0) {
+      hint.textContent = '已选择 ' + fileCount + ' 张图片' + (autoTag ? '，导入后会自动开始 AI 识图。' : '，点「导入图片」开始。');
+    } else {
+      hint.textContent = '支持 PNG、JPG、GIF、WebP 和 BMP，也可以整个文件夹一起选。';
+    }
+  }
+
+  function resetPasteZone() {
+    if (lastPasteUrl) { URL.revokeObjectURL(lastPasteUrl); lastPasteUrl = null; }
+    pastedFiles = [];
+    pasteZoneReady = false;
+    var zone = $('paste-zone');
+    if (!zone) return;
+    zone.classList.remove('active');
+    zone.innerHTML = '<div class="paste-zone-title">点击这里，然后按 Ctrl+V 粘贴</div>'
+      + '<div class="paste-zone-sub">先从聊天软件（QQ 等）复制表情包，点一下这个框，再按 Ctrl+V</div>';
+  }
+
+  // v0.25.2 - 上传主按钮状态：没有可导入的图就禁用，选上就启用
+  function updateUploadBtnState() {
+    var btn = $('upload-btn');
+    if (!btn) return;
     var fileInput = $('upload-file');
-    var files = Array.from(fileInput.files || []);
-    if (!files.length) { toast('请选择图片', true); return; }
+    var hasAny = folderFiles.length > 0 || pastedFiles.length > 0 || (fileInput && fileInput.files && fileInput.files.length > 0);
+    btn.disabled = !hasAny;
+    btn.title = btn.disabled ? '先选图片/文件夹/粘贴，再点导入' : '';
+  }
+
+  // v0.25.2 - 关闭导入弹窗时完整重置：粘贴、文件、文件夹、ZIP、结果提示全部清空，每次打开从头来
+  function resetUploadForm() {
+    resetPasteZone();
+    pastedFiles = [];
+    folderFiles = [];
+    var f = $('upload-file'); if (f) f.value = '';
+    var fo = $('upload-folder'); if (fo) fo.value = '';
+    var z = $('upload-zip'); if (z) z.value = '';
+    resetFolderPick();
+    var fh = $('upload-file-hint');
+    if (fh) fh.textContent = '支持 PNG、JPG、GIF、WebP 和 BMP，也可以整个文件夹一起选。';
+    var zh = $('upload-zip-hint');
+    if (zh) zh.textContent = '选好后点「导入 ZIP」开始';
+    clearUploadResult();
+    updateUploadBtnState();
+  }
+
+  function collectFolderImages(input) {
+    var files = Array.from(input.files || []);
+    var images = [];
+    var skipped = 0;
+    for (var i = 0; i < files.length; i++) {
+      var name = files[i].name || '';
+      var ext = (name.split('.').pop() || '').toLowerCase();
+      if (UPLOAD_EXTS.indexOf(ext) >= 0) images.push(files[i]);
+      else skipped++;
+    }
+    return { images: images, skipped: skipped };
+  }
+
+  function resetFolderPick() {
+    folderFiles = [];
+    var fi = $('upload-folder');
+    if (fi) fi.value = '';
+    var hint = $('upload-folder-hint');
+    if (hint) { hint.textContent = ''; hint.hidden = true; }
+  }
+
+  // v0.25.1 - 并发上传（一次 5 张，后端有串行写队列保证安全）+「上传后自动识图」+ 文件夹导入 + 粘贴导入
+  // v0.25.0 - 上传与 ZIP 导入互斥：任一进行中另一入口禁用，避免 loading/结果提示互相覆盖
+  var uploadBusy = false;
+  var MAX_UPLOAD_COUNT = 200; // v0.25.0 - 单次导入上限，防几千张 base64 分批 POST 爆浏览器内存
+  async function handleUpload() {
+    if (uploadBusy) { toast('有导入正在进行中，稍等一下', true); return; }
+    uploadBusy = true;
+    var fileInput = $('upload-file');
+    var uploadBtn = $('upload-btn');
+    var zipBtn = $('import-zip-btn');
+    if (uploadBtn) uploadBtn.disabled = true;
+    if (zipBtn) zipBtn.disabled = true;
+    // 来源优先级：文件夹 > 粘贴（单张） > 文件多选，后选为准不混用
+    var files = folderFiles.length > 0
+      ? folderFiles
+      : pastedFiles.length > 0
+        ? pastedFiles
+        : Array.from(fileInput.files || []);
+    if (!files.length) { uploadBusy = false; if (zipBtn) zipBtn.disabled = false; toast('请选择图片或粘贴图片', true); return; }
+    // v0.25.0 - 数量上限：超过截断并提示，防几千张全量 base64 分批 POST 爆浏览器内存
+    if (files.length > MAX_UPLOAD_COUNT) {
+      toast('一次最多导入 ' + MAX_UPLOAD_COUNT + ' 张，已截取前 ' + MAX_UPLOAD_COUNT + ' 张（建议分次或打包 ZIP）', true);
+      files = files.slice(0, MAX_UPLOAD_COUNT);
+    }
 
     var fields = { emotion: '', scene: '', keywords: '', description: '' };
     var success = 0;
     var failed = [];
+    var newIds = [];
+    var autoTagEl = $('upload-auto-tag');
+    var autoTag = autoTagEl ? autoTagEl.checked : false;
     clearUploadResult();
     showLoading('正在上传 0/' + files.length + '...');
 
+    var CONCURRENCY = 5;
+    var done = 0;
     try {
-      for (var i = 0; i < files.length; i++) {
-        showLoading('正在上传 ' + (i + 1) + '/' + files.length + '...');
+      async function uploadOne(file) {
         try {
-          var base64 = await readFileAsDataUrl(files[i]);
-          var resp = await fetch(withAuth(API + '/api'), {
+          var base64 = await readFileAsDataUrl(file);
+          var resp = await apiFetch(withAuth(API + '/api'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(Object.assign({
               action: 'upload',
               imageBase64: base64,
-              fileName: files[i].name,
+              fileName: file.name,
             }, fields)),
             signal: AbortSignal.timeout(60000),
           });
           var data = await resp.json();
           if (!data.ok) throw new Error(data.error || '未知错误');
+          if (data.data && data.data.id) newIds.push(data.data.id);
           success++;
         } catch (error) {
-          failed.push(files[i].name + '：' + error.message);
+          failed.push(file.name + '：' + error.message);
+        } finally {
+          done++;
+          showLoading('正在上传 ' + done + '/' + files.length + '...');
         }
+      }
+      for (var i = 0; i < files.length; i += CONCURRENCY) {
+        var batch = files.slice(i, i + CONCURRENCY);
+        await Promise.all(batch.map(uploadOne));
       }
 
       fileInput.value = '';
-      $('upload-file-hint').textContent = '支持 PNG、JPG、GIF、WebP 和 BMP。';
+      pastedFiles = [];
+      $('upload-file-hint').textContent = '支持 PNG、JPG、GIF、WebP 和 BMP，也可以整个文件夹一起选。';
+      resetFolderPick();
+      resetPasteZone();
       if (success > 0) loadStickers();
       if (failed.length) {
         showUploadResult(['导入完成：成功 ' + success + ' 张，失败 ' + failed.length + ' 张。', '', '失败详情：'].concat(failed));
         toast('有 ' + failed.length + ' 张导入失败，详情已留在弹窗里', true);
       } else {
         toast('成功导入 ' + success + ' 张图片');
-        closeModal('upload-modal');
+      }
+      if (success > 0) closeModal('upload-modal');
+
+      // 上传后自动识图：新图直接进识图任务，弹进度窗
+      if (autoTag && newIds.length > 0) {
+        if (!failed.length) closeModal('upload-modal');
+        await enqueueTagTask(newIds, { message: '已创建识图任务，共 ' + newIds.length + ' 张', openDetail: true });
       }
     } finally {
       hideLoading();
+      uploadBusy = false;
+      var zipBtn2 = $('import-zip-btn');
+      if (zipBtn2) zipBtn2.disabled = false;
+      updateUploadBtnState();
     }
   }
 
   async function handleImportZip() {
+    if (uploadBusy) { toast('有导入正在进行中，稍等一下', true); return; }
+    uploadBusy = true;
     var input = $('upload-zip');
     var file = input.files && input.files[0];
-    if (!file) { toast('请选择 ZIP 文件', true); return; }
-    if (file.size > 50 * 1024 * 1024) { toast('ZIP 文件不能超过 50MB', true); return; }
+    if (!file) { uploadBusy = false; toast('请选择 ZIP 文件', true); return; }
+    if (file.size > 50 * 1024 * 1024) { uploadBusy = false; toast('ZIP 文件不能超过 50MB', true); return; }
 
     clearUploadResult();
     showLoading('正在读取 ZIP...');
+    var zipBtn = $('import-zip-btn');
+    if (zipBtn) zipBtn.disabled = true;
+    var uploadBtn2 = $('upload-btn');
+    if (uploadBtn2) uploadBtn2.disabled = true;
     try {
       var zipBase64 = await readFileAsDataUrl(file);
       showLoading('正在导入 ZIP...');
-      var resp = await fetch(withAuth(API + '/api'), {
+      var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'import_zip', zipBase64: zipBase64, fileName: file.name }),
@@ -342,7 +578,10 @@
       var data = await resp.json();
       if (!data.ok) throw new Error(data.error || 'ZIP 导入失败');
       input.value = '';
+      var zipHint = $('upload-zip-hint');
+      if (zipHint) zipHint.textContent = '选好后点「导入 ZIP」开始';
       loadStickers();
+      var importedIds = (data.data && data.data.importedIds) || [];
       var skippedItems = data.data && data.data.skippedItems ? data.data.skippedItems : [];
       if (skippedItems.length) {
         var details = skippedItems.map(function (item) { return item.file + '：' + item.reason; });
@@ -352,10 +591,19 @@
         toast(data.message || 'ZIP 导入完成');
         closeModal('upload-modal');
       }
+      // v0.25.1 - 勾选「上传后自动识图」时，ZIP 导入的新图也自动进识图任务
+      var autoTagEl = $('upload-auto-tag');
+      if (autoTagEl && autoTagEl.checked && importedIds.length > 0) {
+        closeModal('upload-modal');
+        await enqueueTagTask(importedIds, { message: '已创建识图任务，共 ' + importedIds.length + ' 张', openDetail: true });
+      }
     } catch (error) {
       toast('ZIP 导入失败：' + error.message, true);
     } finally {
       hideLoading();
+      uploadBusy = false;
+      if (zipBtn) zipBtn.disabled = false;
+      updateUploadBtnState();
     }
   }
 
@@ -370,6 +618,8 @@
   function closeModal(id) {
     var modal = $(id);
     if (modal) { modal.hidden = true; modal.style.display = ''; }
+    // v0.25.2 - 关闭导入弹窗时完整重置：粘贴、文件、文件夹、ZIP、结果提示全部清空，每次打开从头来
+    if (id === 'upload-modal') resetUploadForm();
   }
 
   // ═══════════════════════════════════
@@ -389,7 +639,7 @@
   async function saveEdit() {
     var id = $('edit-id').value;
     try {
-      var resp = await fetch(withAuth(API + '/api'), {
+      var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -420,7 +670,7 @@
   async function deleteSticker(id) {
     customConfirm('确定要删除这个表情包吗？此操作不可撤销。', async function () {
       try {
-        var resp = await fetch(withAuth(API + '/api'), {
+        var resp = await apiFetch(withAuth(API + '/api'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ action: 'delete', id: id }),
@@ -474,7 +724,7 @@
     var done = function () {
       if (btn) { btn.textContent = original; btn.disabled = false; }
     };
-    fetch(withAuth(API + '/api/check-update'), { signal: AbortSignal.timeout(12000) })
+    apiFetch(withAuth(API + '/api/check-update'), { signal: AbortSignal.timeout(12000) })
       .then(function (r) { return r.json(); })
       .then(function (data) {
         if (!data || data.success === false) {
@@ -582,9 +832,7 @@
     var embeddingConfig = window.__EMBEDDING_CONFIG__ || {};
     var visionReady = hasConfiguredModel(visionConfig);
     var textReady = textConfig.enabled !== false && hasConfiguredModel(textConfig);
-    var embeddingModel = embeddingConfig.source === 'custom' ? embeddingConfig.customModel : embeddingConfig.modelId;
-    var embeddingReady = hasConfiguredModel(embeddingConfig)
-      && String(embeddingModel || '').toLowerCase() === 'baai/bge-m3';
+    var embeddingReady = hasConfiguredModel(embeddingConfig);
     setGuideState('guide-vision', '识图模型', visionReady);
     if (textConfig.enabled === false) {
       var textEl = $('guide-text');
@@ -600,8 +848,8 @@
     var note = $('model-guide-note');
     if (note) {
       var vectorNote = embeddingReady
-        ? 'BGE-M3 已接入，上传并完成识图后即可生成图库语义索引。'
-        : '向量检索建议配置 BAAI/bge-m3；更换模型后需要重新生成图库语义索引。';
+        ? '向量检索已接入，上传并完成识图后即可生成图库语义索引。'
+        : '向量检索需要配置 embedding 模型（建议 BAAI/bge-m3）；更换模型后需要重新生成图库语义索引。';
       note.textContent = '识图负责自动打标签，内容分析负责聊天时自动配图。' + vectorNote;
     }
   }
@@ -798,7 +1046,7 @@
     var btn = $('embedding-index-btn');
     if (!btn) return;
     try {
-      var resp = await fetch(withAuth(API + '/api/vector-status'));
+      var resp = await apiFetch(withAuth(API + '/api/vector-status'));
       var data = await resp.json();
       if (!data.ok) return;
       var d = data.data || {};
@@ -824,7 +1072,7 @@
     btn.disabled = true;
     btn.textContent = '索引中...';
     try {
-      var resp = await fetch(withAuth(API + '/api/generate-embeddings'), {
+      var resp = await apiFetch(withAuth(API + '/api/generate-embeddings'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ onlyMissing: true }),
@@ -869,7 +1117,7 @@
         source: 'hana',
         providerId: providerId,
         modelId: modelId,
-        dimensions: 1024,
+        dimensions: window.__EMBEDDING_TEST_DIM__ || 1024,
         customBaseUrl: '',
         customApiKey: '',
         customModel: '',
@@ -891,7 +1139,7 @@
   async function saveEmbeddingConfig() {
     var cfg = buildEmbeddingConfigFromForm();
     try {
-      var resp = await fetch(withAuth(API + '/api/embedding-config'), {
+      var resp = await apiFetch(withAuth(API + '/api/embedding-config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg),
@@ -915,7 +1163,7 @@
     btn.disabled = true;
     var cfg = buildEmbeddingConfigFromForm();
     try {
-      var resp = await fetch(withAuth(API + '/api/embedding-test'), {
+      var resp = await apiFetch(withAuth(API + '/api/embedding-test'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg),
@@ -925,6 +1173,10 @@
         var d = data.data;
         statusEl.textContent = '✅ ' + d.model + ' · ' + d.dimensions + ' 维';
         statusEl.style.color = 'var(--success)';
+        window.__EMBEDDING_TEST_DIM__ = d.dimensions;
+        if (cfg.source === 'custom' && d.dimensions && !cfg.customDimensions) {
+          $('embedding-custom-dimensions').value = d.dimensions;
+        }
       } else {
         statusEl.textContent = '❌ ' + (data.error || '连接失败');
         statusEl.style.color = 'var(--danger)';
@@ -954,7 +1206,7 @@
 
     try {
       // 保存识图
-      var resp1 = await fetch(withAuth(API + '/api/vision-config'), {
+      var resp1 = await apiFetch(withAuth(API + '/api/vision-config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(vCfg),
@@ -962,7 +1214,7 @@
       var data1 = await resp1.json();
 
       // 保存分析
-      var resp2 = await fetch(withAuth(API + '/api/text-config'), {
+      var resp2 = await apiFetch(withAuth(API + '/api/text-config'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(tCfg),
@@ -972,7 +1224,7 @@
       // v0.16.0 - 保存 Embedding 配置
       var embOk = await saveEmbeddingConfig();
 
-      // v0.18.3 - 三个都要成功才算保存成功，否则报错且不关弹窗
+      // v0.18.3 - 全部成功才算保存成功，否则报错且不关弹窗
       if (data1.ok && data2.ok && embOk) {
         visionConfig = vCfg;
         if (vCfg.customApiKey === '********') {
@@ -1003,7 +1255,7 @@
     statusEl.style.color = 'var(--text-muted)';
     var cfg = buildTextConfigFromForm();
     try {
-      var resp = await fetch(withAuth(API + '/api/text-test'), {
+      var resp = await apiFetch(withAuth(API + '/api/text-test'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg),
@@ -1037,7 +1289,7 @@
       customModel: source === 'custom' ? $('vision-custom-model').value : '',
     };
     try {
-      var resp = await fetch(withAuth(API + '/api/vision-test'), {
+      var resp = await apiFetch(withAuth(API + '/api/vision-test'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg),
@@ -1077,6 +1329,10 @@
       if (!(ctx.emotion && (emotion.includes(ctx.emotion) || ctx.emotion.includes(emotion)))) continue;
       if ((m.preferred_ids || []).includes(stickerId)) return { state: 'positive', mappingIndex: i };
       if ((m.vetoed_ids || []).includes(stickerId)) return { state: 'negative', mappingIndex: i };
+      // v0.25.0 - 不喜欢累计次数也算 negative 态（取消时走 dislikes 移除）
+      if (((m.dislike_counts || {})[stickerId] || 0) > 0) {
+        return { state: 'negative', mappingIndex: i, viaDislike: true };
+      }
     }
     return null;
   }
@@ -1088,7 +1344,7 @@
 
     if (!allStickers || allStickers.length === 0) {
       try {
-        var r = await fetch(withAuth(API + '/api/list'));
+        var r = await apiFetch(withAuth(API + '/api/list'));
         var d = await r.json();
         if (d.ok) allStickers = d.data || [];
       } catch (e) {}
@@ -1247,6 +1503,24 @@
           }
           html += '</div>';
         }
+        // v0.25.0 - 累计不喜欢次数的图（不在硬拉黑列表里）单独显示，带 ×N 次数标记
+        var dislikeEntries = Object.entries(m.dislike_counts || {})
+          .filter(function (kv) { return kv[1] > 0 && !veto.includes(kv[0]) && !pref.includes(kv[0]); });
+        if (dislikeEntries.length > 0) {
+          html += '<div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">';
+          html += '<span style="color:var(--danger);font-size:11px;font-weight:600;flex-shrink:0">不喜欢累计 ' + dislikeEntries.length + ' 张</span>';
+          for (var di = 0; di < dislikeEntries.length; di++) {
+            var did = dislikeEntries[di][0];
+            var dcount = dislikeEntries[di][1];
+            html += '<span class="pref-chip pref-chip-veto">'
+              + '<img class="pref-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(did)) + '" onerror="this.style.display=\'none\'" alt="">'
+              + '<span style="font-size:10px;color:var(--danger);font-weight:600" title="已累计不喜欢 ' + dcount + ' 次">×' + dcount + '</span>'
+              + '<button class="pref-x" data-act="remove" data-list="dislikes" data-sticker="' + escHtml(did) + '" title="清除不喜欢次数">×</button>'
+              + '<button class="pref-del" data-act="delete-sticker" data-sticker="' + escHtml(did) + '" title="删除这张表情包（从库中彻底删除）">删</button>'
+              + '</span>';
+          }
+          html += '</div>';
+        }
         html += '</div>';
       }
       html += '</div>';
@@ -1257,9 +1531,9 @@
     
   }
 
-  async function callPrefUpdate(body) {
+  async function callPrefUpdate(body, onFail) {
     try {
-      var resp = await fetch(withAuth(API + '/api/preferences/update'), {
+      var resp = await apiFetch(withAuth(API + '/api/preferences/update'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -1269,16 +1543,18 @@
         await refreshPreferences();
         toast('已更新');
       } else {
+        if (onFail) onFail();
         toast('更新失败: ' + (data.error || ''), true);
       }
     } catch (err) {
+      if (onFail) onFail();
       toast('更新出错: ' + err.message, true);
     }
   }
 
   async function refreshPreferences() {
     try {
-      var resp = await fetch(withAuth(API + '/api/preferences'));
+      var resp = await apiFetch(withAuth(API + '/api/preferences'));
       var data = await resp.json();
       if (data.ok) {
         window.__PREFERENCES__ = data.data;
@@ -1319,17 +1595,33 @@
         var agent = btn.getAttribute('data-agent') || '';
         // v0.19.5 - 已选中的按钮再点 = 取消这条反馈
         var fbState = findFeedbackFor(agent, stickerId, emotion, kws);
+        // v0.25.2 - 乐观更新：点击瞬间切样式 + 防重复点，请求失败回滚（发布前审查修复）
+        var otherFbBtn = card ? card.querySelector('button[data-act="quick-feedback"][data-fb="' + (fb === 'positive' ? 'negative' : 'positive') + '"]') : null;
+        var fbPosBtn = card ? card.querySelector('button[data-act="quick-feedback"][data-fb="positive"]') : null;
+        var fbNegBtn = card ? card.querySelector('button[data-act="quick-feedback"][data-fb="negative"]') : null;
+        var prevPosActive = fbPosBtn ? fbPosBtn.classList.contains('active') : false;
+        var prevNegActive = fbNegBtn ? fbNegBtn.classList.contains('active') : false;
+        btn.classList.add('active');
+        if (otherFbBtn) otherFbBtn.classList.remove('active');
+        btn.disabled = true;
+        function rollbackFbBtn() {
+          if (fbPosBtn) fbPosBtn.classList.toggle('active', prevPosActive);
+          if (fbNegBtn) fbNegBtn.classList.toggle('active', prevNegActive);
+          btn.disabled = false;
+        }
         if (fbState && fbState.state === fb) {
+          // v0.25.0 - 取消时：negative 态若来自累计次数（不在硬拉黑里），走 dislikes 移除
+          var removeList = fb === 'positive' ? 'preferred' : (fbState.viaDislike ? 'dislikes' : 'vetoed');
           callPrefUpdate({
             action: 'remove_from_list',
             agent: agent,
             mapping_index: fbState.mappingIndex,
-            list: fb === 'positive' ? 'preferred' : 'vetoed',
+            list: removeList,
             sticker_id: stickerId,
-          });
+          }, rollbackFbBtn);
           return;
         }
-        callQuickFeedback({ sticker_id: stickerId, feedback_type: fb, context_emotion: emotion, context_keywords: kws, agent: agent || undefined });
+        callQuickFeedback({ sticker_id: stickerId, feedback_type: fb, context_emotion: emotion, context_keywords: kws, agent: agent || undefined }, rollbackFbBtn);
         return;
       }
 
@@ -1360,9 +1652,9 @@
     });
   }
 
-  async function callQuickFeedback(body) {
+  async function callQuickFeedback(body, onFail) {
     try {
-      var resp = await fetch(withAuth(API + '/api/preferences/correct'), {
+      var resp = await apiFetch(withAuth(API + '/api/preferences/correct'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -1372,9 +1664,11 @@
         await refreshPreferences();
         toast('已反馈');
       } else {
+        if (onFail) onFail();
         toast('反馈失败: ' + (data.error || ''), true);
       }
     } catch (err) {
+      if (onFail) onFail();
       toast('反馈出错: ' + err.message, true);
     }
   }
@@ -1382,7 +1676,7 @@
   // v0.22.0 - 从偏好设置直接删除表情包（二次确认后调删除接口，自动清理偏好引用/向量）
   async function deleteSticker(id) {
     try {
-      var resp = await fetch(withAuth(API + '/api'), {
+      var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'delete', id: id }),
@@ -1483,7 +1777,7 @@
     var thinkingBubble = appendChatBubble('thinking', '小花正在思考...');
 
     try {
-      var resp = await fetch(withAuth(API + '/api/sticker/chat'), {
+      var resp = await apiFetch(withAuth(API + '/api/sticker/chat'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1552,7 +1846,7 @@
     btn.disabled = true;
     btn.textContent = '保存中...';
     try {
-      var resp = await fetch(withAuth(API + '/api/sticker/chat/confirm'), {
+      var resp = await apiFetch(withAuth(API + '/api/sticker/chat/confirm'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1582,7 +1876,7 @@
   function closeChatModal() {
     // 通知后端清空 session（如果还有效）
     if (chatSessionId) {
-      fetch(withAuth(API + '/api/sticker/chat/close'), {
+      apiFetch(withAuth(API + '/api/sticker/chat/close'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: chatSessionId }),
@@ -1629,7 +1923,7 @@
 
   async function cleanupPreferences() {
     try {
-      var resp = await fetch(withAuth(API + '/api/preferences/cleanup'), { method: 'POST' });
+      var resp = await apiFetch(withAuth(API + '/api/preferences/cleanup'), { method: 'POST' });
       var data = await resp.json();
       if (data.ok) {
         await refreshPreferences();
@@ -1706,9 +2000,19 @@
     if (!list) return;
     list.innerHTML = '加载中...';
 
+    // v0.25.2 - 刷新列表按钮：重新读取 Hana 当前助手（新助手会出现，已删除的不会回来）
+    var refreshBtn = $('refresh-agents-btn');
+    if (refreshBtn && refreshBtn.dataset.bound !== '1') {
+      refreshBtn.dataset.bound = '1';
+      refreshBtn.addEventListener('click', function () {
+        renderAgentFreq();
+        toast('已刷新助手列表');
+      });
+    }
+
     Promise.all([
-      fetch(withAuth(API + '/api/agents'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
-      fetch(withAuth(API + '/api/agent-freq'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      apiFetch(withAuth(API + '/api/agents'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      apiFetch(withAuth(API + '/api/agent-freq'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
     ]).then(function (results) {
       var agentsResult = results[0];
       var freqResult = results[1];
@@ -1760,7 +2064,8 @@
     var html = '<div class="agent-freq-item' + (settings.enabled ? '' : ' is-off') + '" data-agent-row="' + escHtml(agent.id) + '">';
     html += '<div class="agent-freq-head"><span class="agent-freq-name">' + escHtml(agent.name || agent.id) + '</span>';
     if (showId) html += '<span class="agent-freq-id">' + escHtml(agent.id) + '</span>';
-    html += '<button type="button" class="freq-enabled-btn' + (settings.enabled ? '' : ' is-off') + '" data-act="toggle-freq-enabled" data-agent-id="' + escHtml(agent.id) + '">' + (settings.enabled ? '允许配图' : '点击开启') + '</button></div>';
+    html += '<button type="button" class="freq-enabled-btn' + (settings.enabled ? '' : ' is-off') + '" data-act="toggle-freq-enabled" data-agent-id="' + escHtml(agent.id) + '">' + (settings.enabled ? '允许配图' : '点击开启') + '</button>';
+    html += '<button type="button" class="freq-del-btn" data-act="remove-agent" data-agent-id="' + escHtml(agent.id) + '" title="从插件中删除该助手：清理它的配图频率/偏好/方言设置，列表里不再显示（不影响 Hana 里的助手本身）">删除</button></div>';
     html += '<div class="freq-options">';
     for (var i = 0; i < FREQ_LEVELS.length; i++) {
       var level = FREQ_LEVELS[i];
@@ -1818,6 +2123,35 @@
       if (!agentId) return;
       var action = button.getAttribute('data-act');
       var focusFreq = button.getAttribute('data-freq');
+      if (action === 'remove-agent') {
+        var theAgent = null;
+        for (var ai = 0; ai < freqAgentsData.length; ai++) {
+          if (freqAgentsData[ai].id === agentId) { theAgent = freqAgentsData[ai]; break; }
+        }
+        var agentLabel = (theAgent && theAgent.name) || agentId;
+        customConfirm('确定要把「' + agentLabel + '」从插件里删除吗？\n会清除它的配图频率、偏好和方言设置（不影响 Hana 里的助手文件本身）。点「刷新列表」后它会重新出现，可以再删。', function () {
+          apiFetch(withAuth(API + '/api/agents/remove'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ agentId: agentId }),
+            signal: AbortSignal.timeout(8000),
+          }).then(function (r) { return r.json(); }).then(function (data) {
+            if (data.ok) {
+              toast('已删除「' + agentLabel + '」，数据已清理');
+              // 从当前列表移除（不重新扫描：删掉的不该立刻回来，点「刷新列表」才会重新出现）
+              freqAgentsData = freqAgentsData.filter(function (a) { return a.id !== agentId; });
+              if (freqConfigData.agents && freqConfigData.agents[agentId]) {
+                delete freqConfigData.agents[agentId];
+              }
+              markFreqSaved();
+              renderAgentFreqList();
+            } else {
+              toast('删除失败: ' + (data.error || ''), true);
+            }
+          }).catch(function () { toast('删除失败，网络开小差了', true); });
+        });
+        return;
+      }
       if (action === 'toggle-freq-enabled') {
         var settings = getAgentFreqSettings(agentId);
         settings.enabled = !settings.enabled;
@@ -1840,7 +2174,7 @@
       var status = $('agent-freq-save-status');
       saveButton.disabled = true;
       if (status) { status.textContent = '正在保存…'; status.classList.remove('is-dirty'); }
-      fetch(withAuth(API + '/api/agent-freq'), {
+      apiFetch(withAuth(API + '/api/agent-freq'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(freqConfigData),
@@ -1862,7 +2196,7 @@
   //  v0.20.0 方言口音（让助手说话带方言味）
   // ════════════════════════════════════════════════════════════════
   var dialectAgentsData = [];
-  var dialectConfigData = { version: 2, agents: {} };
+  var dialectConfigData = { version: 3, agents: {} };
   var dialectMetaData = { dialects: [] };
   var dialectDirty = false;
   var dialectDuplicateNames = {};
@@ -1909,6 +2243,8 @@
     return id;
   }
 
+  // v0.25.0 方言元数据（加强版对所有方言有效，不再需要 hasAdvanced 判断）
+
   // v0.23.0 单控件选择器：一个按钮搞定开关+选择（选方言=开，选(不选)=关）
   function renderDialectRow(agent) {
     var settings = getDialectSetting(agent.id);
@@ -1917,6 +2253,12 @@
     var html = '<div class="dialect-item' + (enabled ? '' : ' is-off') + '" data-agent-row="' + escHtml(agent.id) + '">';
     html += '<div class="dialect-head"><span class="dialect-name">' + escHtml(agent.name || agent.id) + '</span>';
     if (showId) html += '<span class="dialect-id">' + escHtml(agent.id) + '</span>';
+    // v0.25.0 浓方言开关（独立于 picker，放 head 层、选方言左边）
+    // 开启后 = 动态回响（每轮注入短提示，正事自动让路）+ 有精修文案的方言写加强人格
+    var boostOn = !!settings.boost;
+    html += '<button type="button" class="dialect-boost-toggle' + (boostOn ? ' is-on' : '') + (enabled ? '' : ' is-disabled') + '" data-act="toggle-boost"' + (enabled ? '' : ' disabled') + ' title="' + (enabled ? '方言加浓：浓度更高，每轮对话有方言回响，正事场合自动让路' : '先给 ta 选个方言，才能开方言加浓') + '">'
+      + '<span class="dialect-boost-track"><span class="dialect-boost-knob"></span></span>'
+      + '<span class="dialect-boost-label">方言加浓</span></button>';
     html += '<div class="dialect-picker" data-agent-id="' + escHtml(agent.id) + '">';
     html += '<button type="button" class="dialect-picker-btn' + (enabled ? ' is-on' : '') + '" data-act="toggle-picker">';
     html += '<span class="dialect-picker-label">' + escHtml(enabled ? dialectName(settings.dialect) : '选个方言') + '</span>';
@@ -1929,7 +2271,8 @@
       if (d.difficultyNote) html += '<span class="dialect-picker-note">' + escHtml(d.difficultyNote) + '</span>';
       html += '</button>';
     }
-    html += '</div></div>';
+    html += '</div>';
+    html += '</div>';
     html += '</div>';
     html += '<div class="dialect-preview" id="dialect-preview-' + escHtml(agent.id) + '">' + (enabled ? escHtml(dialectPreviewText(settings.dialect)) : '挑一个方言试试，味道会显示在这里') + '</div>';
     html += '</div>';
@@ -1970,8 +2313,8 @@
     list.innerHTML = '加载中...';
 
     Promise.all([
-      fetch(withAuth(API + '/api/agents'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
-      fetch(withAuth(API + '/api/dialect'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      apiFetch(withAuth(API + '/api/agents'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      apiFetch(withAuth(API + '/api/dialect'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
     ]).then(function (results) {
       var agentsResult = results[0];
       var dialectResult = results[1];
@@ -2017,9 +2360,23 @@
         var settings = getDialectSetting(agentId);
         settings.dialect = pickBtn.getAttribute('data-value') || '';
         settings.enabled = !!settings.dialect;
+        // v0.25.0：boost 对所有方言有效（动态回响不依赖精修文案），换方言无需清理
         closeAllDialectMenus();
         markDialectDirty();
         refreshDialectRow(agentId);
+        return;
+      }
+      // v0.25.0 浓方言开关：拨动切换 boost（开/关）。开关在 picker 外，从行元素取 agentId
+      var boostBtn = event.target.closest('button[data-act="toggle-boost"]');
+      if (boostBtn) {
+        var row = boostBtn.closest('.dialect-item');
+        if (!row) return;
+        var agentId3 = row.getAttribute('data-agent-row');
+        if (!agentId3) return;
+        var s = getDialectSetting(agentId3);
+        s.boost = !s.boost;
+        markDialectDirty();
+        refreshDialectRow(agentId3);
         return;
       }
     });
@@ -2047,7 +2404,7 @@
       var status = $('dialect-save-status');
       saveButton.disabled = true;
       if (status) { status.textContent = '正在保存…'; status.classList.remove('is-dirty'); }
-      fetch(withAuth(API + '/api/dialect'), {
+      apiFetch(withAuth(API + '/api/dialect'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(dialectConfigData),
@@ -2115,7 +2472,7 @@
     var button = $('batch-select-untagged');
     if (button) button.disabled = true;
     try {
-      var resp = await fetch(withAuth(API + '/api/list'), { signal: AbortSignal.timeout(5000) });
+      var resp = await apiFetch(withAuth(API + '/api/list'), { signal: AbortSignal.timeout(5000) });
       var data = await resp.json();
       if (!resp.ok || !data.ok) throw new Error(data.error || ('HTTP ' + resp.status));
       var untagged = (data.data || []).filter(function (sticker) { return !sticker.tagged_at; });
@@ -2145,7 +2502,7 @@
       var ok = 0, fail = 0;
       for (var i = 0; i < ids.length; i++) {
         try {
-          var resp = await fetch(withAuth(API + '/api'), {
+          var resp = await apiFetch(withAuth(API + '/api'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ action: 'delete', id: ids[i] }),
           });
@@ -2191,7 +2548,7 @@
   async function batchAutoTag() {
     if (selectedIds.size === 0) { toast('请先勾选表情包', true); return; }
     var ids = Array.from(selectedIds);
-    if (ids.length > 200) { toast('单次最多 200 张，请分批', true); return; }
+    // v0.25.1 - 不再限制 200 张：任务本身是流式队列，几百张一个任务直接跑，用户不用自己分批
 
     var modal = $('batch-modal');
     var summary = $('batch-summary');
@@ -2201,15 +2558,11 @@
     modal.style.cssText = 'display:flex;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(45,58,53,.45);align-items:center;justify-content:center;z-index:99999;pointer-events:auto';
     addModalCloseButton();
 
-    var placeholderHtml = '';
-    for (var i = 0; i < ids.length; i++) {
-      placeholderHtml += renderBatchPlaceholder(ids[i]);
-    }
-    list.innerHTML = placeholderHtml;
-    summary.innerHTML = renderBatchSummary(0, ids.length, 0, true);
+    summary.innerHTML = '<div class="batch-progress"><span class="spinner"></span>正在创建识图任务...</div>';
+    list.innerHTML = '';
 
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-auto-tag'), {
+      var resp = await apiFetch(withAuth(API + '/api/batch-auto-tag'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sticker_ids: ids, concurrency: 5 }),
@@ -2217,15 +2570,14 @@
       var data = await resp.json();
       if (data.ok) {
         currentBatchTaskId = data.data.taskId;
-        summary.innerHTML = renderBatchSummary(0, ids.length, 0, true);
         if (batchPollTimer) clearInterval(batchPollTimer);
         batchPollTimer = setInterval(function () { pollBatchTask(currentBatchTaskId); }, 1500);
         pollBatchTask(currentBatchTaskId);
       } else {
-        summary.innerHTML = '<div style="color:var(--danger)">创建任务失败：' + escHtml(data.error || '') + '</div>';
+        summary.innerHTML = '<div style="color:var(--danger);padding:20px">创建任务失败：' + escHtml(data.error || '') + '</div>';
       }
     } catch (e) {
-      summary.innerHTML = '<div style="color:var(--danger)">网络错误：' + escHtml(e.message) + '</div>';
+      summary.innerHTML = '<div style="color:var(--danger);padding:20px">网络错误：' + escHtml(e.message) + '</div>';
     }
   }
 
@@ -2233,9 +2585,10 @@
     if (batchPollTimer) { clearInterval(batchPollTimer); batchPollTimer = null; }
   }
 
+  // v0.25.1 - 轮询走精简接口（不拉 results，省带宽）；任务结束后拉一次完整数据渲染结果视图
   async function pollBatchTask(taskId) {
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
+      var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
       var data = await resp.json();
       if (!data.ok) {
         $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(data.error || '任务不存在') + '</div>';
@@ -2243,209 +2596,208 @@
         stopBatchPolling();
         return;
       }
-      renderBatchTaskDetail(data.data);
+      var t = data.data;
+      if (t.status === 'running') {
+        renderBatchProgress(t);
+        return;
+      }
+      // 结束态：拉完整数据渲染结果视图
+      stopBatchPolling();
+      try {
+        var fullResp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '?full=1'), { cache: 'no-store' });
+        var fullData = await fullResp.json();
+        if (fullData.ok) {
+          renderBatchResultView(fullData.data);
+        } else {
+          $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(fullData.error || '读取任务失败') + '</div>';
+        }
+      } catch (e2) {
+        console.warn('[batch] fetch full detail error:', e2);
+        $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ 读取任务详情失败</div>';
+      }
     } catch (e) {
       console.warn('[batch] poll error:', e);
     }
   }
 
-  function renderBatchTaskDetail(task) {
-    var processed = task.completed.length + task.failed.length;
-    var pct = task.total > 0 ? Math.round(processed / task.total * 100) : 0;
-    $('batch-summary').innerHTML = renderBatchTaskSummary(task, processed, pct);
+  // ═══ 进度视图（任务进行中）：一条大进度条 + 正在处理的几张图，不渲染全部 ═══
+  function renderBatchProgress(t) {
+    var processed = t.completed_count + t.failed_count;
+    var pct = t.total > 0 ? Math.round(processed / t.total * 100) : 0;
+    var html = '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
+    html += '<div style="flex:1;min-width:200px">';
+    html += '<div style="font-size:13px;color:var(--primary-dark);margin-bottom:6px">';
+    html += '已完成 <b style="color:var(--primary);font-size:16px">' + processed + '</b> / ' + t.total + ' 张';
+    if (t.completed_count > 0) html += ' · 成功 <b style="color:var(--success)">' + t.completed_count + '</b>';
+    if (t.failed_count > 0) html += ' · 失败 <b style="color:var(--danger)">' + t.failed_count + '</b>';
+    html += '</div>';
+    html += '<div style="height:8px;background:var(--border);border-radius:4px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:var(--primary);transition:width .3s"></div></div>';
+    html += '</div>';
+    html += '<div style="display:flex;flex-direction:column;gap:8px;align-items:stretch;min-width:92px;margin-left:auto;flex-shrink:0">';
+    html += '<button class="btn btn-secondary" id="batch-cancel-task" data-task-id="' + escHtml(t.id) + '" style="font-size:12px;width:100%">取消任务</button>';
+    html += '</div></div>';
+    $('batch-summary').innerHTML = html;
 
     var listHtml = '';
-    // v0.15.1 - 支持多并发：current_ids 是正在处理的数组
-    var currentIds = Array.isArray(task.current_ids) ? task.current_ids : (task.current ? [task.current] : []);
-    if (task.status === 'running') {
-      for (var ci = 0; ci < currentIds.length; ci++) {
-        listHtml += renderBatchTaskItem(currentIds[ci], null, 'processing');
+    var currentIds = Array.isArray(t.current_ids) ? t.current_ids : [];
+    if (currentIds.length > 0) {
+      listHtml += '<div class="batch-current-thumbs">';
+      for (var i = 0; i < currentIds.length; i++) {
+        var imgUrl = withAuth(API + '/api/image?id=' + encodeURIComponent(currentIds[i]));
+        listHtml += '<img src="' + imgUrl + '" title="正在识别这张..." alt="">';
       }
+      listHtml += '</div>';
+    } else if (t.pending_count > 0) {
+      listHtml += '<div class="batch-progress-tip">排队中，马上开始...</div>';
     }
-    var appliedIds = new Set(Array.isArray(task.applied) ? task.applied : []);
-    for (var i = 0; i < task.completed.length; i++) {
-      var completedId = task.completed[i];
-      listHtml += renderBatchTaskItem(completedId, task.results[completedId], appliedIds.has(completedId) ? 'applied' : 'success');
-    }
-    for (var j = 0; j < task.failed.length; j++) {
-      var f = task.failed[j];
-      listHtml += renderBatchTaskItem(f.id, { ok: false, error: f.error }, 'failed');
-    }
-    if (task.pending.length > 0 && task.status === 'running') {
-      for (var k = 0; k < Math.min(task.pending.length, 10); k++) {
-        listHtml += renderBatchTaskItem(task.pending[k], null, 'pending');
-      }
-      if (task.pending.length > 10) {
-        listHtml += '<div style="text-align:center;color:var(--text-muted);padding:8px;font-size:11px">还有 ' + (task.pending.length - 10) + ' 张待处理...</div>';
-      }
-    }
-    $('batch-list').innerHTML = listHtml || '<div style="text-align:center;padding:30px;color:var(--text-muted)">暂无内容</div>';
-    bindBatchItemActions();
-    if (task.status !== 'running') stopBatchPolling();
+    $('batch-list').innerHTML = listHtml || '<div class="batch-progress-tip">就绪</div>';
   }
 
-  function renderBatchTaskSummary(task, processed, pct) {
-    var statusLabel = { running:'进行中', completed:'已完成', failed:'失败', cancelled:'已取消' }[task.status] || task.status;
-    var statusColor = { running:'var(--primary)', completed:'var(--success)', failed:'var(--danger)', cancelled:'var(--text-muted)' }[task.status] || 'var(--primary)';
+  // ═══ 结果视图（任务结束）：统计 + 一键全部应用 + 结果网格 ═══
+  var currentResultTask = null; // 当前结果视图对应的完整任务数据
+
+  function renderBatchResultView(task) {
+    currentResultTask = task;
+    var appliedSet = new Set(Array.isArray(task.applied) ? task.applied : []);
+    var pendingApply = (task.completed || []).filter(function (id) { return !appliedSet.has(id); });
+    var failedList = task.failed || [];
+    var cancelled = task.status === 'cancelled';
+    var statusLabel = cancelled ? '已取消' : (task.status === 'failed' ? '失败' : '已完成');
+    var statusColor = cancelled ? 'var(--text-muted)' : (task.status === 'failed' ? 'var(--danger)' : 'var(--success)');
 
     var html = '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
     html += '<div style="flex:1;min-width:200px">';
-    html += '<div style="font-size:13px;color:var(--primary-dark);margin-bottom:4px">';
+    html += '<div style="font-size:13px;color:var(--text);margin-bottom:4px">';
     html += '<b style="color:' + statusColor + '">' + statusLabel + '</b>';
-    html += ' · 已处理 <b style="color:var(--primary)">' + processed + '</b> / ' + task.total;
-    html += '（成功 <b style="color:var(--success)">' + task.completed.length + '</b>';
-    if (task.failed.length > 0) html += '，失败 <b style="color:var(--danger)">' + task.failed.length + '</b>';
-    html += '）</div>';
-    html += '<div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:' + statusColor + ';transition:width .3s"></div></div>';
+    html += ' · 成功 <b style="color:var(--success)">' + (task.completed || []).length + '</b>';
+    if (failedList.length > 0) html += ' · 失败 <b style="color:var(--danger)">' + failedList.length + '</b>';
+    if (cancelled && task.pending && task.pending.length > 0) html += ' · 剩余 ' + task.pending.length;
     html += '</div>';
-    var showApply = task.status === 'completed' && task.completed.length > (task.applied || []).length;
-    var showRetry = task.status === 'completed' && task.failed.length > 0;
-    if (task.status === 'running' || showApply || showRetry) {
+    if (!cancelled) {
+      html += '<div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden"><div style="height:100%;width:100%;background:' + statusColor + '"></div></div>';
+    }
+    html += '</div>';
+    var showApply = pendingApply.length > 0;
+    var showRetry = !cancelled && failedList.length > 0;
+    if (showApply || showRetry) {
       html += '<div style="display:flex;flex-direction:column;gap:8px;align-items:stretch;min-width:92px;margin-left:auto;flex-shrink:0">';
-      if (task.status === 'running') {
-        html += '<button class="btn btn-secondary" id="batch-cancel-task" data-task-id="' + escHtml(task.id) + '" style="font-size:12px;width:100%">取消任务</button>';
-      } else if (showApply) {
-        html += '<button class="btn btn-secondary" id="batch-apply-all" style="border-color:var(--success);color:var(--success);width:100%">全部应用</button>';
-      }
-      if (showRetry) {
-        html += '<button class="btn btn-secondary" id="batch-retry-failed" style="border-color:var(--danger);color:var(--danger);width:100%">全部重试</button>';
-      }
+      if (showApply) html += '<button class="btn btn-secondary" id="batch-apply-all" style="border-color:var(--success);color:var(--success);width:100%">全部应用 (' + pendingApply.length + ')</button>';
+      if (showRetry) html += '<button class="btn btn-secondary" id="batch-retry-failed" style="border-color:var(--danger);color:var(--danger);width:100%">全部重试</button>';
       html += '</div>';
     }
     html += '</div>';
-    return html;
+    $('batch-summary').innerHTML = html;
+
+    var listHtml = '<div class="batch-result-grid">';
+    for (var i = 0; i < (task.completed || []).length; i++) {
+      var cid = task.completed[i];
+      // v0.25.1 - 已应用的项不再展示：处理完了就退场，只留还没处理完的
+      if (appliedSet.has(cid)) continue;
+      listHtml += renderBatchGridItem(cid, task.results[cid], 'success');
+    }
+    for (var j = 0; j < failedList.length; j++) {
+      var f = failedList[j];
+      listHtml += renderBatchGridItem(f.id, { ok: false, error: f.error }, 'failed');
+    }
+    listHtml += '</div>';
+    $('batch-list').innerHTML = listHtml || '<div class="batch-progress-tip">没有可显示的结果</div>';
+    bindBatchGridActions();
   }
 
-  function renderBatchTaskItem(id, result, status) {
+  // ═══ 结果网格项（轻量：缩略图 + 描述 + 标签 + 操作）═══
+  function renderBatchGridItem(id, result, status) {
     var sticker = allStickers.find(function (s) { return s.id === id; });
     var desc = sticker ? sticker.description : id;
     var imgUrl = withAuth(API + '/api/image?id=' + encodeURIComponent(id));
-    var statusBadge = {
-      success: '<div class="batch-status pending">待确认</div>',
-      applied: '<div class="batch-status applied">已应用</div>',
-      failed: '<div class="batch-status" style="background:var(--danger-light);color:var(--danger)">失败</div>',
-      processing: '<div class="batch-status pending"><span class="spinner" style="width:10px;height:10px;border-width:2px;display:inline-block;vertical-align:middle;margin-right:4px"></span>处理中</div>',
-      pending: '<div class="batch-status" style="background:#f5f5f5;color:#999">待处理</div>',
-    }[status] || '';
-
-    var html = '<div class="batch-item" data-id="' + escHtml(id) + '" data-status="' + status + '">';
-    html += '<img class="batch-thumb" src="' + imgUrl + '" onerror="this.style.display=\'none\'" alt="">';
-    html += '<div class="batch-info-col">';
-    html += '<div style="font-weight:500;margin-bottom:3px">' + escHtml(desc) + ' <span style="color:var(--text-light);font-size:11px;font-family:monospace">' + escHtml(id) + '</span></div>';
-    if ((status === 'success' || status === 'applied') && result && result.ok) {
-      var sug = result.data;
-      html += '<div class="batch-tag-line"><b>描述：</b>' + escHtml(sug.description) + '</div>';
-      if (sug.semantic_description) html += '<div class="batch-tag-line" style="color:var(--text-light)"><b>语义：</b>' + escHtml(sug.semantic_description) + '</div>';
-      html += '<div class="batch-tag-line"><b>情绪：</b>' + sug.emotion.map(function (t) { return '<span>' + escHtml(t) + '</span>'; }).join('') + '</div>';
-      html += '<div class="batch-tag-line"><b>场景：</b>' + sug.scene.map(function (t) { return '<span>' + escHtml(t) + '</span>'; }).join('') + '</div>';
-      html += '<div class="batch-tag-line"><b>关键词：</b>' + sug.keywords.map(function (t) { return '<span>' + escHtml(t) + '</span>'; }).join('') + '</div>';
-      html += '<div class="batch-edit-area">';
-      html += '<input class="batch-edit-desc" placeholder="描述" value="' + escHtml(sug.description) + '">';
-      html += '<input class="batch-edit-semantic" type="hidden" value="' + escHtml(sug.semantic_description || '') + '">';
-      html += '<input class="batch-edit-emotion" placeholder="情绪（逗号分隔）" value="' + escHtml(sug.emotion.join(', ')) + '">';
-      html += '<input class="batch-edit-scene" placeholder="场景（逗号分隔）" value="' + escHtml(sug.scene.join(', ')) + '">';
-      html += '<input class="batch-edit-keywords" placeholder="关键词（逗号分隔）" value="' + escHtml(sug.keywords.join(', ')) + '">';
-      html += '<div class="batch-edit-actions">';
-      html += '<button data-edit-act="cancel">取消</button>';
-      html += '<button data-edit-act="confirm" style="border-color:var(--primary);color:var(--primary)">确认修改</button>';
-      html += '</div></div>';
-    } else if (status === 'failed' && result) {
-      html += '<div style="color:var(--danger);font-size:12px">❌ ' + escHtml(result.error || '未知错误') + '</div>';
-      html += '<div style="margin-top:6px"><button data-batch-act="retry" class="batch-retry-btn" style="border:1px solid var(--danger);color:var(--danger);background:var(--surface);font-size:11px;padding:3px 8px;border-radius:3px;cursor:pointer">重试识图</button></div>';
-    } else if (status === 'processing') {
-      html += '<div style="color:var(--primary);font-size:11px;display:flex;align-items:center;gap:6px"><span class="spinner" style="width:10px;height:10px;border-width:2px;display:inline-block"></span>正在识别这张图...</div>';
-    } else if (status === 'pending') {
-      html += '<div style="color:var(--text-muted);font-size:11px">等待识别...</div>';
+    var html = '<div class="batch-grid-item" data-id="' + escHtml(id) + '" data-status="' + status + '">';
+    html += '<img loading="lazy" src="' + imgUrl + '" onerror="this.style.display=\'none\'" alt="">';
+    html += '<div class="bgi-desc" title="' + escHtml(desc) + '">' + escHtml(desc) + '</div>';
+    if (status === 'success' || status === 'applied') {
+      var sug = result && result.ok ? result.data : null;
+      if (sug) {
+        var tagHtml = '';
+        var emos = sug.emotion || [];
+        for (var ei = 0; ei < Math.min(emos.length, 3); ei++) {
+          tagHtml += '<span>' + escHtml(emos[ei]) + '</span>';
+        }
+        if (emos.length > 3) tagHtml += '<span>+' + (emos.length - 3) + '</span>';
+        if (tagHtml) html += '<div class="bgi-tags">' + tagHtml + '</div>';
+        html += '<div class="bgi-edit" hidden>'
+          + '<input class="bgi-edit-desc" placeholder="描述" value="' + escHtml(sug.description || '') + '">'
+          + '<input class="bgi-edit-semantic" type="hidden" value="' + escHtml(sug.semantic_description || '') + '">'
+          + '<input class="bgi-edit-emotion" placeholder="情绪（逗号分隔）" value="' + escHtml((sug.emotion || []).join(', ')) + '">'
+          + '<input class="bgi-edit-scene" placeholder="场景（逗号分隔）" value="' + escHtml((sug.scene || []).join(', ')) + '">'
+          + '<input class="bgi-edit-keywords" placeholder="关键词（逗号分隔）" value="' + escHtml((sug.keywords || []).join(', ')) + '">'
+          + '<div class="bgi-edit-actions">'
+          + '<button data-g-act="edit-cancel">取消</button>'
+          + '<button data-g-act="edit-confirm" style="border-color:var(--primary);color:var(--primary)">保存</button>'
+          + '</div></div>';
+        html += '<div class="bgi-actions">';
+        if (status === 'success') html += '<button data-g-act="apply" class="apply">应用</button>';
+        html += '<button data-g-act="edit">编辑</button>';
+        html += '</div>';
+        html += '<div class="bgi-status ' + (status === 'applied' ? '' : 'pending') + '">' + (status === 'applied' ? '已应用' : '待应用') + '</div>';
+      } else {
+        html += '<div class="bgi-err">结果缺失</div>';
+        html += '<div class="bgi-actions"><button data-g-act="retry">重试</button></div>';
+      }
+    } else if (status === 'failed') {
+      html += '<div class="bgi-err">' + escHtml(result.error || '识别失败') + '</div>';
+      html += '<div class="bgi-actions"><button data-g-act="retry" style="border-color:var(--danger);color:var(--danger)">重试</button></div>';
     }
-    html += '</div>';
-    html += '<div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex-shrink:0">';
-    html += statusBadge;
-    if (status === 'success') {
-      html += '<div class="batch-actions-col">';
-      html += '<button class="apply" data-batch-act="apply">应用</button>';
-      html += '<button data-batch-act="edit">编辑</button>';
-      html += '</div>';
-    }
-    html += '</div>';
     html += '</div>';
     return html;
   }
 
-  function renderBatchPlaceholder(id) {
-    var sticker = allStickers.find(function (s) { return s.id === id; });
-    var desc = sticker ? sticker.description : id;
-    var imgUrl = withAuth(API + '/api/image?id=' + encodeURIComponent(id));
-    var html = '<div class="batch-item" data-id="' + escHtml(id) + '" data-status="processing">';
-    html += '<img class="batch-thumb" src="' + imgUrl + '" onerror="this.style.display=\'none\'" alt="">';
-    html += '<div class="batch-info-col">';
-    html += '<div style="font-weight:500;margin-bottom:3px">' + escHtml(desc) + ' <span style="color:var(--text-light);font-size:11px;font-family:monospace">' + escHtml(id) + '</span></div>';
-    html += '<div style="color:var(--text-muted);font-size:11px;display:flex;align-items:center;gap:6px"><span class="spinner" style="width:10px;height:10px;border-width:2px;display:inline-block"></span>等待处理...</div>';
-    html += '</div>';
-    html += '<div style="display:flex;flex-direction:column;align-items:center;gap:6px;flex-shrink:0">';
-    html += '<div class="batch-status pending">处理中</div>';
-    html += '</div>';
-    html += '</div>';
-    return html;
-  }
-
-  function bindBatchItemActions() {
+  function bindBatchGridActions() {
     var list = $('batch-list');
     if (!list || list.__bound) return;
     list.__bound = true;
-    list.addEventListener('mousedown', function (e) {
-      if (e.target.closest('.batch-edit-area, input, textarea')) e.stopPropagation();
-    }, true);
-    list.addEventListener('mouseup', function (e) {
-      if (e.target.closest('.batch-edit-area, input, textarea')) e.stopPropagation();
-    }, true);
     list.addEventListener('click', function (e) {
-      var btn = e.target.closest('button[data-batch-act]');
+      var btn = e.target.closest('button[data-g-act]');
       if (!btn) return;
-      var item = btn.closest('.batch-item');
+      var item = btn.closest('.batch-grid-item');
       if (!item) return;
-      var act = btn.getAttribute('data-batch-act');
+      var act = btn.getAttribute('data-g-act');
       var id = item.getAttribute('data-id');
-      if (act === 'apply') applyBatchItem(item, id, null);
-      else if (act === 'edit') {
-        var editArea = item.querySelector('.batch-edit-area');
-        if (editArea) editArea.classList.toggle('open');
-      } else if (act === 'retry') retryBatchItem(id, item);
-    });
-    list.addEventListener('click', function (e) {
-      var btn = e.target.closest('button[data-edit-act]');
-      if (!btn) return;
-      var editArea = btn.closest('.batch-edit-area');
-      if (!editArea) return;
-      var item = btn.closest('.batch-item');
-      var id = item.getAttribute('data-id');
-      var editAct = btn.getAttribute('data-edit-act');
-      if (editAct === 'cancel') editArea.classList.remove('open');
-      else if (editAct === 'confirm') {
+      if (act === 'apply') {
+        applyGridItem(item, id, null);
+      } else if (act === 'edit') {
+        var editArea = item.querySelector('.bgi-edit');
+        if (editArea) editArea.hidden = !editArea.hidden;
+      } else if (act === 'edit-cancel') {
+        var ea = item.querySelector('.bgi-edit');
+        if (ea) ea.hidden = true;
+      } else if (act === 'edit-confirm') {
+        var ea2 = item.querySelector('.bgi-edit');
+        if (!ea2) return;
         var customTags = {
-          description: editArea.querySelector('.batch-edit-desc').value.trim(),
-          semantic_description: (editArea.querySelector('.batch-edit-semantic') || {}).value || '',
-          emotion: editArea.querySelector('.batch-edit-emotion').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-          scene: editArea.querySelector('.batch-edit-scene').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-          keywords: editArea.querySelector('.batch-edit-keywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+          description: ea2.querySelector('.bgi-edit-desc').value.trim(),
+          semantic_description: (ea2.querySelector('.bgi-edit-semantic') || {}).value || '',
+          emotion: ea2.querySelector('.bgi-edit-emotion').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+          scene: ea2.querySelector('.bgi-edit-scene').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
+          keywords: ea2.querySelector('.bgi-edit-keywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
         };
-        applyBatchItem(item, id, customTags);
+        applyGridItem(item, id, customTags);
+      } else if (act === 'retry') {
+        retryGridItem(id, item);
       }
     });
   }
 
-  function setBatchItemStatus(item, status, text) {
-    var el = item.querySelector('.batch-status');
-    if (!el) return;
-    el.className = 'batch-status ' + status;
-    el.textContent = text;
-    item.setAttribute('data-status', status);
-    item.querySelectorAll('button[data-batch-act]').forEach(function (b) { b.disabled = true; b.style.opacity = '0.4'; });
+  // v0.25.1 - 应用成功后该项直接从网格退场，不再留在原地
+  function setGridItemApplied(item, id) {
+    selectedIds.delete(id);
+    var card = document.querySelector('.sticker-card[data-id="' + id + '"]');
+    if (card) card.classList.remove('selected');
+    updateBatchCount();
+    if (item && item.parentNode) item.parentNode.removeChild(item);
   }
 
   async function markBatchItemsApplied(taskId, ids) {
     if (!taskId || !ids.length) return false;
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '/applied'), {
+      var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '/applied'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sticker_ids: ids }),
@@ -2457,147 +2809,155 @@
     }
   }
 
-  async function applyBatchItem(item, id, customTags) {
-    var taskId = currentBatchTaskId;
-    var editArea = item.querySelector('.batch-edit-area');
+  // v0.25.1 - 应用单张（走批量接口一次写 meta；无自定义标签时用识别结果原样）
+  async function applyGridItem(item, id, customTags) {
+    var task = currentResultTask;
     var tags;
-    if (customTags) { tags = customTags; }
-    else {
-      var sug = { description: '', emotion: [], scene: [], keywords: [] };
-      if (editArea) {
-        sug.description = editArea.querySelector('.batch-edit-desc').value.trim();
-        sug.semantic_description = (editArea.querySelector('.batch-edit-semantic') || {}).value || '';
-        sug.emotion = editArea.querySelector('.batch-edit-emotion').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-        sug.scene = editArea.querySelector('.batch-edit-scene').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
-        sug.keywords = editArea.querySelector('.batch-edit-keywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (customTags) {
+      tags = customTags;
+    } else {
+      var sug = { description: '', semantic_description: '', emotion: [], scene: [], keywords: [] };
+      var r = task && task.results ? task.results[id] : null;
+      if (r && r.ok) {
+        sug.description = r.data.description;
+        sug.semantic_description = r.data.semantic_description || '';
+        sug.emotion = r.data.emotion;
+        sug.scene = r.data.scene;
+        sug.keywords = r.data.keywords;
       }
       tags = sug;
     }
     try {
-      var resp = await fetch(withAuth(API + '/api'), {
+      var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'update', id: id,
-          description: tags.description,
-          semantic_description: tags.semantic_description || '',
-          emotion: tags.emotion.join(', '),
-          scene: tags.scene.join(', '),
-          keywords: tags.keywords.join(', '),
-        }),
+        body: JSON.stringify({ action: 'batch_update', items: [Object.assign({ id: id }, tags)] }),
       });
       var data = await resp.json();
       if (data.ok) {
-        var marked = await markBatchItemsApplied(taskId, [id]);
-        setBatchItemStatus(item, 'applied', '已应用');
-        if (!marked) toast('标签已应用，但任务确认状态保存失败', true);
-        selectedIds.delete(id);
-        var card = document.querySelector('.sticker-card[data-id="' + id + '"]');
-        if (card) card.classList.remove('selected');
+        if (task) {
+          await markBatchItemsApplied(task.id, [id]);
+          task.applied = task.applied || [];
+          task.applied.push(id);
+        }
         var sticker = allStickers.find(function (s) { return s.id === id; });
-        if (sticker) sticker.tagged_at = data.tagged_at || new Date().toISOString();
-        updateBatchCount();
+        if (sticker) {
+          sticker.tagged_at = new Date().toISOString();
+          if (tags.description) sticker.description = tags.description;
+        }
+        setGridItemApplied(item, id);
+        maybeCloseResultIfDone();
+        toast('已应用');
       } else {
-        toast('更新失败: ' + (data.error || ''), true);
+        toast('应用失败: ' + (data.error || ''), true);
       }
     } catch (e) {
-      toast('更新出错: ' + e.message, true);
+      toast('应用出错: ' + e.message, true);
     }
   }
 
-  async function retryBatchItem(id, item) {
-    var button = item && item.querySelector('[data-batch-act="retry"]');
-    if (button) { button.disabled = true; button.textContent = '加入中...'; }
-    var taskId = await enqueueTagTask([id], { message: '已作为新任务加入后台', openDetail: true });
-    if (!taskId && button) { button.disabled = false; button.textContent = '重试识图'; }
-  }
-
-  async function applyAllBatch() {
-    var items = document.querySelectorAll('.batch-item[data-status="pending"], .batch-item[data-status="success"]');
-    var pending = [];
-    items.forEach(function (it) {
-      if (it.querySelector('.batch-thumb') && it.querySelector('.batch-thumb').style.display !== 'none') pending.push(it);
-      else if (it.querySelector('.batch-edit-desc')) pending.push(it);
-    });
-    if (pending.length === 0) { toast('没有待确认的项', true); return; }
-    var taskId = currentBatchTaskId;
-    customConfirm('确定应用全部 ' + pending.length + ' 项吗？', async function () {
-      var ok = 0, fail = 0, appliedIds = [];
-      for (var i = 0; i < pending.length; i++) {
-        var item = pending[i];
-        var id = item.getAttribute('data-id');
-        var editArea = item.querySelector('.batch-edit-area');
-        var tags = {
-          description: editArea.querySelector('.batch-edit-desc').value.trim(),
-          semantic_description: (editArea.querySelector('.batch-edit-semantic') || {}).value || '',
-          emotion: editArea.querySelector('.batch-edit-emotion').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-          scene: editArea.querySelector('.batch-edit-scene').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-          keywords: editArea.querySelector('.batch-edit-keywords').value.split(',').map(function (s) { return s.trim(); }).filter(Boolean),
-        };
-        var success = await applyBatchItemSilent(id, tags);
-        if (success) { ok++; appliedIds.push(id); } else fail++;
-      }
-      var marked = appliedIds.length === 0 || await markBatchItemsApplied(taskId, appliedIds);
-      pending.forEach(function (item) {
-        var id = item.getAttribute('data-id');
-        if (appliedIds.indexOf(id) < 0) return;
-        setBatchItemStatus(item, 'applied', '已应用');
-        selectedIds.delete(id);
-        var card = document.querySelector('.sticker-card[data-id="' + id + '"]');
-        if (card) card.classList.remove('selected');
-      });
-      updateBatchCount();
-      if (!marked) toast('标签已应用，但任务确认状态保存失败', true);
-      else toast(ok + ' 张已应用' + (fail ? '（' + fail + ' 张失败）' : ''), fail > 0);
-    });
-  }
-
-  async function applyBatchItemSilent(id, tags) {
+  // v0.25.1 - 重试成功后清除旧任务的失败记录（失败项已由新任务接管）
+  async function clearRetriedFromTask(taskId, ids) {
+    if (!taskId || !ids || !ids.length) return;
     try {
-      var resp = await fetch(withAuth(API + '/api'), {
+      await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '/retried'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sticker_ids: ids }),
+      });
+    } catch (e) { console.warn('[batch] mark retried error:', e); }
+  }
+
+  async function retryGridItem(id, item) {
+    var button = item && item.querySelector('[data-g-act="retry"]');
+    if (button) { button.disabled = true; button.textContent = '加入中...'; }
+    var oldTaskId = currentResultTask ? currentResultTask.id : null;
+    var taskId = await enqueueTagTask([id], { message: '已创建重试任务', openDetail: true });
+    if (taskId && oldTaskId) await clearRetriedFromTask(oldTaskId, [id]);
+    if (!taskId && button) { button.disabled = false; button.textContent = '重试'; }
+  }
+
+  // v0.25.1 - 一键全部应用：所有识别成功且未应用的标签一次写库
+  async function applyAllBatchResult() {
+    var task = currentResultTask;
+    if (!task) { toast('任务数据未加载', true); return; }
+    var appliedSet = new Set(Array.isArray(task.applied) ? task.applied : []);
+    var pending = (task.completed || []).filter(function (id) { return !appliedSet.has(id); });
+    if (pending.length === 0) { toast('没有待应用的项', true); return; }
+    var items = [];
+    for (var i = 0; i < pending.length; i++) {
+      var id = pending[i];
+      var r = task.results[id];
+      if (!r || !r.ok) continue;
+      items.push({
+        id: id,
+        description: r.data.description || '',
+        semantic_description: r.data.semantic_description || '',
+        emotion: r.data.emotion || [],
+        scene: r.data.scene || [],
+        keywords: r.data.keywords || [],
+      });
+    }
+    if (items.length === 0) { toast('没有可应用的识别结果', true); return; }
+    try {
+      var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'update', id: id,
-          description: tags.description,
-          semantic_description: tags.semantic_description || '',
-          emotion: tags.emotion.join(', '),
-          scene: tags.scene.join(', '),
-          keywords: tags.keywords.join(', '),
-        }),
+        body: JSON.stringify({ action: 'batch_update', items: items }),
+        signal: AbortSignal.timeout(30000),
       });
       var data = await resp.json();
-      if (data.ok && data.tagged_at) {
-        var sticker = allStickers.find(function (s) { return s.id === id; });
-        if (sticker) sticker.tagged_at = data.tagged_at;
-      }
-      return data.ok;
-    } catch { return false; }
+      if (!data.ok) { toast('应用失败: ' + (data.error || ''), true); return; }
+      await markBatchItemsApplied(task.id, items.map(function (it) { return it.id; }));
+      task.applied = Array.from(new Set([...(task.applied || []), ...items.map(function (it) { return it.id; })]));
+      var now = new Date().toISOString();
+      var idSet = {};
+      items.forEach(function (it) { idSet[it.id] = true; });
+      allStickers.forEach(function (s) { if (idSet[s.id]) s.tagged_at = now; });
+      toast('已应用 ' + items.length + ' 张' + (task.failed.length ? '（' + task.failed.length + ' 张失败未应用）' : ''));
+      refreshBatchResultView();
+    } catch (e) {
+      toast('应用出错: ' + e.message, true);
+    }
+  }
+
+  // v0.25.1 - 任务没有待处理项时（全部应用且无失败），弹窗自动关闭，任务退场
+  function maybeCloseResultIfDone() {
+    var task = currentResultTask;
+    if (!task) return;
+    var appliedSet = new Set(task.applied || []);
+    var pendingApply = (task.completed || []).filter(function (id) { return !appliedSet.has(id); });
+    if (pendingApply.length === 0 && (task.failed || []).length === 0) {
+      setTimeout(function () {
+        closeBatchModal();
+        toast('已全部完成');
+      }, 400);
+    }
+  }
+
+  async function refreshBatchResultView() {
+    if (!currentResultTask) return;
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(currentResultTask.id) + '?full=1'), { cache: 'no-store' });
+      var data = await resp.json();
+      if (data.ok) { renderBatchResultView(data.data); checkBatchTasks(); maybeCloseResultIfDone(); }
+    } catch (e) { console.warn('[batch] refresh result error:', e); }
   }
 
   async function cancelBatchTask(taskId) {
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '/cancel'), { method: 'POST' });
+      var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '/cancel'), { method: 'POST' });
       var data = await resp.json();
       if (data.ok) { toast('任务已取消'); pollBatchTask(taskId); checkBatchTasks(); }
       else { toast('取消失败: ' + (data.error || ''), true); }
     } catch (e) { toast('取消出错: ' + e.message, true); }
   }
 
-  async function retryAllFailedBatch() {
-    var failedItems = document.querySelectorAll('.batch-item[data-status="failed"]');
-    if (failedItems.length === 0) { toast('没有失败的项需要重试', true); return; }
-    var ids = [];
-    failedItems.forEach(function (it) { ids.push(it.getAttribute('data-id')); });
-    await enqueueTagTask(ids, { message: '已创建全部重试任务，共 ' + ids.length + ' 张', openDetail: true });
-  }
-
-  function renderBatchSummary(processed, total, success, hasFail) {
-    var pct = total > 0 ? Math.round(processed / total * 100) : 0;
-    var html = '<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">';
-    html += '<div style="flex:1;min-width:180px">';
-    html += '<div style="font-size:13px;color:var(--primary-dark)">已处理 <b style="color:var(--primary)">' + processed + '</b> / ' + total + '（成功 ' + success + (hasFail ? '，失败 ' + (processed - success) : '') + '）</div>';
-    html += '<div style="height:6px;background:var(--border);border-radius:3px;margin-top:5px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:var(--primary);transition:width .3s"></div></div>';
-    html += '</div></div>';
-    return html;
+  // v0.25.1 - 全部重试：从当前结果视图的任务数据里收集失败项，成功后清旧任务失败记录
+  async function retryAllFailedBatchResult() {
+    var task = currentResultTask;
+    if (!task || !task.failed || task.failed.length === 0) { toast('没有失败的项需要重试', true); return; }
+    var ids = task.failed.map(function (f) { return f.id; });
+    var newTaskId = await enqueueTagTask(ids, { message: '已创建全部重试任务，共 ' + ids.length + ' 张', openDetail: true });
+    if (newTaskId) await clearRetriedFromTask(task.id, ids);
   }
 
   // ═══════════════════════════════════
@@ -2605,7 +2965,7 @@
   // ═══════════════════════════════════
   async function checkBatchTasks() {
     try {
-      var resp = await fetch(withAuth(API + '/api/batch-tasks'));
+      var resp = await apiFetch(withAuth(API + '/api/batch-tasks'));
       var data = await resp.json();
       if (!data.ok || !data.data || data.data.length === 0) {
         renderBatchTasksBadge([]);
@@ -2631,166 +2991,55 @@
     }
   }
 
+  // v0.25.1 - 角标只反映「点开会看到什么」：第一个正在跑的任务 / 第一个待应用任务 /
+  // 第一个有失败的任务。数字和弹窗内容永远一致，历史任务不会累加进来。
   function renderBatchTasksBadge(tasks) {
     var badge = $('batch-tasks-badge');
     if (!badge) return;
-    // v0.15.2 - 按钮始终显示，即使没有任务
-    badge.hidden = false;
-    if (tasks.length === 0) {
-      badge.innerHTML = '批量识图任务 (0)';
-      badge.style.borderColor = 'var(--border)';
-      badge.style.color = 'var(--text-muted)';
-      return;
-    }
-    var running = 0, done = 0, failed = 0;
     for (var i = 0; i < tasks.length; i++) {
-      if (tasks[i].status === 'running') running++;
-      else if (tasks[i].status === 'completed') done++;
-      else if (tasks[i].status === 'failed') failed++;
-    }
-    if (running > 0) {
-      badge.innerHTML = '批量识图任务 (' + tasks.length + ') · 进行中 ' + running;
-      badge.style.borderColor = 'var(--primary)';
-      badge.style.color = 'var(--primary-dark)';
-    } else if (failed > 0) {
-      badge.innerHTML = '批量识图任务 (' + tasks.length + ') · ' + failed + ' 失败';
-      badge.style.borderColor = 'var(--danger)';
-      badge.style.color = 'var(--danger)';
-    } else {
-      badge.innerHTML = '批量识图任务 (' + tasks.length + ') · 完成';
-      badge.style.borderColor = 'var(--success)';
-      badge.style.color = 'var(--success)';
-    }
-  }
-
-  // v0.15.1 - 任务列表弹窗轮询定时器
-  var batchListPollTimer = null;
-
-  function openBatchTasksModal() {
-    var modal = $('batch-tasks-list-modal');
-    if (modal) {
-      modal.hidden = false;
-      modal.style.cssText = 'display:flex;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(45,58,53,.45);align-items:center;justify-content:center;z-index:99999;pointer-events:auto';
-      renderBatchTasksModalContent();
-    } else {
-      modal = document.createElement('div');
-      modal.id = 'batch-tasks-list-modal';
-      modal.className = 'modal-overlay';
-      modal.onclick = function (e) { if (e.target === modal) closeBatchTasksModal(); };
-      modal.style.cssText = 'display:flex;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(45,58,53,.45);align-items:center;justify-content:center;z-index:99999;pointer-events:auto';
-      var box = document.createElement('div');
-      box.className = 'modal-box fixed-modal-box batch-tasks-modal-box';
-      box.style.cssText = 'background:var(--surface);border-radius:var(--radius);padding:0;width:560px;max-width:92vw;max-height:80vh;overflow:hidden;border:1px solid var(--border);position:relative;box-shadow:0 8px 32px rgba(0,0,0,.12)';
-      modal.appendChild(box);
-      document.body.appendChild(modal);
-      renderBatchTasksModalContent();
-    }
-    // v0.15.1 - 开启轮询，每 2s 刷新任务列表
-    if (batchListPollTimer) clearInterval(batchListPollTimer);
-    batchListPollTimer = setInterval(async function () {
-      await checkBatchTasks();
-      // 如果弹窗还开着，重新渲染内容
-      var m = $('batch-tasks-list-modal');
-      if (m && m.style.display !== 'none' && !m.hidden) {
-        renderBatchTasksModalContent();
-      }
-    }, 2000);
-  }
-
-  function closeBatchTasksModal() {
-    var modal = $('batch-tasks-list-modal');
-    if (!modal) return;
-    modal.hidden = true;
-    modal.style.display = 'none';
-    if (batchListPollTimer) { clearInterval(batchListPollTimer); batchListPollTimer = null; }
-  }
-
-  function renderBatchTasksModalContent() {
-    var modal = $('batch-tasks-list-modal');
-    if (!modal) return;
-    var box = modal.querySelector('.modal-box');
-    if (!box) return;
-
-    var html = '<div class="modal-head"><h2>批量识图任务</h2>';
-    html += '<button class="modal-close" data-modal-list-close="1" title="关闭">✕</button></div>';
-    html += '<div class="modal-body">';
-
-    if (batchTasksData.length === 0) {
-      html += '<div style="text-align:center;color:var(--text-muted);padding:40px 20px">暂无后台任务</div>';
-    } else {
-      html += '<div style="display:flex;flex-direction:column;gap:8px">';
-      for (var i = 0; i < batchTasksData.length; i++) {
-        var t = batchTasksData[i];
+      var t = tasks[i];
+      if (t.status === 'running') {
+        badge.hidden = false;
         var processed = t.completed + t.failed;
-        var pct = t.total > 0 ? Math.round(processed / t.total * 100) : 0;
-        var label = t.status === 'running' ? '进行中' : (t.status === 'completed' ? '已完成' : (t.status === 'cancelled' ? '已取消' : '失败'));
-        var color = t.status === 'running' ? 'var(--primary)' : (t.status === 'completed' ? 'var(--success)' : (t.status === 'failed' ? 'var(--danger)' : 'var(--text-muted)'));
-
-        html += '<div data-task-row="' + escHtml(t.id) + '" style="background:var(--surface-alt);border:1px solid var(--border-light);border-radius:6px;padding:12px 14px;display:flex;flex-direction:column;gap:6px">';
-        html += '<div style="display:flex;align-items:center;gap:10px">';
-        html += '<div style="flex:1;min-width:0">';
-        html += '<div style="font-size:13px;font-weight:500;color:' + color + '">' + label + ' · ' + processed + ' / ' + t.total + '</div>';
-        html += '<div style="font-size:11px;color:var(--text-muted);margin-top:2px">成功 ' + t.completed + (t.failed > 0 ? '，失败 ' + t.failed : '') + '</div>';
-        if (t.status === 'running') {
-          html += '<div style="height:4px;background:var(--border);border-radius:2px;margin-top:5px;overflow:hidden"><div style="height:100%;width:' + pct + '%;background:var(--primary);transition:width .3s"></div></div>';
-        }
-        html += '</div></div>';
-        html += '<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;justify-content:flex-end">';
-        html += '<button class="pref-btn" data-list-act="open-detail" data-task-id="' + escHtml(t.id) + '" style="padding:3px 10px;font-size:12px">查看详情</button>';
-        if ((t.status === 'completed' || t.status === 'failed') && t.failed > 0) {
-          html += '<button class="pref-btn" data-list-act="retry-failed" data-task-id="' + escHtml(t.id) + '" style="padding:3px 10px;font-size:12px;border-color:var(--danger);color:var(--danger)">全部重试</button>';
-        }
-        html += '<button class="pref-btn" data-list-act="delete" data-task-id="' + escHtml(t.id) + '" data-status="' + escHtml(t.status) + '" style="padding:3px 10px;font-size:12px;color:var(--danger);border-color:#e6b8b0">删除记录</button>';
-        html += '</div></div>';
+        badge.innerHTML = '识图中 ' + processed + '/' + t.total;
+        badge.style.borderColor = 'var(--primary)';
+        badge.style.color = 'var(--primary-dark)';
+        return;
       }
-      html += '</div>';
     }
-    html += '</div>';
-    box.innerHTML = html;
-
-    box.onclick = function (e) {
-      var btn = e.target.closest('button');
-      if (!btn) return;
-      if (btn.getAttribute('data-modal-list-close') === '1') { closeBatchTasksModal(); return; }
-      var act = btn.getAttribute('data-list-act');
-      var tid = btn.getAttribute('data-task-id');
-      var status = btn.getAttribute('data-status') || '';
-      if (act === 'open-detail' && tid) { openBatchTaskDetail(tid); closeBatchTasksModal(); }
-      else if (act === 'retry-failed' && tid) { retryFailedFromTask(tid); }
-      else if (act === 'delete' && tid) {
-        var promptMsg = status === 'running'
-          ? '删除这条正在跑的任务记录？任务本身会继续在后台跑完，但这条记录下次进来不会再显示。'
-          : '删除这条任务记录？';
-        customConfirm(promptMsg, async function () {
-          await deleteBatchTask(tid);
-          renderBatchTasksModalContent();
-        });
+    for (var j = 0; j < tasks.length; j++) {
+      var t2 = tasks[j];
+      if (t2.status === 'completed' && t2.applied < t2.completed) {
+        badge.hidden = false;
+        badge.innerHTML = (t2.completed - t2.applied) + ' 张待应用';
+        badge.style.borderColor = 'var(--success)';
+        badge.style.color = 'var(--success)';
+        return;
       }
-    };
+    }
+    for (var k = 0; k < tasks.length; k++) {
+      var t3 = tasks[k];
+      if ((t3.status === 'completed' || t3.status === 'failed') && t3.failed > 0) {
+        badge.hidden = false;
+        badge.innerHTML = t3.failed + ' 张识别失败';
+        badge.style.borderColor = 'var(--danger)';
+        badge.style.color = 'var(--danger)';
+        return;
+      }
+    }
+    badge.hidden = true;
   }
 
-  async function deleteBatchTask(taskId) {
-    try {
-      var resp = await fetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId)), { method: 'DELETE' });
-      var data = await resp.json();
-      if (data.ok) { batchTaskNotified[taskId] = true; checkBatchTasks(); toast('已删除任务记录'); }
-      else { toast('删除失败: ' + (data.error || ''), true); }
-    } catch (e) { toast('删除出错: ' + e.message, true); }
-  }
-
-  async function retryFailedFromTask(taskId) {
-    try {
-      var resp = await fetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId)));
-      var data = await resp.json();
-      if (!data.ok || !data.data) { toast('任务已不存在', true); return; }
-      var failedIds = (data.data.failed || []).map(function (f) { return f.id; });
-      if (failedIds.length === 0) { toast('没有失败的项', true); return; }
-      var newTaskId = await enqueueTagTask(failedIds, { message: '已创建全部重试任务，共 ' + failedIds.length + ' 张' });
-      if (newTaskId) {
-        closeBatchTasksModal();
-        openBatchTaskDetail(newTaskId);
-      }
-    } catch (e) { toast('重试失败: ' + e.message, true); }
+  // v0.25.1 - 角标点击直达：正在跑的任务 → 进度弹窗；有结果待应用 → 结果弹窗；
+  // 有失败项 → 失败结果弹窗。
+  function openBatchTasksModal() {
+    var running = batchTasksData.filter(function (t) { return t.status === 'running'; });
+    if (running.length > 0) { openBatchTaskDetail(running[0].id); return; }
+    var pendingApply = batchTasksData.filter(function (t) { return t.status === 'completed' && t.applied < t.completed; });
+    if (pendingApply.length > 0) { openBatchTaskDetail(pendingApply[0].id); return; }
+    var failedTasks = batchTasksData.filter(function (t) { return (t.status === 'completed' || t.status === 'failed') && t.failed > 0; });
+    if (failedTasks.length > 0) { openBatchTaskDetail(failedTasks[0].id); return; }
+    toast('当前没有识图任务');
   }
 
   function openBatchTaskDetail(taskId) {
@@ -2817,6 +3066,7 @@
     loadSemanticIndexStatus();
     checkBatchTasks();
     updateModelGuide();
+    updateUploadBtnState();
 
     // 导航：首页卡片点击
     document.querySelectorAll('.entry-card[data-goto]').forEach(function (card) {
@@ -2862,8 +3112,7 @@
       overlay.addEventListener('click', function (e) {
         if (e.target === overlay && overlay.id !== 'batch-modal' && overlay.id !== 'editor-modal') {
           if (overlay.id === 'chat-modal') { closeChatModal(); return; }
-          overlay.hidden = true;
-          overlay.style.display = '';
+          closeModal(overlay.id);
         }
       });
     });
@@ -2890,14 +3139,99 @@
     // 上传弹窗
     $('upload-btn').addEventListener('click', handleUpload);
     $('import-zip-btn').addEventListener('click', handleImportZip);
+
+    // v0.25.1 - 左右并排两个选择入口：图片文件 / 整个文件夹（互斥，后选为准）
+    $('pick-files-btn').addEventListener('click', function () { $('upload-file').click(); });
     $('upload-file').addEventListener('change', function () {
-      var count = this.files ? this.files.length : 0;
-      $('upload-file-hint').textContent = count
-        ? '已选择 ' + count + ' 张图片。导入后可以到图库中批量识图。'
-        : '支持 PNG、JPG、GIF、WebP 和 BMP。';
+      // 选了文件就清掉文件夹和粘贴选择，避免混用（后选为准）
+      resetFolderPick();
+      pastedFiles = [];
+      resetPasteZone();
+      updateUploadPickHint();
+      clearUploadResult();
+      updateUploadBtnState();
+    });
+    $('pick-folder-btn').addEventListener('click', function () { $('upload-folder').click(); });
+    $('upload-folder').addEventListener('change', function () {
+      if (!this.files || !this.files.length) return;
+      var r = collectFolderImages(this);
+      folderFiles = r.images;
+      var hint = $('upload-folder-hint');
+      if (folderFiles.length > 0) {
+        hint.textContent = '已从文件夹读取 ' + folderFiles.length + ' 张图片' + (r.skipped > 0 ? '（自动跳过 ' + r.skipped + ' 个非图片文件）' : '') + '，点「导入图片」开始';
+      } else {
+        hint.textContent = '文件夹里没找到图片（PNG/JPG/GIF/WebP/BMP）' + (r.skipped > 0 ? '，有 ' + r.skipped + ' 个其他文件被跳过' : '');
+      }
+      hint.hidden = false;
+      // 选了文件夹就清掉普通文件和粘贴选择，避免混用（后选为准）
+      $('upload-file').value = '';
+      pastedFiles = [];
+      resetPasteZone();
+      $('upload-file-hint').textContent = '支持 PNG、JPG、GIF、WebP 和 BMP，也可以整个文件夹一起选。';
+      clearUploadResult();
+      updateUploadBtnState();
+    });
+    // v0.25.1 - ZIP 选择也统一成按钮样式，选完提示文件名
+    $('pick-zip-btn').addEventListener('click', function () { $('upload-zip').click(); });
+    $('upload-zip').addEventListener('change', function () {
+      var file = this.files && this.files[0];
+      var hint = $('upload-zip-hint');
+      if (hint) hint.textContent = file ? '已选择：' + file.name + '，点「导入 ZIP」开始' : '选好后点「导入 ZIP」开始';
       clearUploadResult();
     });
-    $('upload-zip').addEventListener('change', clearUploadResult);
+
+    // v0.25.1 - 粘贴导入：导入弹窗打开时，Ctrl+V 的图片直接算选中（快捷单张）
+    var pasteZone = $('paste-zone');
+    if (pasteZone) {
+      pasteZone.addEventListener('click', function () {
+        this.focus();
+        pasteZoneReady = true;
+        if (!this.classList.contains('active')) {
+          var sub = this.querySelector('.paste-zone-sub');
+          if (sub) sub.textContent = '就绪！直接按 Ctrl+V 粘贴';
+        }
+      });
+    }
+    document.addEventListener('paste', function (e) {
+      var modal = $('upload-modal');
+      if (!modal || modal.hidden) return;
+      // 步骤引导：必须先点击粘贴区，再粘贴
+      if (!pasteZoneReady) {
+        toast('请先点击上面的粘贴区，再按 Ctrl+V', true);
+        return;
+      }
+      var items = e.clipboardData && e.clipboardData.items;
+      if (!items) return;
+      var file = null;
+      for (var pi = 0; pi < items.length; pi++) {
+        var it = items[pi];
+        if (it.type && it.type.indexOf('image/') === 0) {
+          var f = it.getAsFile();
+          if (f) { file = f; break; }
+        }
+      }
+      if (!file) return;
+      e.preventDefault();
+      var ext = (file.type || 'image/png').split('/')[1] || 'png';
+      pastedFiles = [new File([file], '粘贴图片.' + ext, { type: file.type })];
+      // 快捷单张：粘贴时清掉文件夹和文件多选，避免混用
+      resetFolderPick();
+      var fileInput2 = $('upload-file');
+      if (fileInput2) fileInput2.value = '';
+      updateUploadPickHint();
+      clearUploadResult();
+      // 粘贴区直接显示这张图
+      if (lastPasteUrl) URL.revokeObjectURL(lastPasteUrl);
+      lastPasteUrl = URL.createObjectURL(pastedFiles[0]);
+      if (pasteZone) {
+        pasteZone.classList.add('active');
+        pasteZone.innerHTML = '<img src="' + lastPasteUrl + '" alt="粘贴的图片">'
+          + '<div class="paste-zone-title">已粘贴 1 张图片</div>'
+          + '<div class="paste-zone-sub">再粘贴会替换这张，点「导入图片」开始</div>';
+      }
+      toast('已粘贴 1 张图片，点「导入图片」开始');
+      updateUploadBtnState();
+    });
 
     // 编辑弹窗
     $('editor-save').addEventListener('click', saveEdit);
@@ -2925,8 +3259,8 @@
       batchSummaryEl.addEventListener('click', function (e) {
         var btn = e.target.closest('button');
         if (!btn) return;
-        if (btn.id === 'batch-apply-all' && !btn.disabled) applyAllBatch();
-        else if (btn.id === 'batch-retry-failed') retryAllFailedBatch();
+        if (btn.id === 'batch-apply-all' && !btn.disabled) applyAllBatchResult();
+        else if (btn.id === 'batch-retry-failed') retryAllFailedBatchResult();
         else if (btn.id === 'batch-cancel-task') {
           var tid = btn.getAttribute('data-task-id');
           customConfirm('确定取消这个批量识图任务吗？', function () { cancelBatchTask(tid); });
@@ -2934,9 +3268,19 @@
       });
     }
 
+    // v0.25.1 - 角标定时刷新：识别时切去聊天页，回来角标状态也是最新的
+    setInterval(function () { checkBatchTasks(); }, 5000);
+
     // 筛选
     $('filter-emotion').addEventListener('change', loadStickers);
     $('filter-search').addEventListener('input', applyFilter);
+
+    // v0.24.0 - 图库页小图自适应开关
+    var fitToggleEl = $('sticker-fit-toggle');
+    if (fitToggleEl) {
+      fitToggleEl.addEventListener('click', toggleStickerFit);
+      syncFitToggle();
+    }
 
     // 点击图片放大
     $('sticker-grid').addEventListener('click', function (e) {
@@ -2957,13 +3301,15 @@
     document.addEventListener('keydown', function (e) {
       if (e.key === 'Escape') {
         document.querySelectorAll('.modal-overlay:not([hidden])').forEach(function (m) {
+          // v0.25.0 - ESC 关聊天弹窗也走 closeChatModal：通知后端清理 session，三条关闭路径对齐
+          if (m.id === 'chat-modal') { closeChatModal(); return; }
           if (m.id !== 'editor-modal' && m.id !== 'batch-modal') {
-            m.hidden = true;
-            m.style.display = '';
+            closeModal(m.id);
           }
         });
+        // v0.25.1 - 任务列表弹窗已移除，仅保留兼容清理
         var batchListModal = $('batch-tasks-list-modal');
-        if (batchListModal && batchListModal.style.display !== 'none') closeBatchTasksModal();
+        if (batchListModal && batchListModal.style.display !== 'none') batchListModal.style.display = 'none';
       }
     });
   });

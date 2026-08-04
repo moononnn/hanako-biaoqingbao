@@ -1,7 +1,7 @@
 import { copyFile, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { genId, atomicWriteJson } from '../lib/shared.js';
+import { genId, atomicWriteJson, enqueueToolWrite } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = join(__dirname, '..', 'data', 'stickers.json');
@@ -41,46 +41,41 @@ export async function execute(input, ctx) {
     return reply({ ok: false, error: `不支持的文件格式: .${ext}，支持: ${ALLOWED_EXTS.join(', ')}` });
   }
 
-  const id = genId();
-  const fileName = `${id}.${ext}`;
-  const destPath = join(stickersDir, fileName);
+  // v0.25.2 - 分配 id → 复制 → 写 meta 整体进串行队列：多会话并发调用时不会分配到同一个 id
+  return await enqueueToolWrite(async () => {
+    let stickers = [];
+    try {
+      const raw = await readFile(metaPath, 'utf-8');
+      stickers = JSON.parse(raw);
+    } catch { /* 新库 */ }
 
-  try {
-    await copyFile(sourcePath, destPath);
-  } catch (e) {
-    return reply({ ok: false, error: `复制文件失败: ${e.message}` });
-  }
+    const id = genId();
+    const fileName = `${id}.${ext}`;
+    const destPath = join(stickersDir, fileName);
 
-  let stickers = [];
-  try {
-    const raw = await readFile(metaPath, 'utf-8');
-    stickers = JSON.parse(raw);
-  } catch { /* 新库 */ }
+    try {
+      await copyFile(sourcePath, destPath);
+    } catch (e) {
+      return reply({ ok: false, error: `复制文件失败: ${e.message}` });
+    }
 
-  const entry = {
-    id,
-    file: fileName,
-    description: description || originalFile.replace(`.${ext}`, ''),
-    tags: {
-      emotion: emotion ? emotion.split(',').map(s => s.trim()).filter(Boolean) : [],
-      scene: scene ? scene.split(',').map(s => s.trim()).filter(Boolean) : [],
-      keywords: keywords ? keywords.split(',').map(s => s.trim()).filter(Boolean) : []
-    },
-    added_at: new Date().toISOString()
-  };
-
-  stickers.push(entry);
-  // v0.19.5 - 原子写，避免崩溃留下半截图库文件
-  atomicWriteJson(metaPath, stickers);
-
-  return reply({
-    ok: true,
-    data: {
-      id: entry.id,
+    const entry = {
+      id,
       file: fileName,
-      description: entry.description,
-      tags: entry.tags
-    },
-    message: `表情包「${entry.description}」已入库`
+      description: description || originalFile.replace(`.${ext}`, ''),
+      tags: {
+        emotion: emotion ? emotion.split(',').map(s => s.trim()).filter(Boolean) : [],
+        scene: scene ? scene.split(',').map(s => s.trim()).filter(Boolean) : [],
+        keywords: keywords ? keywords.split(',').map(s => s.trim()).filter(Boolean) : []
+      },
+      added_at: new Date().toISOString()
+    };
+
+    stickers.push(entry);
+    // v0.19.5 - 原子写，避免崩溃留下半截图库文件
+    atomicWriteJson(metaPath, stickers);
+
+    ctx?.log?.info?.(`[biaoqingbao] add_sticker 入库: ${id} (${fileName})`);
+    return reply({ ok: true, data: entry, message: `已添加表情包 ${id}` });
   });
 }

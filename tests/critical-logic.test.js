@@ -61,6 +61,7 @@ test('标签打分遵守偏好、否决和排除名单', () => {
   const preferred = scoreStickers(stickers, '开心', [], {
     preferred: ['b'],
     vetoed: ['a'],
+    dislikes: {},
   });
   assert.deepEqual(preferred.map(item => item.id), ['b']);
   assert.equal(preferred[0]._score, 18);
@@ -68,6 +69,7 @@ test('标签打分遵守偏好、否决和排除名单', () => {
   const excluded = scoreStickers(stickers, '开心', ['b'], {
     preferred: [],
     vetoed: [],
+    dislikes: {},
   });
   assert.deepEqual(excluded.map(item => item.id), ['a']);
 });
@@ -160,9 +162,79 @@ test('execute 调用契约：向量通道原地修改 scored 并返回同一引�
   assert.ok(scored.length > 0, '向量通道后应有候选');
 });
 
+test('累计不喜欢降权：次数越多分越低，多轮后基本出局（v0.25.0）', () => {
+  const stickers = [
+    { id: 'a', description: '开心大笑', tags: { emotion: ['开心'], scene: ['问候'] } },
+  ];
+
+  // 1 次不喜欢：-5，标签分 11 - 5 = 6，轻降频但还能出现（有机会再点）
+  const once = scoreStickers(stickers, '开心', [], { preferred: [], vetoed: [], dislikes: { a: 1 } });
+  assert.equal(once.length, 1);
+  assert.equal(once[0]._score, 6);
+
+  // 2 次不喜欢：-10，标签分 11 - 10 = 1，明显降频但仍在场（排最后，还能挽救）
+  const twice = scoreStickers(stickers, '开心', [], { preferred: [], vetoed: [], dislikes: { a: 2 } });
+  assert.equal(twice.length, 1);
+  assert.equal(twice[0]._score, 1);
+
+  // 3 次不喜欢：-15，跌破 0 基本不出现
+  const thrice = scoreStickers(stickers, '开心', [], { preferred: [], vetoed: [], dislikes: { a: 3 } });
+  assert.equal(thrice.length, 0);
+
+  // 5 次及以上惩罚封顶 -25，彻底出局
+  const many = scoreStickers(stickers, '开心', [], { preferred: [], vetoed: [], dislikes: { a: 9 } });
+  assert.equal(many.length, 0);
+});
+
+test('不喜欢累计与硬拉黑叠加：veto 的图再被点不喜欢，分更低（v0.25.0）', () => {
+  const stickers = [
+    { id: 'a', description: '开心大笑', tags: { emotion: ['开心'], scene: ['问候'] } },
+  ];
+  const result = scoreStickers(stickers, '开心', [], { preferred: [], vetoed: ['a'], dislikes: { a: 2 } });
+  assert.equal(result.length, 0);
+});
+
+test('向量补充通道同样吃偏好惩罚：veto/不喜欢的图不能绕道向量复出（v0.25.0 漏洞修复）', () => {
+  const stickers = [
+    { id: 'v1', description: '一只猫在打盹', tags: { emotion: ['困'], keywords: ['猫'] } },
+    { id: 'v2', description: '开心大笑', tags: { emotion: ['开心'], keywords: ['笑'] } },
+  ];
+  const tiredVec = [1, 0.9, 0.2];
+  const vectors = {
+    v1: [0.95, 0.85, 0.1],   // 与「疲惫」语义高度相似
+    v2: [0.1, 0.1, 0.9],
+  };
+
+  // v1 被硬拉黑：即使语义相似度极高（sim>0.35 会被补充），也要被 -20 拉回来
+  const scored = [];
+  const withVeto = applyVectorBonus(scored, stickers, tiredVec, vectors, [], {
+    preferred: [], vetoed: ['v1'], dislikes: {},
+  });
+  assert.equal(withVeto.length, 1);
+  assert.equal(withVeto[0].id, 'v1');
+  assert.ok(withVeto[0]._score < 0, 'veto 惩罚应盖过向量加分，分数为负');
+
+  // v1 被不喜欢 2 次：同样不能靠向量通道翻身
+  const scored2 = [];
+  const withDislike = applyVectorBonus(scored2, stickers, tiredVec, vectors, [], {
+    preferred: [], vetoed: [], dislikes: { v1: 2 },
+  });
+  assert.equal(withDislike.length, 1);
+  assert.equal(withDislike[0].id, 'v1');
+  assert.ok(withDislike[0]._score < 0, '2 次不喜欢的惩罚应盖过向量加分');
+
+  // 对照：没有偏好的图，向量通道正常加分
+  const scored3 = [];
+  const clean = applyVectorBonus(scored3, stickers, tiredVec, vectors, [], {
+    preferred: [], vetoed: [], dislikes: {},
+  });
+  assert.equal(clean.length, 1);
+  assert.ok(clean[0]._score > 0, '无偏好时向量命中应为正分');
+});
+
 test('偏好按助手隔离：不合并其他助手的喜欢/反感记录（回归：遍历全部 users 导致串号）', () => {
   const agentA = [
-    { context: { emotion: '开心' }, preferred_ids: ['a1'], vetoed_ids: ['a2'] },
+    { context: { emotion: '开心' }, preferred_ids: ['a1'], vetoed_ids: ['a2'], dislike_counts: { a3: 2 } },
     { context: { emotion: '难过' }, preferred_ids: ['a3'] },
   ];
   const agentB = [
@@ -170,17 +242,17 @@ test('偏好按助手隔离：不合并其他助手的喜欢/反感记录（回�
   ];
 
   const forA = collectPrefsForEmotion(agentA, '开心');
-  assert.deepEqual(forA, { preferred: ['a1'], vetoed: ['a2'] });
+  assert.deepEqual(forA, { preferred: ['a1'], vetoed: ['a2'], dislikes: { a3: 2 } });
 
   const forB = collectPrefsForEmotion(agentB, '开心');
-  assert.deepEqual(forB, { preferred: ['b1'], vetoed: ['b2'] });
+  assert.deepEqual(forB, { preferred: ['b1'], vetoed: ['b2'], dislikes: {} });
 
   // A 情绪是「难过」时拿不到「开心」的偏好
   const sadA = collectPrefsForEmotion(agentA, '难过');
-  assert.deepEqual(sadA, { preferred: ['a3'], vetoed: [] });
+  assert.deepEqual(sadA, { preferred: ['a3'], vetoed: [], dislikes: {} });
 
   // 该助手没有记录时为空
-  assert.deepEqual(collectPrefsForEmotion(undefined, '开心'), { preferred: [], vetoed: [] });
+  assert.deepEqual(collectPrefsForEmotion(undefined, '开心'), { preferred: [], vetoed: [], dislikes: {} });
 });
 
 test('问候词英文用词边界：this/while/something 不误判 hi（回归：字符串包含误判）', () => {
@@ -209,8 +281,8 @@ test('标签清洗：识图/情绪词去除换行、引号、控制字符并限�
 
 test('偏好收集：空情绪不收集任何偏好', () => {
   const mappings = [
-    { context: { emotion: '开心' }, preferred_ids: ['a1'], vetoed_ids: ['a2'] },
+    { context: { emotion: '开心' }, preferred_ids: ['a1'], vetoed_ids: ['a2'], dislike_counts: { a3: 1 } },
   ];
-  assert.deepEqual(collectPrefsForEmotion(mappings, ''), { preferred: [], vetoed: [] });
-  assert.deepEqual(collectPrefsForEmotion(mappings, undefined), { preferred: [], vetoed: [] });
+  assert.deepEqual(collectPrefsForEmotion(mappings, ''), { preferred: [], vetoed: [], dislikes: {} });
+  assert.deepEqual(collectPrefsForEmotion(mappings, undefined), { preferred: [], vetoed: [], dislikes: {} });
 });

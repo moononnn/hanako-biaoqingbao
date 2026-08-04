@@ -15,6 +15,7 @@ import { resolveAgentId, atomicWriteJson } from '../lib/shared.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const DATA_DIR = join(__dirname, '..', 'data');
+const STICKERS_FILE = join(DATA_DIR, 'stickers.json');
 const BAD_MATCHES_FILE = join(DATA_DIR, 'bad-matches.json');
 const PREFERENCES_FILE = join(DATA_DIR, 'preferences.json');
 const DECISION_LOG_FILE = join(DATA_DIR, 'decision-log.json');
@@ -77,11 +78,14 @@ function ensureUserMapping(prefs, agentId, emotion, keywords) {
       context: { emotion, keywords: kwList },
       preferred_ids: [],
       vetoed_ids: [],
+      dislike_counts: {},
       weight: 1,
       updated_at: new Date().toISOString()
     };
     user.mappings.push(mapping);
   } else {
+    // 旧数据兼容：没有 dislike_counts 时补上
+    if (!mapping.dislike_counts) mapping.dislike_counts = {};
     // 合并关键词
     const merged = [...new Set([...mapping.context.keywords, ...kwList])];
     mapping.context.keywords = merged;
@@ -123,9 +127,24 @@ export const parameters = {
 
 export async function execute(input, ctx) {
   const { sticker_id, feedback_type, reason, context_keywords, context_emotion } = input || {};
-  if (!sticker_id) return reply({ ok: false, error: '缺少 sticker_id' });
-  // 默认 negative（向后兼容）
+  // v0.25.0 - 严格校验：非法 ID / 非法反馈类型直接拒绝，不再静默走错分支
+  const sid = typeof sticker_id === 'string' ? sticker_id.trim() : '';
+  if (!sid) return reply({ ok: false, error: '缺少 sticker_id' });
+  if (feedback_type !== undefined && feedback_type !== 'positive' && feedback_type !== 'negative') {
+    return reply({ ok: false, error: 'feedback_type 必须是 positive 或 negative' });
+  }
   const fbType = feedback_type || 'negative';
+  if (typeof context_keywords !== 'undefined' && typeof context_keywords !== 'string') {
+    return reply({ ok: false, error: 'context_keywords 必须是字符串' });
+  }
+  // v0.25.0 - 校验 sticker 真实存在：空库 / 非法 ID 直接拒绝，防脏数据进偏好库
+  try {
+    const raw = await readFile(STICKERS_FILE, 'utf-8');
+    const stickers = JSON.parse(raw);
+    if (!stickers.some(s => s.id === sid)) return reply({ ok: false, error: '表情包不存在: ' + sid });
+  } catch {
+    return reply({ ok: false, error: '表情包库读取失败，请稍后再试' });
+  }
 
   const agentId = getAgentId(ctx);
   const kwList = context_keywords
@@ -133,24 +152,24 @@ export async function execute(input, ctx) {
     : [];
   const emotion = context_emotion || '';
 
-  ctx?.log?.info?.(`[biaoqingbao] 反馈: sticker=${sticker_id} type=${feedback_type} agent=${agentId}`);
+  ctx?.log?.info?.(`[biaoqingbao] 反馈: sticker=${sid} type=${feedback_type} agent=${agentId}`);
 
   // ── 1. 写偏好记忆库 ──
   const prefs = await loadPreferences();
   const mapping = ensureUserMapping(prefs, agentId, emotion, kwList);
 
   if (fbType === 'negative') {
-    // 从 preferred 中移除（如果之前喜欢过）
-    mapping.preferred_ids = mapping.preferred_ids.filter(id => id !== sticker_id);
-    // 加入 vetoed（防止重复）
-    if (!mapping.vetoed_ids.includes(sticker_id)) {
-      mapping.vetoed_ids.push(sticker_id);
-    }
+    // v0.25.0 - 不喜欢改为累计计数（多轮不喜欢 → 频率衰减），不再写入 vetoed 硬拉黑
+    // 历史 vetoed 数据保留硬排除语义（-20），不迁移
+    mapping.preferred_ids = mapping.preferred_ids.filter(id => id !== sid);
+    mapping.dislike_counts = mapping.dislike_counts || {};
+    mapping.dislike_counts[sid] = (mapping.dislike_counts[sid] || 0) + 1;
   } else {
-    // positive —— 从 vetoed 中移除（如果之前不喜欢过），加入 preferred
-    mapping.vetoed_ids = mapping.vetoed_ids.filter(id => id !== sticker_id);
-    if (!mapping.preferred_ids.includes(sticker_id)) {
-      mapping.preferred_ids.push(sticker_id);
+    // positive —— 从 vetoed 中移除（如果之前拉黑过），清零不喜欢次数，加入 preferred
+    mapping.vetoed_ids = mapping.vetoed_ids.filter(id => id !== sid);
+    if (mapping.dislike_counts) delete mapping.dislike_counts[sid];
+    if (!mapping.preferred_ids.includes(sid)) {
+      mapping.preferred_ids.push(sid);
     }
   }
   mapping.weight = Math.min(10, mapping.weight + 1);
@@ -168,7 +187,7 @@ export async function execute(input, ctx) {
     }
     let existing = null;
     for (const r of bmData.records) {
-      if (r.sticker_id !== sticker_id) continue;
+      if (r.sticker_id !== sid) continue;
       const rkws = r.context_keywords || [];
       const overlap = kwList.filter(k => rkws.includes(k));
       if (overlap.length > 0 || (!kwList.length && !rkws.length)) {
@@ -182,7 +201,7 @@ export async function execute(input, ctx) {
       existing.reason = reason || existing.reason;
     } else {
       bmData.records.push({
-        sticker_id,
+        sticker_id: sid,
         context_keywords: kwList,
         context_emotion: emotion,
         reason: reason || '',
@@ -221,7 +240,7 @@ export async function execute(input, ctx) {
     agent: agentId,
     type: 'user_feedback',
     feedback_type,
-    sticker_id,
+    sticker_id: sid,
     emotion,
     keywords: kwList,
     reason: reason || '',
@@ -232,12 +251,12 @@ export async function execute(input, ctx) {
 
   const msg = feedback_type === 'positive'
     ? '已记住，以后类似情景优先推荐这张图'
-    : '已记录，以后类似情景不会再配这张图';
+    : `已记录，以后类似情景会少配这张图（累计 ${mapping.dislike_counts?.[sid] || 1} 次）`;
 
   return reply({
     ok: true,
     data: {
-      sticker_id,
+      sticker_id: sid,
       feedback_type,
       message: msg
     }

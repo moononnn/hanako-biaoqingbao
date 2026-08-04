@@ -12,7 +12,7 @@ import {
   HANA_HOME, MIME_MAP,
   readEmbeddingConfig, resolveEmbeddingApi, generateEmbeddings,
   cosineSimilarity, readVectors, getAgentFreqSettings, markAgentStickerCooldown, resolveAgentId,
-  collectPrefsForEmotion, atomicWriteJson,
+  collectPrefsForEmotion, atomicWriteJson, prefsScoreBonus,
 } from '../lib/shared.js';
 
 const OUTPUT_DIR_CFG = join(dataDir, 'output-dir.json');
@@ -50,7 +50,8 @@ async function readVectorsCached() {
 // v0.19.5 - 向量打分纯函数（供 execute 与单元测试复用）
 // ⚠️ 副作用契约：原地修改 scored 数组（叠加 _score、补充新项）并返回同一个数组；
 // 调用方依赖此行为，改动返回值语义前必须先改 execute。
-export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, excludeIds) {
+// v0.25.0 - 新增 prefs 参数：向量补充通道同样应用偏好惩罚（修复 veto/不喜欢绕道向量通道钻回来的漏洞）
+export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, excludeIds, prefs) {
   if (!emotionVec || !vectorMap || Object.keys(vectorMap).length === 0) return scored;
 
   // 给已有打分的表情包加向量 bonus
@@ -69,7 +70,8 @@ export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, exc
     if (vec) {
       const sim = cosineSimilarity(emotionVec, vec);
       if (sim > 0.35) {
-        scored.push({ ...sticker, _score: sim * 10 });
+        // v0.25.0 - 补充命中也要吃偏好惩罚：vetoed/不喜欢次数照常降权，避免绕道向量通道复出
+        scored.push({ ...sticker, _score: sim * 10 + prefsScoreBonus(sticker.id, prefs) });
       }
     }
   }
@@ -79,7 +81,7 @@ export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, exc
 }
 
 // 向量检索：给已有打分加向量 bonus，并补充纯向量命中
-async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
+async function applyVectorScoring(scored, allStickers, emotion, excludeIds, prefs) {
   // v0.19.5 - 修复：readVectorsCached 是 async，少了 await 会导致向量通道整体静默失效
   const vectorsData = await readVectorsCached();
   if (!vectorsData?.vectors || Object.keys(vectorsData.vectors).length === 0) return scored;
@@ -99,7 +101,7 @@ async function applyVectorScoring(scored, allStickers, emotion, excludeIds) {
   }
   if (!emotionVec) return scored;
 
-  return applyVectorBonus(scored, allStickers, emotionVec, vectorsData.vectors, excludeIds);
+  return applyVectorBonus(scored, allStickers, emotionVec, vectorsData.vectors, excludeIds, prefs);
 }
 
 function reply(obj) {
@@ -123,7 +125,7 @@ async function loadPreferencesFor(emotion, agentId) {
     const users = data.users || {};
     // 优先级：当前助手 > 旧格式 default > 更老的根级 mappings（都只取一个，不合并，避免串号）
     const target = (agentId && users[agentId]) || users.default || (Array.isArray(data.mappings) ? { mappings: data.mappings } : null);
-    if (!target) return { preferred: [], vetoed: [] };
+    if (!target) return { preferred: [], vetoed: [], dislikes: {} };
     return collectPrefsForEmotion(target.mappings, emotion);
   } catch {
     return { preferred: [], vetoed: [] };
@@ -197,9 +199,8 @@ export function scoreStickers(stickers, emotion, excludeIds, prefs) {
       // 情绪词匹配 description
       if (sticker.description && sticker.description.includes(emotion)) { score += 3; }
 
-      // 偏好加权
-      if (prefs.preferred.includes(sticker.id)) { score += 10; }
-      if (prefs.vetoed.includes(sticker.id)) { score -= 20; }
+      // v0.25.0 - 偏好加权统一走 prefsScoreBonus（preferred +10 / vetoed -20 / 不喜欢次数 -10×count）
+      score += prefsScoreBonus(sticker.id, prefs);
 
       return { ...sticker, _score: score };
     })
@@ -271,7 +272,8 @@ export async function execute(input, ctx) {
   // v0.19.5 - 修复：applyVectorScoring 原地修改 scored 并返回同一个引用，
   // 若先 length=0 再 push(...vectorScored) 会把结果一起清空（vectorScored === scored），
   // 导致永远走到 no_match。恢复原地修改语义，不回填。
-  await applyVectorScoring(scored, stickers, emotion, allExclude);
+  // v0.25.0 - applyVectorScoring 传入 prefs：向量补充通道同样应用偏好惩罚
+  await applyVectorScoring(scored, stickers, emotion, allExclude, prefs);
 
   if (scored.length === 0) {
     return reply({

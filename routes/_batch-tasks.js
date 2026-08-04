@@ -263,6 +263,21 @@ function markTaskApplied(taskId, stickerIds) {
   return { ok: true, applied: task.applied.length };
 }
 
+// v0.25.1 - 重试成功后清除旧任务的失败记录：失败项已被新任务接管，
+// 旧任务不再显示这些失败（如果它没有其他待处理项，就会从列表里自然消失）
+function markTaskRetried(taskId, stickerIds) {
+  const task = getTask(taskId);
+  if (!task) return { ok: false, error: '任务不存在' };
+  const idSet = new Set(stickerIds || []);
+  if (idSet.size === 0) return { ok: false, error: '缺少 sticker_ids' };
+  const before = (task.failed || []).length;
+  task.failed = (task.failed || []).filter(f => !idSet.has(typeof f === 'string' ? f : f?.id));
+  if (task.failed.length === before) return { ok: false, error: '没有可清除的失败项' };
+  task.updated_at = new Date().toISOString();
+  saveTask(task);
+  return { ok: true, cleared: before - task.failed.length };
+}
+
 function listTasks(filter = {}) {
   const all = readBatchTasks();
   let tasks = all.order.map(id => all.tasks[id]).filter(Boolean);
@@ -389,8 +404,10 @@ export function registerBatchTasksRoutes(app, ctx) {
       if (stickerIds.length === 0) {
         return jsonResp({ ok: false, error: '缺少 sticker_ids' }, 400);
       }
-      if (stickerIds.length > 200) {
-        return jsonResp({ ok: false, error: '单次最多 200 张' }, 400);
+      // v0.25.1 - 上限放宽到 1000：任务本身是流式队列，单任务几百张毫无压力，
+      // 用户不再需要手动分批；超过 1000 的极端图库前端会拆两次创建。
+      if (stickerIds.length > 1000) {
+        return jsonResp({ ok: false, error: '单次最多 1000 张' }, 400);
       }
       // 验证 sticker 存在
       const meta = readMeta();
@@ -428,12 +445,30 @@ export function registerBatchTasksRoutes(app, ctx) {
     return jsonResp({ ok: true, data: tasks });
   });
 
-  // GET /api/batch-task/:id — 查任务详情（含 results）
+  // GET /api/batch-task/:id — 查任务详情
+  // 默认返回精简版（只有计数 + 正在处理项，不含 results / 明细数组），
+  // 供进度轮询使用：几百张的任务每 1.5s 拉一次也不会卡带宽。
+  // 传 full=1 才返回完整任务（results / completed / failed / applied），供结果视图使用。
   app.get('/api/batch-task/:id', async (c) => {
     const id = c.req.param('id');
     const task = getTask(id);
     if (!task) return jsonResp({ ok: false, error: '任务不存在' }, 404);
-    return jsonResp({ ok: true, data: task });
+    if (c.req.query('full') === '1') {
+      return jsonResp({ ok: true, data: task });
+    }
+    return jsonResp({ ok: true, data: {
+      id: task.id,
+      created_at: task.created_at,
+      updated_at: task.updated_at,
+      status: task.status,
+      total: task.total,
+      completed_count: (task.completed || []).length,
+      failed_count: (task.failed || []).length,
+      pending_count: (task.pending || []).length,
+      applied_count: Array.isArray(task.applied) ? task.applied.length : 0,
+      current_ids: task.current_ids || [],
+      error: task.error || null,
+    } });
   });
 
   // POST /api/batch-task/:id/cancel — 取消运行中的任务
@@ -449,6 +484,14 @@ export function registerBatchTasksRoutes(app, ctx) {
     const stickerIds = Array.isArray(body.sticker_ids) ? body.sticker_ids : [];
     if (stickerIds.length === 0) return jsonResp({ ok: false, error: '缺少 sticker_ids' }, 400);
     return jsonResp(markTaskApplied(id, stickerIds));
+  });
+
+  // POST /api/batch-task/:id/retried — 重试成功后清除旧任务的失败记录
+  app.post('/api/batch-task/:id/retried', async (c) => {
+    const id = c.req.param('id');
+    const body = await c.req.json().catch(() => ({}));
+    const stickerIds = Array.isArray(body.sticker_ids) ? body.sticker_ids : [];
+    return jsonResp(markTaskRetried(id, stickerIds));
   });
 
   // DELETE /api/batch-task/:id — 删除任务记录

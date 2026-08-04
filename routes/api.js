@@ -8,24 +8,22 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import {
-  STICKERS_DIR, DATA_DIR, META_FILE, VISION_CFG_FILE, TEXT_CFG_FILE,
-  EMBEDDING_CFG_FILE, VECTORS_FILE, PREFERENCES_FILE, DECISION_LOG_FILE,
-  AGENT_FREQ_FILE, BLOCKED_FILE,
-  HANA_HOME, MODELS_JSON, PROVIDER_CATALOG,
-  MIME_MAP,
+  STICKERS_DIR, DATA_DIR, PREFERENCES_FILE, BLOCKED_FILE,
+  HANA_HOME, MIME_MAP,
   readMeta, writeMeta,
-  readVisionConfig, writeVisionConfig, getProviderApiConfig, resolveVisionApi,
-  isReasoningModel, getAvailableVisionModels, getAvailableTextModels,
-  tagImage, AUTOTAG_PROMPT,
+  readVisionConfig, writeVisionConfig, getProviderApiConfig,
+  getAvailableVisionModels, getAvailableTextModels,
+  tagImage,
   readEmbeddingConfig, writeEmbeddingConfig, resolveEmbeddingApi,
-  generateEmbeddings, cosineSimilarity, readVectors, writeVectors,
+  generateEmbeddings, readVectors, writeVectors,
   readTextConfig, writeTextConfig,
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
-  json, escapeHtml, ensureDataDir, atomicWriteJson,
+  json, atomicWriteJson,
 } from '../lib/shared.js';
 import {
   DIALECT_LIST,
   readDialectConfig, writeDialectConfig, syncDialectToIshiki, reconcileDialectToIshiki,
+  removeDialectFromIshiki,
   appendDialectLog, readDialectLog,
 } from '../lib/dialect.js';
 import { extractImagesFromZip, hasImageSignature } from '../lib/zip-images.js';
@@ -61,6 +59,16 @@ function buildStickerEntry(id, destFile, sourceName, fields) {
 
 export default async function registerRoutes(app, ctx) {
   ctx?.log?.info?.('[biaoqingbao] API 路由已注册');
+
+  // v0.25.1 - 上传写队列：前端并发上传时，「读 meta → 分配 id → 写文件 → 追加 → 写 meta」
+  // 必须串行，否则两个请求会分配到同一个 id 互相覆盖，或 meta.json 并发读改写丢失条目。
+  // （坑 47：并发写文件竞态）
+  let uploadWriteChain = Promise.resolve();
+  function enqueueUploadWrite(task) {
+    const p = uploadWriteChain.then(task, task);
+    uploadWriteChain = p.catch(() => {});
+    return p;
+  }
 
   // ═══ GET /api/list — 列表（可按情绪筛选） ═══
   app.get('/api/list', (c) => {
@@ -109,20 +117,23 @@ export default async function registerRoutes(app, ctx) {
       if (!hasImageSignature(imageData, ext))
         return json({ ok: false, error: '图片内容与文件格式不符' });
 
-      const meta = readMeta();
-      const id = nextStickerId(meta);
-      const destFile = id + '.' + ext;
-      const destPath = path.join(STICKERS_DIR, destFile);
-      try {
-        fs.mkdirSync(STICKERS_DIR, { recursive: true });
-        fs.writeFileSync(destPath, imageData);
-        const entry = buildStickerEntry(id, destFile, fileName, { emotion, scene, keywords, description });
-        meta.push(entry); writeMeta(meta);
-        return json({ ok: true, data: entry, message: '已入库' });
-      } catch (error) {
-        try { fs.unlinkSync(destPath); } catch {}
-        return json({ ok: false, error: error.message || '图片入库失败' }, 500);
-      }
+      // 入库写操作进串行队列（校验在队列外，互不阻塞）
+      return await enqueueUploadWrite(async () => {
+        const meta = readMeta();
+        const id = nextStickerId(meta);
+        const destFile = id + '.' + ext;
+        const destPath = path.join(STICKERS_DIR, destFile);
+        try {
+          fs.mkdirSync(STICKERS_DIR, { recursive: true });
+          fs.writeFileSync(destPath, imageData);
+          const entry = buildStickerEntry(id, destFile, fileName, { emotion, scene, keywords, description });
+          meta.push(entry); writeMeta(meta);
+          return json({ ok: true, data: entry, message: '已入库' });
+        } catch (error) {
+          try { fs.unlinkSync(destPath); } catch {}
+          return json({ ok: false, error: error.message || '图片入库失败' }, 500);
+        }
+      });
     }
 
     // ── ZIP 批量导入 ──
@@ -168,7 +179,7 @@ export default async function registerRoutes(app, ctx) {
         writeMeta(meta);
         return json({
           ok: true,
-          data: { imported: imported.length, skipped: skipped.length, skippedItems: skipped.slice(0, 30) },
+          data: { imported: imported.length, skipped: skipped.length, skippedItems: skipped.slice(0, 30), importedIds: imported.map(e => e.id) },
           message: `成功导入 ${imported.length} 张，跳过 ${skipped.length} 个文件`,
         });
       } catch (error) {
@@ -200,6 +211,32 @@ export default async function registerRoutes(app, ctx) {
       return json({ ok: true, message: '已更新', tagged_at: meta[idx].tagged_at });
     }
 
+    // ── 批量应用（识图结果一键写入，一次读改写 meta）──
+    if (action === 'batch_update') {
+      const { items } = body;
+      if (!Array.isArray(items) || items.length === 0) return json({ ok: false, error: '缺少 items' });
+      if (items.length > 1000) return json({ ok: false, error: '单次最多 1000 条' });
+      const meta = readMeta();
+      let updated = 0;
+      const now = new Date().toISOString();
+      for (const it of items) {
+        if (!it || !it.id) continue;
+        const idx = meta.findIndex(s => s.id === it.id);
+        if (idx === -1) continue;
+        const toList = (v) => Array.isArray(v) ? v.map(s => String(s).trim()).filter(Boolean) : splitTags(v);
+        if (it.emotion !== undefined) meta[idx].tags.emotion = toList(it.emotion);
+        if (it.scene !== undefined) meta[idx].tags.scene = toList(it.scene);
+        if (it.keywords !== undefined) meta[idx].tags.keywords = toList(it.keywords);
+        if (it.description !== undefined) meta[idx].description = it.description;
+        if (it.semantic_description !== undefined) meta[idx].semantic_description = it.semantic_description;
+        meta[idx].tagged_at = now;
+        updated++;
+      }
+      if (updated === 0) return json({ ok: false, error: '没有找到可更新的表情包' });
+      writeMeta(meta);
+      return json({ ok: true, updated, message: `已应用 ${updated} 张` });
+    }
+
     // ── 删除 ──
     if (action === 'delete') {
       const { id } = body;
@@ -221,9 +258,12 @@ export default async function registerRoutes(app, ctx) {
             for (const m of mappings) {
               const beforeP = (m.preferred_ids || []).length;
               const beforeV = (m.vetoed_ids || []).length;
+              const beforeD = m.dislike_counts ? Object.keys(m.dislike_counts).length : 0;
               m.preferred_ids = (m.preferred_ids || []).filter(x => x !== id);
               m.vetoed_ids = (m.vetoed_ids || []).filter(x => x !== id);
-              cleanedRefs += (beforeP - m.preferred_ids.length) + (beforeV - m.vetoed_ids.length);
+              if (m.dislike_counts) delete m.dislike_counts[id];
+              cleanedRefs += (beforeP - m.preferred_ids.length) + (beforeV - m.vetoed_ids.length)
+                + (beforeD - (m.dislike_counts ? Object.keys(m.dislike_counts).length : 0));
             }
           }
           if (cleanedRefs > 0) atomicWriteJson(prefsFile, prefs);
@@ -430,6 +470,50 @@ export default async function registerRoutes(app, ctx) {
     } catch (e) {
       ctx?.log?.error?.('[biaoqingbao] 识图失败:', e.message);
       return json({ ok: false, error: e.message });
+    }
+  });
+
+  // ═══ POST /api/auto-tag-id — 按 id 单张识图（v0.25.1）═══
+  // 卡片上的「识图」按钮走这个：当场识别、当场写入标签，不再绕后台任务。
+  // preview=true 时只识别不落库（编辑器预览用，用户点保存才生效）。
+  app.post('/api/auto-tag-id', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const id = body && body.id;
+      if (!id) return json({ ok: false, error: '缺少 id' }, 400);
+      const preview = body.preview === true;
+      const meta = readMeta();
+      const sticker = meta.find(s => s.id === id);
+      if (!sticker) return json({ ok: false, error: '表情包不存在' }, 404);
+      const filePath = path.join(STICKERS_DIR, sticker.file);
+      if (!fs.existsSync(filePath)) return json({ ok: false, error: '图片文件不存在' }, 404);
+      const buf = fs.readFileSync(filePath);
+      const result = await tagImage(buf.toString('base64'), sticker.file);
+      if (!result.ok) {
+        ctx?.log?.warn?.('[biaoqingbao] 单张识图失败:', result.error);
+        return json({ ok: false, error: result.error || '识图失败' });
+      }
+      const sug = result.data || {};
+      if (preview) {
+        ctx?.log?.info?.('[biaoqingbao] 单张识图预览:', id);
+        return json({ ok: true, data: sug, message: '识别完成（预览，点保存才生效）' });
+      }
+      // 写回前重新读最新快照再合并：识图期间其他写操作（上传/删除/改标签）不能丢（发布前审查修复）
+      const latest = readMeta();
+      const idx = latest.findIndex(s => s.id === id);
+      if (idx === -1) return json({ ok: false, error: '表情包不存在' }, 404);
+      if (sug.description) latest[idx].description = sug.description;
+      if (sug.semantic_description) latest[idx].semantic_description = sug.semantic_description;
+      if (Array.isArray(sug.emotion)) latest[idx].tags.emotion = sug.emotion.filter(Boolean);
+      if (Array.isArray(sug.scene)) latest[idx].tags.scene = sug.scene.filter(Boolean);
+      if (Array.isArray(sug.keywords)) latest[idx].tags.keywords = sug.keywords.filter(Boolean);
+      latest[idx].tagged_at = new Date().toISOString();
+      writeMeta(latest);
+      ctx?.log?.info?.('[biaoqingbao] 单张识图并应用:', id);
+      return json({ ok: true, data: sug, message: '识图完成，标签已应用' });
+    } catch (e) {
+      ctx?.log?.error?.('[biaoqingbao] 单张识图应用失败:', e.message);
+      return json({ ok: false, error: e.message }, 500);
     }
   });
 
@@ -736,6 +820,31 @@ export default async function registerRoutes(app, ctx) {
     }
   });
 
+  // ═══ GET /api/display-config — 读取配图卡片显示配置 ═══
+  app.get('/api/display-config', (c) => {
+    let cfg = { smallImageFit: true };
+    try {
+      cfg = { ...cfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) };
+    } catch {}
+    return json({ ok: true, data: cfg });
+  });
+
+  // ═══ POST /api/display-config — 保存配图卡片显示配置 ═══
+  app.post('/api/display-config', async (c) => {
+    try {
+      const body = await c.req.json();
+      const threshold = Math.max(50, Math.min(500, Number(body.smallImageThreshold) || 200));
+      const cfg = {
+        smallImageFit: typeof body.smallImageFit === 'boolean' ? body.smallImageFit : true,
+        smallImageThreshold: threshold,
+      };
+      atomicWriteJson(path.join(DATA_DIR, 'display-config.json'), cfg);
+      return json({ ok: true, data: cfg });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
   // ═══ GET /api/preferences — 读取偏好 ═══
   app.get('/api/preferences', (c) => {
     const agent = c.req.query('agent') || '';
@@ -782,24 +891,29 @@ export default async function registerRoutes(app, ctx) {
       if (!mapping) {
         mapping = {
           context: { emotion, keywords: kwList },
-          preferred_ids: [], vetoed_ids: [], weight: 1,
+          preferred_ids: [], vetoed_ids: [], dislike_counts: {}, weight: 1,
           updated_at: new Date().toISOString()
         };
         user.mappings.push(mapping);
       }
 
       if (feedback_type === 'positive') {
+        // v0.25.0 - 喜欢：清掉累计不喜欢次数，移除历史拉黑，加入 preferred
         mapping.vetoed_ids = mapping.vetoed_ids.filter(id => id !== sticker_id);
+        if (mapping.dislike_counts) delete mapping.dislike_counts[sticker_id];
         if (!mapping.preferred_ids.includes(sticker_id)) mapping.preferred_ids.push(sticker_id);
       } else {
+        // v0.25.0 - 不喜欢改为累计计数（多轮不喜欢 → 频率衰减），不再写入 vetoed 硬拉黑
         mapping.preferred_ids = mapping.preferred_ids.filter(id => id !== sticker_id);
-        if (!mapping.vetoed_ids.includes(sticker_id)) mapping.vetoed_ids.push(sticker_id);
+        if (!mapping.dislike_counts) mapping.dislike_counts = {};
+        mapping.dislike_counts[sticker_id] = (mapping.dislike_counts[sticker_id] || 0) + 1;
       }
       mapping.weight = Math.min(10, mapping.weight + 1);
       mapping.updated_at = new Date().toISOString();
 
       atomicWriteJson(prefsFile, prefs);
-      return json({ ok: true, message: '偏好已更新' });
+      const dislikeCount = (mapping.dislike_counts || {})[sticker_id] || 0;
+      return json({ ok: true, message: '偏好已更新', dislike_count: dislikeCount });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -830,9 +944,16 @@ export default async function registerRoutes(app, ctx) {
         mapping.weight = Math.max(0, Math.min(10, w));
       } else if (action === 'remove_from_list') {
         if (!sticker_id || !list) return json({ ok: false, error: '缺少 sticker_id 或 list' }, 400);
-        if (list !== 'preferred' && list !== 'vetoed') return json({ ok: false, error: 'list 必须是 preferred 或 vetoed' }, 400);
-        const key = list + '_ids';
-        mapping[key] = mapping[key].filter(id => id !== sticker_id);
+        if (list === 'preferred') {
+          mapping.preferred_ids = (mapping.preferred_ids || []).filter(id => id !== sticker_id);
+        } else if (list === 'vetoed') {
+          mapping.vetoed_ids = (mapping.vetoed_ids || []).filter(id => id !== sticker_id);
+        } else if (list === 'dislikes') {
+          // v0.25.0 - 移除某张图的不喜欢累计次数
+          if (mapping.dislike_counts) delete mapping.dislike_counts[sticker_id];
+        } else {
+          return json({ ok: false, error: 'list 必须是 preferred / vetoed / dislikes' }, 400);
+        }
       } else if (action === 'delete_mapping') {
         user.mappings.splice(mapping_index, 1);
       } else {
@@ -867,11 +988,20 @@ export default async function registerRoutes(app, ctx) {
         for (const m of mappings) {
           const beforeP = (m.preferred_ids || []).length;
           const beforeV = (m.vetoed_ids || []).length;
+          const beforeD = m.dislike_counts ? Object.keys(m.dislike_counts).length : 0;
           m.preferred_ids = (m.preferred_ids || []).filter(x => validIds.has(x));
           m.vetoed_ids = (m.vetoed_ids || []).filter(x => validIds.has(x));
-          cleanedPrefs += (beforeP - m.preferred_ids.length) + (beforeV - m.vetoed_ids.length);
-          // 如果 mapping 偏好和排除都是空，删除整条
-          if (m.preferred_ids.length === 0 && m.vetoed_ids.length === 0) {
+          if (m.dislike_counts) {
+            for (const k of Object.keys(m.dislike_counts)) {
+              if (!validIds.has(k)) delete m.dislike_counts[k];
+            }
+          }
+          cleanedPrefs += (beforeP - m.preferred_ids.length) + (beforeV - m.vetoed_ids.length)
+            + (beforeD - (m.dislike_counts ? Object.keys(m.dislike_counts).length : 0));
+          // 如果 mapping 偏好、排除、不喜欢计数都是空，删除整条
+          const hasAny = m.preferred_ids.length > 0 || m.vetoed_ids.length > 0
+            || (m.dislike_counts && Object.keys(m.dislike_counts).length > 0);
+          if (!hasAny) {
             cleanedMappings += 1;
             continue;
           }
@@ -1126,7 +1256,13 @@ export default async function registerRoutes(app, ctx) {
       // 清理回复中的 <suggestion> 标签，前端展示更干净
       const cleanReply = rawReply.replace(/<suggestion>[\s\S]*?<\/suggestion>/g, '').trim();
 
-      return json({ ok: true, session_id: sid, reply: cleanReply, suggestion });
+      // v0.25.0 - 附带旧标签，前端（配图卡片内联聊天）可直接渲染修改前后对照
+      return json({ ok: true, session_id: sid, reply: cleanReply, suggestion, old_tags: {
+        description: sticker.description || '',
+        emotion: tags.emotion || [],
+        scene: tags.scene || [],
+        keywords: tags.keywords || [],
+      } });
     } catch (e) {
       ctx?.log?.error?.('[biaoqingbao] chat error:', e.message);
       return json({ ok: false, error: e.message }, 500);
@@ -1139,6 +1275,18 @@ export default async function registerRoutes(app, ctx) {
       const body = await c.req.json();
       const { session_id, sticker_id, new_tags } = body || {};
       if (!sticker_id || !new_tags) return json({ ok: false, error: '缺少 sticker_id 或 new_tags' }, 400);
+      if (typeof new_tags !== 'object' || Array.isArray(new_tags)) return json({ ok: false, error: 'new_tags 必须是对象' }, 400);
+
+      // v0.25.0 - 会话归属校验：提供了 session_id 就必须存在且属于该 sticker（防跨图确认）
+      // 会话过期（TTL 30 分钟）时降级放行并记日志：页面有鉴权，边缘情况不让用户白点一次
+      if (session_id) {
+        const session = chatSessions.get(session_id);
+        if (!session) {
+          ctx?.log?.warn?.('[biaoqingbao] confirm 会话不存在（可能已过期）: ' + session_id);
+        } else if (session.sticker_id !== sticker_id) {
+          return json({ ok: false, error: '会话与表情包不匹配' }, 400);
+        }
+      }
 
       const meta = readMeta();
       const idx = meta.findIndex(s => s.id === sticker_id);
@@ -1146,13 +1294,43 @@ export default async function registerRoutes(app, ctx) {
 
       const sticker = meta[idx];
 
+      // v0.25.0 - new_tags 白名单严格校验：只接受已知字段，类型/长度全部收紧，防脏数据入库
+      const cleanTags = {};
+      if (new_tags.description !== undefined) {
+        if (typeof new_tags.description !== 'string') return json({ ok: false, error: 'description 必须是字符串' }, 400);
+        cleanTags.description = new_tags.description.trim().slice(0, 100);
+      }
+      if (new_tags.semantic_description !== undefined) {
+        if (typeof new_tags.semantic_description !== 'string') return json({ ok: false, error: 'semantic_description 必须是字符串' }, 400);
+        cleanTags.semantic_description = new_tags.semantic_description.trim().slice(0, 300);
+      }
+      const cleanTagList = (v, maxCount, itemMaxLen) => {
+        if (!Array.isArray(v)) return null;
+        return v.map(s => String(s).trim().slice(0, itemMaxLen)).filter(Boolean).slice(0, maxCount);
+      };
+      if (new_tags.emotion !== undefined) {
+        const list = cleanTagList(new_tags.emotion, 5, 30);
+        if (list === null) return json({ ok: false, error: 'emotion 必须是数组' }, 400);
+        cleanTags.emotion = list;
+      }
+      if (new_tags.scene !== undefined) {
+        const list = cleanTagList(new_tags.scene, 8, 4);
+        if (list === null) return json({ ok: false, error: 'scene 必须是数组' }, 400);
+        cleanTags.scene = list;
+      }
+      if (new_tags.keywords !== undefined) {
+        const list = cleanTagList(new_tags.keywords, 12, 30);
+        if (list === null) return json({ ok: false, error: 'keywords 必须是数组' }, 400);
+        cleanTags.keywords = list;
+      }
+
       // 更新标签（保留原有字段，只覆盖 new_tags 里提供的）
-      if (typeof new_tags.description === 'string') sticker.description = new_tags.description.trim();
-      if (typeof new_tags.semantic_description === 'string') sticker.semantic_description = new_tags.semantic_description.trim();
+      if (cleanTags.description !== undefined) sticker.description = cleanTags.description;
+      if (cleanTags.semantic_description !== undefined) sticker.semantic_description = cleanTags.semantic_description;
       sticker.tags = sticker.tags || {};
-      if (Array.isArray(new_tags.emotion)) sticker.tags.emotion = new_tags.emotion.slice(0, 5);
-      if (Array.isArray(new_tags.scene)) sticker.tags.scene = new_tags.scene.slice(0, 8).map(s => String(s).slice(0, 4));
-      if (Array.isArray(new_tags.keywords)) sticker.tags.keywords = new_tags.keywords.slice(0, 12);
+      if (cleanTags.emotion !== undefined) sticker.tags.emotion = cleanTags.emotion;
+      if (cleanTags.scene !== undefined) sticker.tags.scene = cleanTags.scene;
+      if (cleanTags.keywords !== undefined) sticker.tags.keywords = cleanTags.keywords;
       sticker.tagged_at = new Date().toISOString();
 
       writeMeta(meta);
@@ -1401,6 +1579,57 @@ export default async function registerRoutes(app, ctx) {
     }
   });
 
+  // ═══ POST /api/agents/remove — 删除助手（v0.25.2）═══
+  // 只清理该助手在插件里的数据（频率/偏好/方言/人格块），不写任何忽略名单：
+  // 用户点「刷新列表」后所有助手（含刚删的）会重新出现，自由度交给用户。
+  app.post('/api/agents/remove', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const agentId = body && String(body.agentId || '').trim();
+      if (!agentId) return json({ ok: false, error: '缺少 agentId' }, 400);
+
+      // 1) 配图频率设置
+      const freq = readAgentFreqConfig();
+      if (freq.agents && freq.agents[agentId]) {
+        delete freq.agents[agentId];
+        writeAgentFreqConfig(freq);
+      }
+
+      // 2) 偏好记录（喜欢/不喜欢/累计次数）
+      try {
+        const prefs = JSON.parse(fs.readFileSync(PREFERENCES_FILE, 'utf-8'));
+        if (prefs.users && prefs.users[agentId]) {
+          delete prefs.users[agentId];
+          atomicWriteJson(PREFERENCES_FILE, prefs);
+        }
+      } catch {}
+
+      // 3) 方言配置 + 人格文件里的方言块（有残留就一并清掉）
+      const dcfg = readDialectConfig();
+      if (dcfg.agents && dcfg.agents[agentId]) {
+        try { removeDialectFromIshiki(agentId); } catch {}
+        delete dcfg.agents[agentId];
+        writeDialectConfig(dcfg);
+      }
+
+      // 4) 历史屏蔽名单
+      try {
+        const blocked = JSON.parse(fs.readFileSync(BLOCKED_FILE, 'utf-8'));
+        if (Array.isArray(blocked.blockedIds)) {
+          const before = blocked.blockedIds.length;
+          blocked.blockedIds = blocked.blockedIds.filter((x) => x !== agentId);
+          if (blocked.blockedIds.length !== before) atomicWriteJson(BLOCKED_FILE, blocked);
+        }
+      } catch {}
+
+      ctx?.log?.info?.('[biaoqingbao] 删除助手:', agentId);
+      return json({ ok: true, message: `已删除助手「${agentId}」，其插件数据已清理（刷新列表后会重新出现）` });
+    } catch (e) {
+      ctx?.log?.error?.('[biaoqingbao] 删除助手失败:', e.message);
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
   // ════════════════════════════════════════════════════════════════
   //  v0.17.0 助手配图频率控制（屏蔽助手的升级版）
   // ════════════════════════════════════════════════════════════════
@@ -1441,7 +1670,7 @@ export default async function registerRoutes(app, ctx) {
       ok: true,
       data: {
         config,
-        dialects: DIALECT_LIST.map(d => ({ id: d.id, name: d.name, tagline: d.tagline, difficulty: d.difficulty, difficultyNote: d.difficultyNote })),
+        dialects: DIALECT_LIST.map(d => ({ id: d.id, name: d.name, tagline: d.tagline, difficulty: d.difficulty, difficultyNote: d.difficultyNote, hasAdvanced: Boolean(d.personaAdvanced) })),
       },
     });
   });
