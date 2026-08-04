@@ -7,7 +7,7 @@ import path from 'node:path';
 import {
   DIALECTS, DIALECT_LIST,
   getDialect, buildDialectPrompt, buildDialectPersona,
-  buildDialectEcho, isWorkTalk, shouldBoostRound,
+  buildDialectEcho, BOOST_EXAMPLES, isWorkTalk, shouldBoostRound,
   readDialectConfig, writeDialectConfig, getAgentDialectSetting,
   applyDialectToIshiki, removeDialectFromIshiki, readDialectFromIshiki,
   syncDialectToIshiki, reconcileDialectToIshiki,
@@ -41,11 +41,11 @@ test('方言库完整性：9 种方言齐全，字段非空，难度标注仅新
     assert.ok(d.people, `${d.id} 缺 people`);
     assert.ok(d.tagline, `${d.id} 缺 tagline`);
     assert.ok(['easy', 'medium', 'hard'].includes(d.difficulty), `${d.id} 难度标注无效`);
-    // v0.23.0：难度标注只保留新疆话一处（提醒其他用户预期）
+    // v0.26.0：新疆话普通版效果一般（模型语料少），保留提示引导开加浓；其余方言不标注
     if (d.id === 'xinjiang') {
-      assert.equal(d.difficultyNote, '效果一般', '新疆话应保留「效果一般」提醒');
+      assert.ok(d.difficultyNote && d.difficultyNote.includes('建议开加浓'), '新疆话应保留「效果一般，建议开加浓」提醒');
     } else {
-      assert.ok(!d.difficultyNote, `${d.id} 不应再标注效果`);
+      assert.ok(!d.difficultyNote, `${d.id} 不应标注效果难度`);
     }
     assert.ok(Array.isArray(d.markers) && d.markers.length >= 4, `${d.id} 标志词不足`);
     assert.ok(Array.isArray(d.particles) && d.particles.length >= 2, `${d.id} 语气词不足`);
@@ -60,7 +60,7 @@ test('方言库完整性：9 种方言齐全，字段非空，难度标注仅新
 });
 
 test('习惯式文案：身份化、锚定起头、质量声明、零指令词、强调打字场景、正事不压制', () => {
-  // easy/medium：整句方言模式
+  // easy/medium：整句方言模式（v0.26.0：新疆话走 personaNormal 特制文案，见下方单独断言）
   for (const id of ['dongbei', 'taiwan', 'beijing', 'henan']) {
     const text = buildDialectPersona(id, 'on');
     assert.ok(text, `${id} 文案不应为空`);
@@ -82,24 +82,24 @@ test('习惯式文案：身份化、锚定起头、质量声明、零指令词�
       assert.ok(!text.includes(bad), `${id} 文案不应含指令词「${bad}」`);
     }
   }
-  // hard 档：彩蛋模式（偶尔蹦家乡词，不要求整句方言）
-  for (const id of ['xinjiang']) {
-    const text = buildDialectPersona(id, 'on');
-    assert.ok(text.includes('土生土长的'), `${id} 彩蛋文案应为身份化断言`);
-    assert.ok(text.includes('偶尔'), `${id} 彩蛋文案应说「偶尔蹦」`);
-    assert.ok(text.includes('家乡词'), `${id} 彩蛋文案应提「家乡词」`);
-    assert.ok(text.includes('大部分时候说普通话'), `${id} 彩蛋文案应允许普通话为主`);
-    assert.ok(!text.includes('打字也带着'), `${id} 彩蛋文案不应要求整句方言`);
-    assert.ok(!text.includes('接话时爱用'), `${id} 彩蛋文案不应有整句锚定`);
-    assert.ok(text.includes('方言只是你的措辞'), `${id} 彩蛋文案也应有质量声明`);
-    for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
-      assert.ok(!text.includes(bad), `${id} 彩蛋文案不应含指令词「${bad}」`);
-    }
+  // v0.26.0：新疆话普通版为特制文案（模型语料少，需内置整句示范；加强版靠回响层，普通版只能写进文案）
+  const xjNormal = buildDialectPersona('xinjiang', 'on');
+  assert.ok(xjNormal.includes('土生土长的'), '新疆话普通版应为身份化断言');
+  assert.ok(xjNormal.includes('说话本能'), '新疆话普通版应强调说话本能');
+  assert.ok(xjNormal.includes('打字也带着'), '新疆话普通版应强调打字场景');
+  assert.ok(xjNormal.includes('接话时爱用'), '新疆话普通版应有起头锚定');
+  assert.ok(xjNormal.includes('句尾偶尔落个'), '新疆话普通版应有句尾频率控制');
+  assert.ok(xjNormal.includes('饭吃了么？'), '新疆话普通版应内置语序整句示范');
+  assert.ok(xjNormal.includes('这事儿歹得很！'), '新疆话普通版应内置夸赞整句示范');
+  assert.ok(xjNormal.includes('走撒，吃拌面去'), '新疆话普通版应内置邀约整句示范');
+  assert.ok(xjNormal.includes('方言只是你的措辞'), '新疆话普通版应有质量声明');
+  for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
+    assert.ok(!xjNormal.includes(bad), `新疆话普通版不应含指令词「${bad}」`);
   }
   // 按难度引用例句：easy 2 句、medium 3 句（hard 彩蛋模式用标志词，不引用例句）
   assert.equal(buildDialectPersona('dongbei', 'on').split('「').length - 1, 2, 'easy 方言应引用 2 句例句');
   assert.equal(buildDialectPersona('henan', 'on').split('「').length - 1, 3, 'medium 方言应引用 3 句例句');
-  assert.equal(buildDialectPersona('xinjiang', 'on').split('「').length - 1, 0, 'hard 彩蛋文案不引用例句');
+  assert.ok(buildDialectPersona('xinjiang', 'on').includes('饭吃了么'), '新疆话普通版应含语序示范例句（特制文案不走模板）');
   // 北京话不出现「诶呦喂」式表演词，新疆话不出现馕言文式夸张比喻
   const bj = buildDialectPersona('beijing', 'on');
   assert.ok(!bj.includes('诶呦喂') && !bj.includes('真地道'), '北京话文案不应有表演腔');
@@ -431,12 +431,64 @@ test('加强版文案：四川话存在、身份化、零指令词、含语气�
   }
 });
 
-test('加强版支持范围：当前仅四川话有加强文案，其余方言 advanced 回退普通文案', () => {
-  for (const id of DIALECT_LIST.map(d => d.id)) {
-    if (id === 'sichuan') continue;
-    assert.ok(!DIALECTS[id].personaAdvanced, `${id} 暂不应有加强文案`);
-    assert.equal(buildDialectPersona(id, 'on', 'advanced'), buildDialectPersona(id, 'on'), `${id} advanced 应回退普通文案`);
+test('加强版文案：全部方言都有 personaAdvanced，通用硬性约束通过', () => {
+  for (const d of DIALECT_LIST) {
+    const advanced = buildDialectPersona(d.id, 'on', 'advanced');
+    const normal = buildDialectPersona(d.id, 'on');
+    assert.ok(d.personaAdvanced, `${d.id} 应有 personaAdvanced`);
+    assert.ok(advanced, `${d.id} 加强版文案不应为空`);
+    assert.notEqual(advanced, normal, `${d.id} 加强版应与普通版不同`);
+    assert.ok(advanced.length > normal.length, `${d.id} 加强版应比普通版更厚`);
+    assert.ok(advanced.includes(`土生土长的${d.people}`), `${d.id} 应为身份化断言`);
+    assert.ok(advanced.includes('说话本能'), `${d.id} 应强调「说话本能」`);
+    assert.ok(advanced.includes('打字也带着'), `${d.id} 应强调「打字」场景`);
+    assert.ok(advanced.includes('情绪的开关'), `${d.id} 应含语气词情绪表`);
+    assert.ok(advanced.includes('一个字顶十句表情包'), `${d.id} 应有情绪表收尾`);
+    assert.ok(advanced.includes('给人意见会说'), `${d.id} 应有给意见正事示例`);
+    assert.ok(advanced.includes('跟人解释东西也一样'), `${d.id} 应有科普正事示例`);
+    assert.ok(advanced.includes('夸张的词收着用'), `${d.id} 应说明正事分寸`);
+    assert.ok(advanced.includes('方言只是你的措辞'), `${d.id} 应含质量声明`);
+    for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
+      assert.ok(!advanced.includes(bad), `${d.id} 加强版不应含指令词「${bad}」`);
+    }
   }
+});
+
+test('加强版二轮增量：各方言语序/音调/情绪特征抽查（2026-08-04 深挖）', () => {
+  const checks = {
+    sichuan: ['得不得行嘛', '吃都吃了', '闹热'],
+    dongbei: ['可劲造', '皮儿片儿', '乐呵儿的'],
+    henan: ['得劲死了', '嘞吧'],
+    shanghai: ['格么', '煞煞齐', '帮帮忙好伐'],
+    cantonese: ['俾本书我', '你去唔去先', '好mean'],
+    taiwan: ['有在看', '穿看看', '不错吃'],
+    shaanxi: ['克里马擦', '日塌啦'],
+    beijing: ['得嘞您呐', '不儿道'],
+    xinjiang: ['给给我', '外江'],
+  };
+  for (const [id, words] of Object.entries(checks)) {
+    const t = buildDialectPersona(id, 'on', 'advanced');
+    for (const w of words) {
+      assert.ok(t.includes(w), `${id} 加强版应含增量特征「${w}」`);
+    }
+  }
+});
+
+test('加强版特有断言：台湾腔写中国台湾、新疆话有语序特征无馕言文比喻', () => {
+  const taiwan = buildDialectPersona('taiwan', 'on', 'advanced');
+  assert.ok(taiwan.includes('中国台湾人'), '台湾腔加强版应写明「中国台湾人」');
+  assert.ok(taiwan.includes('波浪号'), '台湾腔应含波浪号尾音特征');
+  // 新疆话：正经语序路线（玥儿拍板不整活），有语序特征、无馕言文夸张比喻
+  const xj = buildDialectPersona('xinjiang', 'on', 'advanced');
+  assert.ok(xj.includes('饭吃了'), '新疆话加强版应含宾语前置语序特征');
+  assert.ok(xj.includes('歹得很'), '新疆话应含夸赞词');
+  assert.ok(!xj.includes('雄鹰') && !xj.includes('豹子'), '新疆话加强版不应有馕言文夸张比喻');
+});
+
+test('加强版文案：四川话精修保留原特征断言', () => {
+  const advanced = buildDialectPersona('sichuan', 'on', 'advanced');
+  assert.ok(advanced.includes('香腾了'), '四川话应含程度补语示范');
+  assert.ok(advanced.includes('要得不'), '四川话正事示例应含正反问句式');
 });
 
 test('配置归一化：boost 开关保留，旧 mode=advanced 迁移为 boost，非法值降级', () => {
@@ -485,21 +537,35 @@ test('syncDialectToIshiki：配置 boost=true 时同步写入加强版文案', (
 
 // ── v0.25.0 加强版开关 = 动态回响层 ──
 
-test('buildDialectEcho：身份化锚点句 + 随机例句（50% 概率），零指令词', () => {
+test('buildDialectEcho：身份化锚点句 + 加强例句池随机示范（50% 概率），零指令词', () => {
   const noEx = buildDialectEcho('sichuan', 0.7);
   assert.ok(noEx.includes('你打字带着四川话味，这轮也照常。'), '应含身份化锚点句');
   assert.ok(!noEx.includes('像「'), 'random>=0.5 不应附例句');
 
   const withEx = buildDialectEcho('sichuan', 0.3);
   assert.ok(withEx.includes('像「'), 'random<0.5 应附例句');
+  assert.ok(withEx.includes('也像「'), '应附两句示范（句式+情绪覆盖面）');
   const ex = withEx.match(/像「(.+?)」那样/);
-  assert.ok(ex && DIALECTS.sichuan.examples.includes(ex[1]), '例句应来自该方言例句库');
+  assert.ok(ex && BOOST_EXAMPLES.sichuan.includes(ex[1]), '例句应来自加强版回响例句池');
 
   for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
     assert.ok(!noEx.includes(bad), `锚点句不应含指令词「${bad}」`);
     assert.ok(!withEx.includes(bad), `含例句回声不应含指令词「${bad}」`);
   }
   assert.equal(buildDialectEcho('nope', 0.3), '', '无效方言应返回空串');
+});
+
+test('加强版回响例句池：九种方言齐全、句式级短句、零指令词', () => {
+  for (const d of DIALECT_LIST) {
+    const pool = BOOST_EXAMPLES[d.id];
+    assert.ok(pool && pool.length >= 3, `${d.id} 应至少有 3 句加强回响例句`);
+    for (const ex of pool) {
+      assert.ok(ex.length <= 16, `${d.id} 回响例句「${ex}」应保持句式级短句（≤16 字）`);
+      for (const bad of ['注意', '不要', '请', '必须', '应该', '记住', '尽量']) {
+        assert.ok(!ex.includes(bad), `${d.id} 回响例句「${ex}」不应含指令词「${bad}」`);
+      }
+    }
+  }
 });
 
 test('isWorkTalk：技术/工作关键词命中正事，闲聊放行', () => {
@@ -526,11 +592,11 @@ test('isWorkTalk：技术/工作关键词命中正事，闲聊放行', () => {
   for (const t of chat) assert.ok(!isWorkTalk(t), `「${t}」不应判为正事`);
 });
 
-test('shouldBoostRound：前 8 条消息必注入，之后按 40% 概率衰减', () => {
+test('shouldBoostRound：前 8 条消息必注入，之后按 60% 概率衰减', () => {
   assert.equal(shouldBoostRound(0, 0.99), true, 'warmup 内任意随机值都注入');
   assert.equal(shouldBoostRound(8, 0.99), true, '边界：第 8 条仍在 warmup 内');
-  assert.equal(shouldBoostRound(9, 0.3), true, 'warmup 后 random<0.4 注入');
-  assert.equal(shouldBoostRound(9, 0.9), false, 'warmup 后 random>=0.4 跳过');
+  assert.equal(shouldBoostRound(9, 0.3), true, 'warmup 后 random<0.6 注入');
+  assert.equal(shouldBoostRound(9, 0.9), false, 'warmup 后 random>=0.6 跳过');
   assert.equal(shouldBoostRound(-1), false, '非法长度不注入');
   assert.equal(shouldBoostRound(NaN), false, 'NaN 长度不注入');
 });

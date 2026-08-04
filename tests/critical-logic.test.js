@@ -7,7 +7,8 @@ import {
 } from '../extensions/observer.js';
 import { recoverInterruptedItems } from '../routes/_batch-tasks.js';
 import { scoreStickers, applyVectorBonus } from '../tools/express.js';
-import { collectPrefsForEmotion, matchRitualWord, sanitizeTag } from '../lib/shared.js';
+import { collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT } from '../lib/shared.js';
+import { KNOWN_CONFUSABLES, buildConfusableSection } from '../lib/known-confusables.js';
 
 function seededRandom(seed = 1) {
   let state = seed >>> 0;
@@ -277,6 +278,40 @@ test('标签清洗：识图/情绪词去除换行、引号、控制字符并限�
   assert.equal(sanitizeTag('`开心`'), '开心');
   assert.equal(sanitizeTag('${开心}'), '开心');
   assert.equal(sanitizeTag('[开心]'), '开心');
+});
+
+test('识图 prompt：含知名角色/梗图规则与防幻觉约束（v0.26.0）', () => {
+  // 知名角色/梗图必须报名字（虹夏、月薪喵、猫meme、熊猫头）
+  assert.ok(AUTOTAG_PROMPT.includes('虹夏'), 'prompt 应示范知名角色名');
+  assert.ok(AUTOTAG_PROMPT.includes('月薪喵'), 'prompt 应示范新梗名');
+  assert.ok(AUTOTAG_PROMPT.includes('猫meme'), 'prompt 应示范系列梗图名');
+  assert.ok(AUTOTAG_PROMPT.includes('熊猫头'), 'prompt 应示范表情包系列名');
+  assert.ok(AUTOTAG_PROMPT.includes('角色名、梗名或系列名'), 'keywords 应要求报名字/系列名');
+  assert.ok(AUTOTAG_PROMPT.includes('外观描述词同样保留'), '外观描述词应与角色名共存');
+  // 防幻觉：报名前核对至少两个独有特征，对不上不写名字
+  assert.ok(AUTOTAG_PROMPT.includes('核对至少两个独有特征'), '应有特征核对要求');
+  assert.ok(AUTOTAG_PROMPT.includes('只写外观描述，不要猜测'), '应有防幻觉约束');
+  // 既有规则不被破坏：scene 限 4 字、emotion 是情绪词
+  assert.ok(AUTOTAG_PROMPT.includes('每个不超过4个字'), 'scene 限长规则应保留');
+  assert.ok(AUTOTAG_PROMPT.includes('情绪词'), 'emotion 情绪词规则应保留');
+  // 易混淆对照表已拼接进 prompt
+  assert.ok(AUTOTAG_PROMPT.includes('千早爱音'), 'prompt 应含对照表内容（爱音）');
+  assert.ok(AUTOTAG_PROMPT.includes('后藤一里'), 'prompt 应含对照表内容（波奇）');
+});
+
+test('易混淆对照表：爱音/波奇辨别要点齐全，生成段落含对照引导（v0.26.0）', () => {
+  assert.ok(KNOWN_CONFUSABLES.length >= 1, '对照表不应为空');
+  const group = KNOWN_CONFUSABLES.find(g => g.topic === '粉发少女');
+  assert.ok(group, '应有粉发少女分组');
+  const anon = group.entries.find(e => e.name === '千早爱音');
+  const bocchi = group.entries.find(e => e.name === '后藤一里');
+  assert.ok(anon && anon.traits.length >= 10, '爱音应有可核对的辨别要点');
+  assert.ok(bocchi && bocchi.traits.length >= 10, '波奇应有可核对的辨别要点');
+  assert.ok(anon.traits.includes('无呆毛'), '爱音应明确写无呆毛');
+  assert.ok(bocchi.traits.includes('呆毛'), '波奇要点应含呆毛（独有特征）');
+  const section = buildConfusableSection();
+  assert.ok(section.includes('高相似度角色容易认错'), '应含对照引导语');
+  assert.ok(section.includes('千早爱音'), '生成段落应含名字');
 });
 
 test('偏好收集：空情绪不收集任何偏好', () => {

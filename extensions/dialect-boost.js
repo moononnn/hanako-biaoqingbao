@@ -5,7 +5,7 @@
 // 拉回「打字带家乡味」的状态：
 //   - 只在「方言开启 + 加强版开关（boost）打开」的助手生效（按 agentId 过滤）
 //   - 正事场合自动让路：命中技术/工作关键词的本轮不注入（人格文件里的正事锚点兜底）
-//   - 频率衰减：会话前 8 条消息必注入，之后按 40% 概率注入，省 token
+//   - 频率衰减：会话前 8 条消息必注入，之后按 60% 概率注入，省 token
 //   - 只改内存中的请求消息数组，不落盘、不进记忆管道、用户界面不可见
 //
 // 注入内容遵循文案三原则：身份化（你打字带着X味）、零指令词、打字场景。
@@ -38,7 +38,7 @@ export default function (pi) {
       if (!Array.isArray(messages) || messages.length === 0) return;
       // 正事让路：本轮命中技术/工作信号就不注入
       if (isWorkTalk(lastUserText(messages))) return;
-      // 频率衰减：会话前 8 条必注入，之后 40%
+      // 频率衰减：会话前 8 条必注入，之后 60%
       if (!shouldBoostRound(messages.length)) return;
       const echo = buildDialectEcho(setting.dialect);
       if (!echo) return;

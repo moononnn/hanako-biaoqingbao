@@ -20,6 +20,7 @@ import {
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
   json, atomicWriteJson,
 } from '../lib/shared.js';
+import { upsertTeachingSample, removeTeachingSample } from '../lib/teaching.js';
 import {
   DIALECT_LIST,
   readDialectConfig, writeDialectConfig, syncDialectToIshiki, reconcileDialectToIshiki,
@@ -203,6 +204,11 @@ export default async function registerRoutes(app, ctx) {
       const meta = readMeta();
       const idx = meta.findIndex(s => s.id === id);
       if (idx === -1) return json({ ok: false, error: '未找到' });
+      // v0.26.0 教学样本：快照用户改标签前的名字/描述，改了就记教学（用户教一次，以后同类图识别更准）
+      const before = {
+        keywords: (meta[idx].tags?.keywords || []).slice(),
+        description: meta[idx].description || '',
+      };
       if (emotion !== undefined) meta[idx].tags.emotion = emotion.split(',').map(s => s.trim()).filter(Boolean);
       if (scene !== undefined) meta[idx].tags.scene = scene.split(',').map(s => s.trim()).filter(Boolean);
       if (keywords !== undefined) meta[idx].tags.keywords = keywords.split(',').map(s => s.trim()).filter(Boolean);
@@ -214,6 +220,13 @@ export default async function registerRoutes(app, ctx) {
       // v0.10.0：记录「最后一次识图应用」的时间，方便用户记住什么时候识过
       meta[idx].tagged_at = new Date().toISOString();
       writeMeta(meta);
+      // v0.26.0：用户改了名字/描述 → 记教学样本（异步，不影响保存响应）
+      const afterKw = meta[idx].tags?.keywords || [];
+      const afterDesc = meta[idx].description || '';
+      if (JSON.stringify(before.keywords) !== JSON.stringify(afterKw) || before.description !== afterDesc) {
+        upsertTeachingSample(id, { description: afterDesc, keywords: afterKw, semanticDescription: meta[idx].semantic_description || '' })
+          .catch(() => {});
+      }
       return json({ ok: true, message: '已更新', tagged_at: meta[idx].tagged_at });
     }
 
@@ -293,6 +306,8 @@ export default async function registerRoutes(app, ctx) {
           writeVectors(vd);
         }
       } catch {}
+      // v0.26.0 - 同步清理该图的教学样本（删图后不再参与后续识别参考）
+      try { removeTeachingSample(id); } catch {}
 
       const msg = cleanedRefs > 0 ? `已删除（清理了 ${cleanedRefs} 条偏好引用）` : '已删除';
       return json({ ok: true, message: msg, cleanedReferences: cleanedRefs });
@@ -1300,6 +1315,12 @@ export default async function registerRoutes(app, ctx) {
 
       const sticker = meta[idx];
 
+      // v0.26.0 教学样本：快照确认前的名字/描述（聊天式改标签也是用户显式教学）
+      const before = {
+        keywords: (sticker.tags?.keywords || []).slice(),
+        description: sticker.description || '',
+      };
+
       // v0.25.0 - new_tags 白名单严格校验：只接受已知字段，类型/长度全部收紧，防脏数据入库
       const cleanTags = {};
       if (new_tags.description !== undefined) {
@@ -1343,6 +1364,14 @@ export default async function registerRoutes(app, ctx) {
 
       // 清理 session
       if (session_id && chatSessions.has(session_id)) chatSessions.delete(session_id);
+
+      // v0.26.0：用户改了名字/描述 → 记教学样本（异步，不影响确认响应）
+      const afterKw = sticker.tags?.keywords || [];
+      const afterDesc = sticker.description || '';
+      if (JSON.stringify(before.keywords) !== JSON.stringify(afterKw) || before.description !== afterDesc) {
+        upsertTeachingSample(sticker_id, { description: afterDesc, keywords: afterKw, semanticDescription: sticker.semantic_description || '' })
+          .catch(() => {});
+      }
 
       // 单图重算 embedding（基于新的 semantic_description）
       let vectorOk = false;

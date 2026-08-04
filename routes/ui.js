@@ -275,6 +275,7 @@ function renderPage() {
     + '.dialect-boost-toggle.is-on .dialect-boost-knob{left:11px}'
     + '.dialect-boost-label{font-size:11px;color:var(--text-muted);white-space:nowrap;transition:color .15s}'
     + '.dialect-boost-toggle.is-on .dialect-boost-label{color:var(--primary-dark);font-weight:600}'
+    + '.dialect-boost-tip{font-size:10px;color:var(--text-light);white-space:nowrap;line-height:1.4}'
     + '.dialect-preview{font-size:11px;color:var(--text-light);margin-top:8px;line-height:1.6;font-style:italic}'
     + '#save-dialect-btn:disabled{cursor:not-allowed}'
     + '.dialect-save-bar{position:sticky;bottom:10px;z-index:12;display:flex;align-items:center;gap:12px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:rgba(250,253,251,.96);box-shadow:0 -2px 12px rgba(45,58,53,.08)}'

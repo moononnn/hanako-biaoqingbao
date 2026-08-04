@@ -2257,9 +2257,11 @@
     var html = '<div class="dialect-item' + (enabled ? '' : ' is-off') + '" data-agent-row="' + escHtml(agent.id) + '">';
     html += '<div class="dialect-head"><span class="dialect-name">' + escHtml(agent.name || agent.id) + '</span>';
     if (showId) html += '<span class="dialect-id">' + escHtml(agent.id) + '</span>';
-    // v0.25.0 浓方言开关（独立于 picker，放 head 层、选方言左边）
+    // v0.26.0 浓方言开关（独立于 picker，放 head 层、选方言左边）
     // 开启后 = 动态回响（每轮注入短提示，正事自动让路）+ 有精修文案的方言写加强人格
     var boostOn = !!settings.boost;
+    // v0.26.0 token 提示：只在开启后显示，放开关左边，让两个按钮挨着
+    if (boostOn) html += '<span class="dialect-boost-tip">开加浓每轮多费一点 token</span>';
     html += '<button type="button" class="dialect-boost-toggle' + (boostOn ? ' is-on' : '') + (enabled ? '' : ' is-disabled') + '" data-act="toggle-boost"' + (enabled ? '' : ' disabled') + ' title="' + (enabled ? '方言加浓：浓度更高，每轮对话有方言回响，正事场合自动让路' : '先给 ta 选个方言，才能开方言加浓') + '">'
       + '<span class="dialect-boost-track"><span class="dialect-boost-knob"></span></span>'
       + '<span class="dialect-boost-label">方言加浓</span></button>';
@@ -2602,25 +2604,37 @@
       }
       var t = data.data;
       if (t.status === 'running') {
+        // v0.26.0：处理数已达总数但状态还是 running（worker 收尾中）时，直接拉完整结果渲染，
+        // 不等状态切换——否则用户只看到 100% 进度条没有结果图，要重开弹窗才正常
+        if (t.total > 0 && (t.completed_count + t.failed_count) >= t.total) {
+          stopBatchPolling();
+          await loadFullBatchResult(taskId);
+          return;
+        }
         renderBatchProgress(t);
         return;
       }
       // 结束态：拉完整数据渲染结果视图
       stopBatchPolling();
-      try {
-        var fullResp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '?full=1'), { cache: 'no-store' });
-        var fullData = await fullResp.json();
-        if (fullData.ok) {
-          renderBatchResultView(fullData.data);
-        } else {
-          $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(fullData.error || '读取任务失败') + '</div>';
-        }
-      } catch (e2) {
-        console.warn('[batch] fetch full detail error:', e2);
-        $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ 读取任务详情失败</div>';
-      }
+      await loadFullBatchResult(taskId);
     } catch (e) {
       console.warn('[batch] poll error:', e);
+    }
+  }
+
+  // v0.26.0 - 抽取：拉取任务完整数据并渲染结果视图（结束态与收尾兜底共用）
+  async function loadFullBatchResult(taskId) {
+    try {
+      var fullResp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '?full=1'), { cache: 'no-store' });
+      var fullData = await fullResp.json();
+      if (fullData.ok) {
+        renderBatchResultView(fullData.data);
+      } else {
+        $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(fullData.error || '读取任务失败') + '</div>';
+      }
+    } catch (e2) {
+      console.warn('[batch] fetch full detail error:', e2);
+      $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ 读取任务详情失败</div>';
     }
   }
 
@@ -2708,10 +2722,12 @@
     bindBatchGridActions();
   }
 
-  // ═══ 结果网格项（轻量：缩略图 + 描述 + 标签 + 操作）═══
+  // ═══ 结果网格项（轻量：缩略图 + 描述 + 标签 + 应用）═══
   function renderBatchGridItem(id, result, status) {
     var sticker = allStickers.find(function (s) { return s.id === id; });
-    var desc = sticker ? sticker.description : id;
+    // v0.26.0 - 描述优先用识别结果（粘贴导入的图原名是「粘贴图片」，识别完应显示识别的标题）
+    var sugDesc = (result && result.ok && result.data && result.data.description) ? result.data.description : '';
+    var desc = sugDesc || (sticker ? sticker.description : id);
     var imgUrl = withAuth(API + '/api/image?id=' + encodeURIComponent(id));
     var html = '<div class="batch-grid-item" data-id="' + escHtml(id) + '" data-status="' + status + '">';
     html += '<img loading="lazy" src="' + imgUrl + '" onerror="this.style.display=\'none\'" alt="">';
@@ -2726,6 +2742,7 @@
         }
         if (emos.length > 3) tagHtml += '<span>+' + (emos.length - 3) + '</span>';
         if (tagHtml) html += '<div class="bgi-tags">' + tagHtml + '</div>';
+        // v0.26.0 - 编辑区确认按钮叫「应用」不叫「保存」（与应用语义统一，不再混淆）
         html += '<div class="bgi-edit" hidden>'
           + '<input class="bgi-edit-desc" placeholder="描述" value="' + escHtml(sug.description || '') + '">'
           + '<input class="bgi-edit-semantic" type="hidden" value="' + escHtml(sug.semantic_description || '') + '">'
@@ -2734,7 +2751,7 @@
           + '<input class="bgi-edit-keywords" placeholder="关键词（逗号分隔）" value="' + escHtml((sug.keywords || []).join(', ')) + '">'
           + '<div class="bgi-edit-actions">'
           + '<button data-g-act="edit-cancel">取消</button>'
-          + '<button data-g-act="edit-confirm" style="border-color:var(--primary);color:var(--primary)">保存</button>'
+          + '<button data-g-act="edit-confirm" style="border-color:var(--primary);color:var(--primary)">应用</button>'
           + '</div></div>';
         html += '<div class="bgi-actions">';
         if (status === 'success') html += '<button data-g-act="apply" class="apply">应用</button>';
@@ -2765,7 +2782,7 @@
       var act = btn.getAttribute('data-g-act');
       var id = item.getAttribute('data-id');
       if (act === 'apply') {
-        applyGridItem(item, id, null);
+        applyGridItem(item, id);
       } else if (act === 'edit') {
         var editArea = item.querySelector('.bgi-edit');
         if (editArea) editArea.hidden = !editArea.hidden;
@@ -2995,8 +3012,8 @@
     }
   }
 
-  // v0.25.1 - 角标只反映「点开会看到什么」：第一个正在跑的任务 / 第一个待应用任务 /
-  // 第一个有失败的任务。数字和弹窗内容永远一致，历史任务不会累加进来。
+  // v0.25.1 - 角标反映「点开会看到什么」：第一个正在跑的任务；全部待应用任务的聚合数量；
+  // 全部失败任务的聚合数量。数字和弹窗内容一致，历史任务不会累加进来。
   function renderBatchTasksBadge(tasks) {
     var badge = $('batch-tasks-badge');
     if (!badge) return;
@@ -3011,25 +3028,35 @@
         return;
       }
     }
+    // v0.26.0 - 聚合所有任务的待应用数（多任务时角标显示总数，不再只显示第一个任务）
+    var pendingTotal = 0;
     for (var j = 0; j < tasks.length; j++) {
       var t2 = tasks[j];
       if (t2.status === 'completed' && t2.applied < t2.completed) {
-        badge.hidden = false;
-        badge.innerHTML = (t2.completed - t2.applied) + ' 张待应用';
-        badge.style.borderColor = 'var(--success)';
-        badge.style.color = 'var(--success)';
-        return;
+        pendingTotal += (t2.completed - t2.applied);
       }
     }
+    if (pendingTotal > 0) {
+      badge.hidden = false;
+      badge.innerHTML = pendingTotal + ' 张待应用';
+      badge.style.borderColor = 'var(--success)';
+      badge.style.color = 'var(--success)';
+      return;
+    }
+    // v0.26.0 - 失败数也聚合
+    var failedTotal = 0;
     for (var k = 0; k < tasks.length; k++) {
       var t3 = tasks[k];
       if ((t3.status === 'completed' || t3.status === 'failed') && t3.failed > 0) {
-        badge.hidden = false;
-        badge.innerHTML = t3.failed + ' 张识别失败';
-        badge.style.borderColor = 'var(--danger)';
-        badge.style.color = 'var(--danger)';
-        return;
+        failedTotal += t3.failed;
       }
+    }
+    if (failedTotal > 0) {
+      badge.hidden = false;
+      badge.innerHTML = failedTotal + ' 张识别失败';
+      badge.style.borderColor = 'var(--danger)';
+      badge.style.color = 'var(--danger)';
+      return;
     }
     badge.hidden = true;
   }
