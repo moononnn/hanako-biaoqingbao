@@ -1100,8 +1100,12 @@ export default async function registerRoutes(app, ctx) {
         negBtn.classList.add('on-hate');
         showToast(dislikeCount > 0 ? '这张之前点过 ' + dislikeCount + ' 次不喜欢' : '之前已记过：不喜欢');
       }
-      posMarked = (state === 'positive');
-      negMarked = (state === 'negative');
+      // v0.25.3 - 每次出图独立计算：服务端预置的历史状态只做视觉提示，不占本卡片的表达名额。
+      // marked 仅在用户本卡片内主动点过后才置 true。
+      // 之前把 marked 同步成服务端预置态，导致历史点过不喜欢的图再次出现时，
+      // 再点「不喜欢」被防重拦截：不累计次数、弹不出「和小花聊聊」入口（只冒气泡）。
+      posMarked = false;
+      negMarked = false;
       function setState(type) {
         state = type;
         // v0.25.2 - 方向切换后重置另一方向的标记：同方向防重复累计，变心（切方向）允许重新表达

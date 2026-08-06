@@ -8,6 +8,8 @@ import {
   resolveAgentId,
   META_FILE,
 } from '../lib/shared.js';
+import { TAG_TO_GROUP, resolveEmotionFactor } from '../lib/emotion-groups.js';
+import { getAgentExpressionBias } from '../lib/dialect.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = META_FILE;
@@ -17,22 +19,7 @@ const metaPath = META_FILE;
 // 例：搜「搞笑」能命中戏谵/调侃/整活/扮酷（AI 输出的具体词）
 //     搜「难过」能命中委屈/emo/崩溃/丧（AI 输出的具体词）
 //     搜「感谢」能命中感动/被治愈/心怀感激（AI 输出的具体词）
-const EMOTION_SYNONYMS = {
-  开心: ['开心', '高兴', '雀跃', '快乐', '得意', '偷着乐', '暗爽', '乐开花', '找到同类', '兴奋', '感动', '心动', '治愈', '心有灵犀', '恍然大悟', '得意洋洋', '喘息', '摸鱼得意', '渔翁得意'],
-  难过: ['难过', '委屈', '委屈巴巴', '心碎', '受伤', '心疼', '丧', '丧到极点', 'emo', '崩溃', '崩溃边缘', '想哭', '心累', '破防'],
-  无语: ['无语', '无奈', '嫌弃', '吐槽', '社死瞬间', '被噜住', '嫌弃脸', '阴阳怪气', '酸了', '柠檬精', '尴尬苦笑', '被逼到无语', '无语到极致'],
-  搞笑: ['搞笑', '戏谵', '调侃', '整活', '扮酷', '戏精上身', '卖萌耍宝', '奶凶', '装酷', '装傻', '装懂', '装傻充狠', '撩人', '暧昧', '撒娇', '傲娇', '嘴硬', '心虚', '假装生气', '假装生气实则撒娇', '撒锅', '质问', '骚话'],
-  感谢: ['感谢', '感动', '被理解的感动', '被治愈', '心有灵犀', '找到同类', '心怀感激', '撒娇式感谢', '找到同类的欣慰', '小众幽默共鸣', '自我认同'],
-  鼓励: ['鼓励', '打气', '假装坚强', '自我安慰', '释然', '心有灵犀', '感动', '被理解的感动', '心怀感激', '找到同类'],
-};
-// 预计算反向索引：标签 → 所属语义组
-const TAG_TO_GROUP = {};
-for (const [group, tags] of Object.entries(EMOTION_SYNONYMS)) {
-  for (const tag of tags) {
-    if (!TAG_TO_GROUP[tag]) TAG_TO_GROUP[tag] = [];
-    TAG_TO_GROUP[tag].push(group);
-  }
-}
+// v0.27.0：数据迁至 lib/emotion-groups.js（express 共用），此处仅保留说明
 
 function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
@@ -73,8 +60,11 @@ export async function execute(input, ctx) {
 
   // v0.25.2 - 候选列表也吃偏好惩罚：vetoed/累计不喜欢的图不排前面（与 express 选图口径一致，避免「先 search 再 express」链路里不喜欢的图以最高分出现误导助手）
   let prefs = { preferred: [], vetoed: [], dislikes: {} };
+  let expressionBias = null;
+  let agentId = null;
   try {
-    const agentId = resolveAgentId(null, ctx);
+    agentId = resolveAgentId(null, ctx);
+    expressionBias = getAgentExpressionBias(agentId);
     const pRaw = await readFile(PREFERENCES_FILE, 'utf-8');
     const pData = JSON.parse(pRaw);
     const users = pData.users || {};
@@ -119,20 +109,35 @@ export async function execute(input, ctx) {
       }
 
       // emotion 精确匹配 → 中等分（区分度低，只做粗筛）
+      // v0.27.0：情绪分单独累计，方言气质系数与强度偏移统一作用在情绪分上
+      let emotionScore = 0;
+      const emotionHitTags = [];
       for (const em of emotions) {
         for (const tag of (tags.emotion || [])) {
           if (tag === em) {
-            score += 3;
+            emotionScore += 3;
+            emotionHitTags.push(tag);
             matchDetails.push(`emotion精确:${tag}`);
           } else if (TAG_TO_GROUP[em] && TAG_TO_GROUP[tag] && TAG_TO_GROUP[em].some(g => TAG_TO_GROUP[tag].includes(g))) {
             // 语义相近（在同一个语义组里）→ 比纯子串包含更准
-            score += 2;
+            emotionScore += 2;
+            emotionHitTags.push(tag);
             matchDetails.push(`emotion语义:${em}≈${tag}`);
           } else if (tag.includes(em) || em.includes(tag)) {
-            score += 1;
+            emotionScore += 1;
+            emotionHitTags.push(tag);
           }
         }
       }
+      // v0.27.0 方言×表情包联动：只影响情绪匹配分（有情绪查询且命中了情绪标签才参与）
+      if (emotionScore > 0 && expressionBias) {
+        emotionScore *= resolveEmotionFactor(emotionHitTags, expressionBias);
+        const intensity = sticker._source?.intensity;
+        if (intensity && expressionBias.intensity && expressionBias.intensity[intensity] !== undefined) {
+          emotionScore += expressionBias.intensity[intensity];
+        }
+      }
+      score += emotionScore;
 
       // 没有任何查询条件时，随机展示
       if (emotions.length === 0 && kwList.length === 0 && scenes.length === 0) {

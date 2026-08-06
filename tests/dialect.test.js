@@ -478,7 +478,7 @@ test('加强版特有断言：台湾腔写中国台湾、新疆话有语序特�
   const taiwan = buildDialectPersona('taiwan', 'on', 'advanced');
   assert.ok(taiwan.includes('中国台湾人'), '台湾腔加强版应写明「中国台湾人」');
   assert.ok(taiwan.includes('波浪号'), '台湾腔应含波浪号尾音特征');
-  // 新疆话：正经语序路线（玥儿拍板不整活），有语序特征、无馕言文夸张比喻
+  // 新疆话：正经语序路线（拍板不整活），有语序特征、无馕言文夸张比喻
   const xj = buildDialectPersona('xinjiang', 'on', 'advanced');
   assert.ok(xj.includes('饭吃了'), '新疆话加强版应含宾语前置语序特征');
   assert.ok(xj.includes('歹得很'), '新疆话应含夸赞词');

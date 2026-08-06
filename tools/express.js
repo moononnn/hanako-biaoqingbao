@@ -14,6 +14,8 @@ import {
   cosineSimilarity, readVectors, getAgentFreqSettings, markAgentStickerCooldown, resolveAgentId,
   collectPrefsForEmotion, atomicWriteJson, prefsScoreBonus,
 } from '../lib/shared.js';
+import { resolveEmotionFactor } from '../lib/emotion-groups.js';
+import { getAgentExpressionBias } from '../lib/dialect.js';
 
 const OUTPUT_DIR_CFG = join(dataDir, 'output-dir.json');
 
@@ -168,39 +170,51 @@ async function logDecision(emotion, stickerId, ctx) {
 }
 
 // 纯标签匹配打分（不调模型）
-export function scoreStickers(stickers, emotion, excludeIds, prefs) {
+// v0.27.0：新增 bias 参数（方言表情气质权重），情绪贡献分乘方言系数 + 加强度偏移；
+// 只影响情绪匹配分，prefs 偏好惩罚在系数之外照常生效。bias=null 时与原逻辑完全一致。
+export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null) {
   const emoLower = (emotion || '').toLowerCase();
   return stickers
     .filter(s => !excludeIds.includes(s.id))
     .map(sticker => {
-      let score = 0;
+      let emotionScore = 0;
+      const emotionHitTags = [];
       const tags = sticker.tags || {};
 
       // 情绪词匹配 emotion 标签
       for (const tag of (tags.emotion || [])) {
         const tagLower = tag.toLowerCase();
-        if (tag === emotion) { score += 8; }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { score += 5; }
-        else if (tagLower.includes(emoLower) || emoLower.includes(tagLower)) { score += 3; }
+        if (tag === emotion) { emotionScore += 8; emotionHitTags.push(tag); }
+        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 5; emotionHitTags.push(tag); }
+        else if (tagLower.includes(emoLower) || emoLower.includes(tagLower)) { emotionScore += 3; emotionHitTags.push(tag); }
       }
 
       // 情绪词匹配 scene 标签
       for (const tag of (tags.scene || [])) {
-        if (tag === emotion) { score += 5; }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { score += 3; }
+        if (tag === emotion) { emotionScore += 5; emotionHitTags.push(tag); }
+        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 3; emotionHitTags.push(tag); }
       }
 
       // 情绪词匹配 keywords 标签
       for (const tag of (tags.keywords || [])) {
-        if (tag === emotion) { score += 4; }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { score += 2; }
+        if (tag === emotion) { emotionScore += 4; emotionHitTags.push(tag); }
+        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 2; emotionHitTags.push(tag); }
       }
 
       // 情绪词匹配 description
-      if (sticker.description && sticker.description.includes(emotion)) { score += 3; }
+      if (sticker.description && sticker.description.includes(emotion)) { emotionScore += 3; }
+
+      // v0.27.0 方言×表情包联动：有情绪命中才参与（关键词/场景独立查询不受干扰）
+      if (emotionScore > 0 && bias) {
+        emotionScore *= resolveEmotionFactor(emotionHitTags, bias);
+        const intensity = sticker._source?.intensity;
+        if (intensity && bias.intensity && bias.intensity[intensity] !== undefined) {
+          emotionScore += bias.intensity[intensity];
+        }
+      }
 
       // v0.25.0 - 偏好加权统一走 prefsScoreBonus（preferred +10 / vetoed -20 / 不喜欢次数 -10×count）
-      score += prefsScoreBonus(sticker.id, prefs);
+      const score = emotionScore + prefsScoreBonus(sticker.id, prefs);
 
       return { ...sticker, _score: score };
     })
@@ -236,6 +250,8 @@ export async function execute(input, ctx) {
 
   // 主动调用不再重复抽概率，只遵守每位助手的全局开关。
   const agentId = resolveAgentId(null, ctx);
+  // v0.27.0 方言×表情包联动：按当前助手方言设置取气质权重（没开方言返回 null，不干预）
+  const expressionBias = getAgentExpressionBias(agentId);
   try {
     const freqSettings = getAgentFreqSettings(agentId);
     if (!freqSettings.enabled) {
@@ -260,12 +276,12 @@ export async function execute(input, ctx) {
   const prefs = await loadPreferencesFor(emotion, agentId);
   const allExclude = [...new Set([...(exclude_ids || []), ...getRecent(agentId)])];
 
-  // 打分匹配
-  const scored = scoreStickers(stickers, emotion, allExclude, prefs);
+  // 打分匹配（v0.27.0：传入方言气质权重）
+  const scored = scoreStickers(stickers, emotion, allExclude, prefs, expressionBias);
 
   if (scored.length === 0) {
     // 放宽限制：不排除最近用过的，再试一次
-    const relaxed = scoreStickers(stickers, emotion, [], prefs);
+    const relaxed = scoreStickers(stickers, emotion, [], prefs, expressionBias);
     scored.push(...relaxed);
   }
 
