@@ -484,6 +484,7 @@ function renderPage() {
     + '<span class="count" id="home-count">加载中</span>'
     + '<span class="spacer"></span>'
     + '<button class="home-text-btn" id="btn-check-update" title="检查 GitHub 上的新版本">检查更新</button>'
+    + '<button class="home-text-btn" id="btn-feedback" title="遇到 bug 或有建议，来 GitHub 提 issue">反馈</button>'
     + '<button class="home-text-btn" id="btn-settings" title="设置">模型设置</button>'
     + '</div>'
     + '<div class="home-main">'
@@ -1092,18 +1093,14 @@ export default async function registerRoutes(app, ctx) {
       function showInvite() { if (invite) invite.hidden = false; }
       function hideInvite() { if (invite) invite.hidden = true; }
 
-      // v0.25.0 - 初始状态：不喜欢累计次数也预置（这张图之前被点过不喜欢 → 直接显示聊聊入口）
-      // v0.25.0 - 初始分支同步 marked 标志：服务端预置的态同样算「已表达过」，防重复拦截才生效
-      if (state === 'positive') { posBtn.classList.add('on-love'); showToast('之前已记过：喜欢'); }
-      // v0.25.1 - 初始不主动弹聊聊条（哪怕之前点过不喜欢），点了「不喜欢」才出现
+      // v0.27.2 - 每次出图重新选择：历史态度只提示、不预置按钮亮灯
+      // 之前预置亮灯让「喜欢」方向点了没有视觉变化（按钮本来亮着），用户感受不到重新表达；
+      // 现在初始两个按钮都是未选择状态，点了才算数，喜欢/不喜欢行为对称。
+      if (state === 'positive') { showToast('这张之前记过喜欢，可重新选择'); }
       if (state === 'negative') {
-        negBtn.classList.add('on-hate');
-        showToast(dislikeCount > 0 ? '这张之前点过 ' + dislikeCount + ' 次不喜欢' : '之前已记过：不喜欢');
+        showToast(dislikeCount > 0 ? '这张之前点过 ' + dislikeCount + ' 次不喜欢，可重新选择' : '这张之前记过不喜欢，可重新选择');
       }
-      // v0.25.3 - 每次出图独立计算：服务端预置的历史状态只做视觉提示，不占本卡片的表达名额。
-      // marked 仅在用户本卡片内主动点过后才置 true。
-      // 之前把 marked 同步成服务端预置态，导致历史点过不喜欢的图再次出现时，
-      // 再点「不喜欢」被防重拦截：不累计次数、弹不出「和小花聊聊」入口（只冒气泡）。
+      // v0.25.3 - 每次出图独立计算：marked 仅在用户本卡片内主动点过后才置 true。
       posMarked = false;
       negMarked = false;
       function setState(type) {

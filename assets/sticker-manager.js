@@ -3128,6 +3128,17 @@
     $('guide-settings-btn').addEventListener('click', openSettings);
     // v0.19.5 - 检查更新按钮
     $('btn-check-update').addEventListener('click', checkUpdate);
+    // v0.27.1 - 反馈入口：打开 GitHub Issues（弹窗被拦时降级为复制链接）
+    var fbBtn = document.getElementById('btn-feedback');
+    if (fbBtn) fbBtn.addEventListener('click', function () {
+      var issueUrl = 'https://github.com/moononnn/hanako-biaoqingbao/issues';
+      var opened = null;
+      try { opened = window.open(issueUrl, '_blank'); } catch (e) {}
+      if (!opened) {
+        try { navigator.clipboard.writeText(issueUrl); } catch (e) {}
+        toast('已复制反馈链接，粘贴到浏览器打开即可', false);
+      }
+    });
 
     // 弹窗关闭按钮（通用 data-close 属性）
     document.querySelectorAll('[data-close]').forEach(function (btn) {

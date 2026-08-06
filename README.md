@@ -202,6 +202,14 @@ ZIP 最大 50MB、最多检查 500 个文件，只会导入 PNG、JPEG、GIF、W
 
 插件使用 omggif 在本地读取动态 GIF，并将关键帧转换成静态画面交给视觉模型综合理解。omggif 采用 MIT License，完整声明见 `THIRD_PARTY_NOTICES.md`。
 
+## 反馈
+
+遇到 bug、有想吐槽的体验，或者想要什么新功能，欢迎来 GitHub 提 issue：
+
+[github.com/moononnn/hanako-biaoqingbao/issues](https://github.com/moononnn/hanako-biaoqingbao/issues)
+
+提的时候带上：插件版本、你做了什么操作、出现了什么现象（最好能截图）。信息越全，我修得越快～
+
 ## 项目关系
 
 本插件是 HanaAgent 的社区插件，与 HanaAgent 官方没有隶属或担保关系。
