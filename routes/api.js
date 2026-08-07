@@ -851,13 +851,17 @@ export default async function registerRoutes(app, ctx) {
   });
 
   // ═══ POST /api/display-config — 保存配图卡片显示配置 ═══
+  // v0.28.0 - 合并式写入：前端只传改动的字段时保留其他配置，避免整体覆盖丢字段（坑 28）
   app.post('/api/display-config', async (c) => {
     try {
       const body = await c.req.json();
-      const threshold = Math.max(50, Math.min(500, Number(body.smallImageThreshold) || 200));
+      let old = {};
+      try { old = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')); } catch {}
+      const threshold = Math.max(50, Math.min(500, Number(body.smallImageThreshold) || old.smallImageThreshold || 200));
       const cfg = {
-        smallImageFit: typeof body.smallImageFit === 'boolean' ? body.smallImageFit : true,
+        smallImageFit: typeof body.smallImageFit === 'boolean' ? body.smallImageFit : (typeof old.smallImageFit === 'boolean' ? old.smallImageFit : true),
         smallImageThreshold: threshold,
+        showFeedbackButtons: typeof body.showFeedbackButtons === 'boolean' ? body.showFeedbackButtons : (typeof old.showFeedbackButtons === 'boolean' ? old.showFeedbackButtons : true),
       };
       atomicWriteJson(path.join(DATA_DIR, 'display-config.json'), cfg);
       return json({ ok: true, data: cfg });

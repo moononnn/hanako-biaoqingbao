@@ -40,7 +40,8 @@ function renderPage() {
   let logData = { version: 1, entries: [] };
   try { logData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'decision-log.json'), 'utf-8')); } catch {}
   // v0.24.0 - 配图卡片显示配置（小图自适应开关）
-  let displayCfg = { smallImageFit: true, smallImageThreshold: 200 };
+  // v0.28.0 - 新增 showFeedbackButtons：聊天卡片下方喜欢/不喜欢按钮显示开关
+  let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true };
   try { displayCfg = { ...displayCfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) }; } catch {}
 
   return '<!DOCTYPE html>'
@@ -584,6 +585,16 @@ function renderPage() {
     + '<h2>偏好设置</h2>'
     + '</div>'
 
+    // v0.28.0 - 配图卡片反馈按钮显示开关（聊天里表情包卡片下方喜欢/不喜欢）
+    + '<div class="pref-section">'
+    + '<h3>🃏 配图卡片</h3>'
+    + '<div class="section-desc">聊天里每次配图时，表情包卡片下方会有一排「喜欢 / 不喜欢」按钮，用来调教配图偏好。只想看表情包图片、不想要按钮的话，关掉这个开关即可。</div>'
+    + '<div class="fit-toggle" id="sticker-fb-toggle" role="switch" aria-checked="true" title="开 = 卡片下方显示喜欢/不喜欢按钮；关 = 卡片只显示表情包图片">'
+    + '<span class="fit-track"><span class="fit-knob"></span></span>'
+    + '<span class="fit-label">显示反馈按钮</span>'
+    + '</div>'
+    + '</div>'
+
     // 决策日志 + 偏好映射
     + '<div class="pref-section">'
     + '<h3>📊 配图决策日志</h3>'
@@ -858,10 +869,12 @@ export default async function registerRoutes(app, ctx) {
     const emotion = c.req.query('emotion') || '';
 
     // v0.24.0 - 配图卡片显示配置（小图自适应开关，仅对小于阈值的图生效）
-    let displayCfg = { smallImageFit: true, smallImageThreshold: 200 };
+    let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true };
     try { displayCfg = { ...displayCfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) }; } catch {}
     const fitEnabled = displayCfg.smallImageFit !== false;
     const fitThreshold = Math.max(50, Math.min(500, Number(displayCfg.smallImageThreshold) || 200));
+    // v0.28.0 - 反馈按钮显示开关（关掉后卡片只显示表情包图片）
+    const showFb = displayCfg.showFeedbackButtons !== false;
 
     // v0.22.0 - 初始反馈状态：该图在 agent+emotion 偏好映射里已记过则预置
     // v0.25.0 - 不喜欢累计次数也预置状态（多轮不喜欢 → 频率衰减），次数传给前端显示
@@ -884,7 +897,7 @@ export default async function registerRoutes(app, ctx) {
       }
     } catch {}
 
-    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold }).replace(/</g, '\\u003c');
+    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold, fb: showFb }).replace(/</g, '\\u003c');
 
     return c.html(`<!DOCTYPE html>
 <html lang="zh-CN">
@@ -905,11 +918,11 @@ export default async function registerRoutes(app, ctx) {
     .img-card img { max-width: 100%; max-height: 100%; display: block; object-fit: contain; border-radius: 6px; }
     /* v0.24.0 - 小图自适应开启时：强制占满卡片尺寸，按比例缩放不裁切 */
     .img-card img.fit { width: 100%; height: 100%; }
+    /* v0.28.0 - 去掉外层容器框：按钮直接贴在图片下，不再套白底圆角框（保留 flex 居中与 toast 定位） */
     .fb-card {
       position: relative; margin: 0 auto;
       display: flex; align-items: center; gap: 8px;
-      background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px;
-      padding: 5px 12px;
+      padding: 2px 0;
     }
     .fb-btn {
       border: 1px solid #d5e5dd; border-radius: 999px;
@@ -1012,7 +1025,7 @@ export default async function registerRoutes(app, ctx) {
 </head>
 <body>
   <div class="img-card" id="img-card"><img src="${imgBase64}" alt="表情包" /></div>
-  <div class="fb-card" id="fb-card">
+  <div class="fb-card" id="fb-card"${showFb ? '' : ' hidden'}>
     <button class="fb-btn" id="fb-pos" type="button">喜欢</button>
     <button class="fb-btn" id="fb-neg" type="button">不喜欢</button>
     <span class="fb-toast" id="fb-toast"></span>
@@ -1362,6 +1375,8 @@ export default async function registerRoutes(app, ctx) {
     (function () {
       var FIT = ${fitEnabled ? 'true' : 'false'};
       var FIT_THRESHOLD = ${fitThreshold};
+      // v0.28.0 - 反馈按钮开关：关闭时宽度不再给按钮区留空间
+      var FBN = ${showFb ? 'true' : 'false'};
       var IMG = document.querySelector('.img-card img');
       var FB_CARD = document.querySelector('.fb-card');
       function shouldFit() {
@@ -1380,13 +1395,19 @@ export default async function registerRoutes(app, ctx) {
         var ratio = IMG.naturalHeight / IMG.naturalWidth;
         var w = window.innerWidth;
         var displayW = fit ? w : Math.min(w, IMG.naturalWidth);
-        var target = Math.round(displayW * ratio) + 70;
+        // v0.28.0 - 高度自适应：按钮显示时按按钮区实际高度放大卡片；隐藏时只留图片卡片自身留白，底部不再有白边
+        var imgH = Math.round(displayW * ratio);
+        var fbH = FBN && FB_CARD && !FB_CARD.hidden ? FB_CARD.offsetHeight : 0;
+        var extra = 12;                 // body 上下 padding 6*2
+        if (fbH > 0) extra += 8 + fbH;  // 图片卡片与按钮区的 gap 8 + 按钮区实际高度
+        var target = imgH + 14 + extra; // img-card 自身 padding 6*2 + 边框 1*2 = 14
         target = Math.min(600, Math.max(30, target));
         var payload = { height: target };
         // v0.24.0 - 宽度自适应：关开关时卡片包着图；下限取按钮区实际宽度，绝不挤压喜欢/不喜欢按钮
+        // v0.28.0 - 反馈按钮关闭时直接按图片宽度，不给按钮区留白
         if (!fit) {
-          var btnW = FB_CARD ? FB_CARD.offsetWidth : 150;
-          var targetW = Math.max(displayW, btnW) + 26;
+          var btnW = FBN ? (FB_CARD ? FB_CARD.offsetWidth : 150) : 0;
+          var targetW = Math.max(displayW, btnW) + (FBN ? 26 : 0);
           targetW = Math.min(w, Math.max(30, targetW));
           payload.width = targetW;
         }

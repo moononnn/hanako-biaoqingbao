@@ -98,6 +98,7 @@
     var view = $('view-' + name);
     if (view) view.classList.remove('hidden');
     if (name === 'library') syncFitToggle();
+    if (name === 'preferences') syncFbToggle();
     window.scrollTo(0, 0);
   }
 
@@ -109,6 +110,40 @@
     var on = cfg.smallImageFit !== false;
     t.classList.toggle('on', on);
     t.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+  // v0.28.0 - 偏好设置页：配图卡片反馈按钮显示开关
+  function syncFbToggle() {
+    var t = $('sticker-fb-toggle');
+    if (!t) return;
+    var cfg = window.__DISPLAY_CONFIG__ || {};
+    var on = cfg.showFeedbackButtons !== false;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+  async function toggleFbButtons() {
+    var t = $('sticker-fb-toggle');
+    if (!t) return;
+    var next = !t.classList.contains('on');
+    t.classList.toggle('on', next);
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/display-config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ showFeedbackButtons: next }),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        window.__DISPLAY_CONFIG__ = data.data;
+        t.setAttribute('aria-checked', next ? 'true' : 'false');
+        toast(next ? '反馈按钮已开启：卡片下方会显示喜欢/不喜欢' : '反馈按钮已关闭：卡片只显示表情包图片');
+      } else {
+        t.classList.toggle('on', !next);
+        toast('保存失败：' + (data.error || '出错了'), true);
+      }
+    } catch (e) {
+      t.classList.toggle('on', !next);
+      toast('保存失败，网络开小差了', true);
+    }
   }
   async function toggleStickerFit() {
     var t = $('sticker-fit-toggle');
@@ -3322,6 +3357,13 @@
     if (fitToggleEl) {
       fitToggleEl.addEventListener('click', toggleStickerFit);
       syncFitToggle();
+    }
+
+    // v0.28.0 - 偏好设置页：配图卡片反馈按钮显示开关
+    var fbToggleEl = $('sticker-fb-toggle');
+    if (fbToggleEl) {
+      fbToggleEl.addEventListener('click', toggleFbButtons);
+      syncFbToggle();
     }
 
     // 点击图片放大
