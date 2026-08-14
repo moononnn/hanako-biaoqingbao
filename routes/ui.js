@@ -10,6 +10,7 @@ import {
   readVisionConfig, getAvailableVisionModels, getAvailableTextModels,
   readTextConfig, readEmbeddingConfig, getAvailableEmbeddingModels,
   escapeHtml,
+  readUserName, userstyleDisplayName,
 } from '../lib/shared.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -30,6 +31,14 @@ function renderPage() {
   const textModels = getAvailableTextModels();
   const embeddingConfig = readEmbeddingConfig();
   const embeddingModels = getAvailableEmbeddingModels();
+  // v0.30.1：用户名话展示名服务端动态拼（入口按钮/标题不再写死「用户名话」）
+  const userName = readUserName();
+  const userstyleName = userstyleDisplayName(userName);
+  // v0.31.0：用户名话总结前置依赖「内容分析模型」——未配置时页面顶部直接给引导条
+  const textReady = !!(textConfig.enabled && (
+    (textConfig.source === 'custom' && textConfig.customBaseUrl && textConfig.customModel && textConfig.customApiKey) ||
+    (textConfig.source !== 'custom' && textConfig.providerId && textConfig.modelId)
+  ));
   // 页面只接收密钥占位符；真实密钥始终留在服务端配置文件中。
   const safeVisionConfig = { ...visionConfig, customApiKey: visionConfig.customApiKey ? '********' : '' };
   const safeTextConfig = { ...textConfig, customApiKey: textConfig.customApiKey ? '********' : '' };
@@ -636,9 +645,72 @@ function renderPage() {
     + '</div>'
     + '<div class="pref-section">'
     + '<div class="dialect-desc">给每位助手挑个方言就行：挑上即开，选「(不选)」即关。\n开启后会在 ta 的意识栏注入一段方言设定（关闭时自动移除），打字自然带家乡味。\n所有方言都支持「方言加浓」开关：打开后浓度更高，每轮对话都有方言回响，聊到正事时自动让路；四川话另有精修文案，效果最浓。\n方言加浓的回响部分保存后即时生效，人格文件部分要<strong>重启 Hana</strong>才完整生效；重启后建议新开一个对话框聊天，方言味最正。</div>'
+    + '<div class="userstyle-entry" style="margin:0 0 12px"><button type="button" class="btn btn-primary" id="goto-userstyle-btn" data-goto="userstyle">我的「' + userstyleName + '」：让 ta 学你的说话方式 →</button></div>'
     + '<div id="dialect-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">加载中...</div>'
     + '<div class="dialect-save-bar"><span class="dialect-save-status" id="dialect-save-status">已保存</span>'
     + '<button class="btn btn-primary" id="save-dialect-btn" disabled>保存设置</button></div>'
+    + '</div>'
+    + '</div>'
+
+    // ═══════════════════════════════════
+    //  视图 6：用户名话（v0.30.0 自定义方言模板）
+    // ═══════════════════════════════════
+    + '<div class="view hidden" id="view-userstyle">'
+    + '<div class="sub-header">'
+    + '<button class="back-btn" data-goto="dialect">← 返回</button>'
+    + '<h2 id="userstyle-title">' + userstyleName + '</h2>'
+    + '</div>'
+    + '<div class="pref-section">'
+    + '<div class="dialect-desc" id="userstyle-desc">让助手学你的说话方式打字：点一下按钮，插件会读取你与所选助手的聊天记录，提炼你的说话习惯（用词、句式、标点、口头禅），生成一段可自己修改的方言模板。聊得越多，总结越准。\n模板确认后，到「方言口音」里给助手选上「' + userstyleName + '」就生效了。</div>'
+    // v0.31.0：内容分析模型未配置时的前置引导（避免点总结才被拒绝）
+    + (textReady ? '' : '<div class="form-group" style="background:var(--bg-soft,#f6f4ef);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--text-muted)">'
+      + '总结需要先配置「内容分析模型」（提炼风格时用来分析你的聊天记录）。'
+      + '<button type="button" class="btn btn-primary" id="userstyle-model-config-btn" style="width:auto;margin-left:8px;font-size:12px">去配置 →</button>'
+      + '</div>')
+    + '<div class="form-group" id="userstyle-agents-wrap">'
+    // v0.31.1：入口改胶囊按钮样式（原来纯文字看不出能点）
+    + '<details id="userstyle-agents-details" style="font-size:13px">'
+    + '<summary style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none;color:var(--primary-dark);background:var(--primary-light);border:1px solid var(--primary);border-radius:999px;padding:6px 14px;font-size:13px">聊天记录来源<span id="userstyle-agents-arrow">▾</span></summary>'
+    + '<div style="font-size:12px;color:var(--text-muted);margin-top:8px">总结时会读取这些助手的聊天记录来提炼你的风格，默认全部勾选，取消勾选就不读那边的记录</div>'
+    + '<div id="userstyle-agents" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px"></div>'
+    + '</details>'
+    + '</div>'
+    + '<div class="form-group">'
+    + '<label style="display:block;margin-bottom:6px">总结档位</label>'
+    + '<div id="userstyle-levels" style="display:flex;gap:10px;flex-wrap:wrap"></div>'
+    + '</div>'
+    // v0.31.1：状态提示移到按钮下方（按钮右边太挤）
+    + '<div class="form-group">'
+    + '<button type="button" class="btn btn-primary" id="userstyle-start-btn">总结我的发言习惯</button>'
+    + '</div>'
+    + '<div class="form-group" style="font-size:12px;margin-top:-8px">'
+    + '<span class="dialect-save-status" id="userstyle-task-status"></span>'
+    + '</div>'
+    + '<div class="form-group" id="userstyle-progress" hidden>'
+    + '<div class="form-hint" id="userstyle-progress-text"></div>'
+    + '</div>'
+    + '<div class="form-group" id="userstyle-draft-wrap" hidden>'
+    + '<label style="display:block;margin-bottom:6px">草稿（读着不像你就点「再总结一次」，想改就改完点「用它」）</label>'
+    + '<textarea id="userstyle-draft" rows="8" style="width:100%;box-sizing:border-box;font-size:13px;line-height:1.6"></textarea>'
+    + '<div style="font-size:12px;color:var(--text-muted);margin-top:4px"><span id="userstyle-draft-count">0 / 600 字</span>（模板保存上限 600 字）</div>'
+    + '<div style="display:flex;gap:10px;margin-top:8px;flex-wrap:wrap">'
+    + '<button type="button" class="btn btn-primary" id="userstyle-confirm-btn">保存模板</button>'
+    + '<button type="button" class="btn" id="userstyle-shorten-btn" hidden>自动精简</button>'
+    + '</div>'
+    + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px">保存后到「方言口音」页，给助手选上「<span id="userstyle-save-hint-name">用户名话</span>」就生效了</div>'
+    + '</div>'
+    + '<div class="form-group" id="userstyle-current-wrap" hidden>'
+    + '<label style="display:block;margin-bottom:6px">当前模板（已生效）</label>'
+    + '<div id="userstyle-current" style="font-size:12px;line-height:1.7;color:var(--text-muted);white-space:pre-wrap;background:var(--bg-soft,#f6f4ef);border-radius:10px;padding:10px;max-height:180px;overflow:auto"></div>'
+    + '<div style="display:flex;gap:10px;margin-top:8px">'
+    // v0.31.1：历史只留最近一版，不展示列表，给一个「返回上一版」按钮（可逆：再点一次换回来）
+    + '<button type="button" class="btn" id="userstyle-revert-btn" hidden>返回上一版</button>'
+    + '<button type="button" class="btn" id="userstyle-clear-btn">清空模板</button>'
+    + '</div>'
+    + '</div>'
+    + '<div class="form-group" style="margin-top:10px">'
+    + '<div class="form-hint">隐私说明：总结时只读取你与所选助手（以及之前总结过的其他助手）在本机的聊天记录，仅提炼说话风格（不提炼也不存储对话内容），数据不出本机。</div>'
+    + '</div>'
     + '</div>'
     + '</div>'
 
@@ -704,7 +776,7 @@ function renderPage() {
     + '</div>'
 
     // 分析模型
-    + '<div class="settings-section">'
+    + '<div class="settings-section" id="text-settings-section">'
     + '<h3>🧠 内容分析模型</h3>'
     + '<div class="settings-desc">在每次聊天时自动判断「该不该配图、配什么图」。配轻量便宜的就行。</div>'
     + '<div class="form-group"><label><input type="checkbox" id="text-enabled" style="vertical-align:middle;width:auto;margin-right:6px;accent-color:var(--primary)">启用辅助模型（关闭后不做自动判断）</label></div>'

@@ -19,17 +19,26 @@ import {
   readTextConfig, writeTextConfig,
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
   json, atomicWriteJson,
+  readUserName, userstyleDisplayName,
 } from '../lib/shared.js';
 import { upsertTeachingSample, removeTeachingSample } from '../lib/teaching.js';
 import {
   DIALECT_LIST,
   readDialectConfig, writeDialectConfig, syncDialectToIshiki, reconcileDialectToIshiki,
-  removeDialectFromIshiki,
+  removeDialectFromIshiki, syncUserstyleToIshiki,
   appendDialectLog, readDialectLog,
 } from '../lib/dialect.js';
 import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
+// v0.30.0 - 用户名话：风格模板 + 总结任务
+import {
+  STYLE_LEVELS, STYLE_LEVEL_IDS,
+  readStyleTemplate, writeStyleTemplate, confirmStyleDraft, revertStyleTemplate, clearStyleTemplate,
+  saveExcludedAgents,
+  readStyleTasks, getStyleTask, createStyleTask, updateStyleTask, runStyleTask,
+} from '../lib/style-template.js';
 
+// v0.30.1 - readUserName / userstyleDisplayName 已移到 lib/shared.js 共用
 function nextStickerId(meta) {
   let max = 0;
   for (const sticker of meta) {
@@ -1644,9 +1653,10 @@ export default async function registerRoutes(app, ctx) {
       } catch {}
 
       // 3) 方言配置 + 人格文件里的方言块（有残留就一并清掉）
+      // v0.28.0：remove 默认联动配置，这里传 syncConfig:false，因为紧接着就 writeDialectConfig 统一写
       const dcfg = readDialectConfig();
       if (dcfg.agents && dcfg.agents[agentId]) {
-        try { removeDialectFromIshiki(agentId); } catch {}
+        try { removeDialectFromIshiki(agentId, undefined, { syncConfig: false }); } catch {}
         delete dcfg.agents[agentId];
         writeDialectConfig(dcfg);
       }
@@ -1705,11 +1715,22 @@ export default async function registerRoutes(app, ctx) {
   // ── GET /api/dialect - 读取方言配置 + 方言库元数据（纯读，自愈只发生在 POST 保存后）──
   app.get('/api/dialect', (c) => {
     const config = readDialectConfig();
+    const userName = readUserName();
     return json({
       ok: true,
       data: {
         config,
-        dialects: DIALECT_LIST.map(d => ({ id: d.id, name: d.name, tagline: d.tagline, difficulty: d.difficulty, difficultyNote: d.difficultyNote, hasAdvanced: Boolean(d.personaAdvanced) })),
+        userName,
+        dialects: DIALECT_LIST.map(d => ({
+          id: d.id,
+          // v0.30.1：用户名话展示名动态拼用户名（如「XX话」），读不到用户名兜底「我的风格」
+          name: d.dynamicName ? userstyleDisplayName(userName) : d.name,
+          tagline: d.tagline,
+          difficulty: d.difficulty,
+          difficultyNote: d.difficultyNote,
+          hasAdvanced: Boolean(d.personaAdvanced),
+          dynamicName: Boolean(d.dynamicName),
+        })),
       },
     });
   });
@@ -1996,6 +2017,185 @@ export default async function registerRoutes(app, ctx) {
   } catch (e) {
     ctx?.log?.error?.('[biaoqingbao] 批量任务路由注册失败:', e.message);
   }
+
+  // ════════════════════════════════════════════════════════════════
+  //  v0.30.0 用户名话（userstyle）· 风格模板 + 总结任务
+  // ════════════════════════════════════════════════════════════════
+
+  // ── GET /api/style-template - 读取当前模板 + 历史版本 + 最近任务 + 助手列表（供设置区展示）──
+  app.get('/api/style-template', (c) => {
+    const tpl = readStyleTemplate();
+    const tasks = readStyleTasks().slice(-20).reverse();
+    // v0.30.7：全部助手（含名字）+ 排除名单（v0.30.9：移除 activeAgent——配方言是方言页的职责）
+    let agents = [];
+    try {
+      const agentsDir = path.join(HANA_HOME, 'agents');
+      agents = fs.readdirSync(agentsDir, { withFileTypes: true })
+        .filter((e) => e.isDirectory() && /^[A-Za-z0-9_-]+$/.test(e.name))
+        .map((e) => {
+          let name = e.name;
+          try {
+            const cfg = fs.readFileSync(path.join(agentsDir, e.name, 'config.yaml'), 'utf-8');
+            const m = cfg.match(/^agent:\s*$/m);
+            if (m) {
+              const nm = cfg.slice(m.index).match(/^\s{2}name:\s*['"]?([^'"\n#]+)['"]?\s*$/m);
+              if (nm && nm[1].trim()) name = nm[1].trim();
+            }
+          } catch { /* 读不到名字用 id */ }
+          return { id: e.name, name };
+        });
+    } catch { /* 没有助手 */ }
+    return json({
+      ok: true,
+      data: {
+        template: tpl,
+        agents,
+        userName: readUserName(),
+        levels: STYLE_LEVELS,
+        tasks: tasks.map(t => ({
+          id: t.id, status: t.status, level: t.level, agent_id: t.agent_id,
+          phase: t.phase, total_messages: t.total_messages, sampled_count: t.sampled_count,
+          draft: t.draft, // v0.30.1：必须带 draft，前端靠它展示草稿（实机发现漏字段导致「总结完没反应」）
+          created_at: t.created_at, updated_at: t.updated_at, error: t.error,
+        })),
+      },
+    });
+  });
+
+  // ── POST /api/style-template/excluded - 保存排除名单（「从哪些助手学」里取消勾选的）──
+  app.post('/api/style-template/excluded', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const ids = Array.isArray(body.agent_ids) ? body.agent_ids.map(String) : [];
+      const next = saveExcludedAgents(ids);
+      return json({ ok: true, data: { excluded_agents: next.excluded_agents } });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ── POST /api/style-task - 创建总结任务（后台执行，前端轮询进度）──
+  // v0.30.7：不再需要选助手——语料 = 全部助手（排除名单外），agent_id 仅作展示保留
+  app.post('/api/style-task', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const agentId = String(body.agent_id || '').trim() || 'all'; // 兼容旧前端
+      const level = String(body.level || 'balanced');
+      if (!STYLE_LEVEL_IDS.includes(level)) return json({ ok: false, error: '无效的档位' }, 400);
+
+      // 未配置内容分析模型时提前拦截（跟表情包识图一致的口径）
+      const cfg = readTextConfig();
+      if (!cfg.enabled) {
+        return json({ ok: false, error: '内容分析模型未启用，请先到设置里启用' }, 400);
+      }
+      if (cfg.source === 'hana' && (!cfg.providerId || !cfg.modelId)) {
+        return json({ ok: false, error: '请先在设置中选择内容分析模型' }, 400);
+      }
+      if (cfg.source === 'custom' && (!cfg.customBaseUrl || !cfg.customApiKey || !cfg.customModel)) {
+        return json({ ok: false, error: '请先在设置中配置自定义模型' }, 400);
+      }
+
+      const created = createStyleTask(agentId, level);
+      if (!created.ok) return json({ ok: false, error: created.error }, 400);
+
+      const task = created.task;
+      const userName = readUserName();
+      // fire-and-forget：后台执行，不阻塞响应（参考坑 49：不在请求里等重活）
+      setImmediate(async () => {
+        try {
+          await runStyleTask(task, async (messages, opts) => {
+            // 复用内容分析模型的调用链路（utility:call-text / 自定义 API）
+            return callTextModel(messages, { maxTokens: opts.maxTokens || 1200, temperature: opts.temperature || 0.5, timeoutMs: opts.timeoutMs || 120000 });
+          }, userName, HANA_HOME);
+        } catch (e) {
+          ctx?.log?.error?.('[biaoqingbao] 风格总结任务异常:', e.message || e);
+          updateStyleTask(task.id, { status: 'failed', phase: 'distilling', error: '任务异常: ' + (e.message || e) });
+        }
+      });
+
+      return json({ ok: true, data: { taskId: task.id } });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ── GET /api/style-task/:id - 查任务详情（轮询进度用）──
+  app.get('/api/style-task/:id', (c) => {
+    const t = getStyleTask(c.req.param('id'));
+    if (!t) return json({ ok: false, error: '任务不存在' }, 404);
+    return json({ ok: true, data: t });
+  });
+
+  // ── POST /api/style-template/confirm - 保存草稿为当前模板（保存前自动备份旧版，可回退）──
+  // v0.30.9：纯编辑器职责——只保存模板，配方言是方言页的事（移除一键套用逻辑）
+  app.post('/api/style-template/confirm', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const draft = String(body.draft || '').trim();
+      const taskId = String(body.task_id || '');
+      const sourceAgent = String(body.agent_id || '');
+      const level = String(body.level || '');
+      const res = confirmStyleDraft(draft, { sourceAgent, level });
+      if (!res.ok) return json({ ok: false, error: res.error }, 400);
+      // v0.31.0：模板更新后自动同步到已开启「用户名话」的助手 ishiki.md，
+      // 否则重启后 Hana 组装系统提示词读到的还是旧模板（回归：保存不生效）
+      const sync = syncUserstyleToIshiki();
+      // 关联任务标记已确认（历史记录用）
+      if (taskId) {
+        const t = getStyleTask(taskId);
+        if (t) updateStyleTask(taskId, { confirmed: true });
+      }
+      return json({ ok: true, data: res.data, sync });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ── POST /api/style-template/shorten - 自动精简草稿（超 600 字时一键压缩，分享版用户不用手动删）──
+  app.post('/api/style-template/shorten', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const draft = String(body.draft || '').trim();
+      if (!draft) return json({ ok: false, error: '没有草稿内容' }, 400);
+      const SHORTEN_PROMPT = `你是一名文字编辑。下面是一段「用户说话风格模板」，它超过了保存上限（600 字）。
+请把它精简到 550 字以内：保留最核心的风格特征（高频词、语气词、句式、标点习惯、情绪表达），删掉重复描述和次要细节，保持原有的身份化口吻（「你是一个……打字也带着……的习惯」），不要用 markdown 标题/列表/加粗，不要新增内容，直接输出精简后的模板全文。
+
+<模板>
+${draft}
+</模板>`;
+      const result = await callTextModel([{ role: 'user', content: SHORTEN_PROMPT }], { maxTokens: 1200, temperature: 0.3, timeoutMs: 60000 });
+      if (!result.ok) return json({ ok: false, error: result.error || '精简失败' }, 500);
+      const shortened = String(result.data || '').trim();
+      if (!shortened) return json({ ok: false, error: '精简结果为空' }, 500);
+      return json({ ok: true, data: shortened });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ── POST /api/style-template/revert - 回退到历史版本 ──
+  app.post('/api/style-template/revert', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const version = Number(body.version);
+      if (!Number.isInteger(version) || version <= 0) return json({ ok: false, error: '无效的版本号' }, 400);
+      const res = revertStyleTemplate(version);
+      if (!res.ok) return json({ ok: false, error: res.error }, 400);
+      // v0.31.0：回退后同样重新同步 userstyle 助手的 ishiki.md
+      const sync = syncUserstyleToIshiki();
+      return json({ ok: true, data: res.data, sync });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ── POST /api/style-template/clear - 清空模板 + 历史（用户主动要求）──
+  app.post('/api/style-template/clear', async (c) => {
+    const res = clearStyleTemplate();
+    // v0.31.0：清空后把 userstyle 人格块从各助手 ishiki.md 移除，避免旧模板残留
+    const sync = syncUserstyleToIshiki();
+    return json({ ok: true, data: res.data, sync });
+  });
 
   // ═══ GET /api/check-update — 检查 GitHub 更新（v0.19.5 分享版）═══
   app.get('/api/check-update', async (c) => {

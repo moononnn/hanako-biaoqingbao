@@ -2270,6 +2270,10 @@
       if (dialectMetaData.dialects[i].id === dialectId) { d = dialectMetaData.dialects[i]; break; }
     }
     if (!d) return '';
+    // v0.30.0：用户名话预览特殊文案（提示模板状态）
+    if (d.dynamicName) {
+      return '开启后 ta 打字会自然带点你的味道，正事闲聊都这样 · 像 ta 一样说话';
+    }
     var note = d.difficultyNote ? '（模型表现：' + d.difficultyNote + '）' : '';
     return '开启后 ta 打字会自然带点' + d.name + '味，正事闲聊都这样' + note + ' · ' + d.tagline;
   }
@@ -2295,11 +2299,15 @@
     // v0.26.0 浓方言开关（独立于 picker，放 head 层、选方言左边）
     // 开启后 = 动态回响（每轮注入短提示，正事自动让路）+ 有精修文案的方言写加强人格
     var boostOn = !!settings.boost;
-    // v0.26.0 token 提示：只在开启后显示，放开关左边，让两个按钮挨着
-    if (boostOn) html += '<span class="dialect-boost-tip">开加浓每轮多费一点 token</span>';
-    html += '<button type="button" class="dialect-boost-toggle' + (boostOn ? ' is-on' : '') + (enabled ? '' : ' is-disabled') + '" data-act="toggle-boost"' + (enabled ? '' : ' disabled') + ' title="' + (enabled ? '方言加浓：浓度更高，每轮对话有方言回响，正事场合自动让路' : '先给 ta 选个方言，才能开方言加浓') + '">'
-      + '<span class="dialect-boost-track"><span class="dialect-boost-knob"></span></span>'
-      + '<span class="dialect-boost-label">方言加浓</span></button>';
+    var isUserstyle = settings.dialect === 'userstyle';
+    // v0.30.0：用户名话不走回响层，不显示「方言加浓」开关（模板本身就是用户风格）
+    if (!isUserstyle) {
+      // v0.26.0 token 提示：只在开启后显示，放开关左边，让两个按钮挨着
+      if (boostOn) html += '<span class="dialect-boost-tip">开加浓每轮多费一点 token</span>';
+      html += '<button type="button" class="dialect-boost-toggle' + (boostOn ? ' is-on' : '') + (enabled ? '' : ' is-disabled') + '" data-act="toggle-boost"' + (enabled ? '' : ' disabled') + ' title="' + (enabled ? '方言加浓：浓度更高，每轮对话有方言回响，正事场合自动让路' : '先给 ta 选个方言，才能开方言加浓') + '">'
+        + '<span class="dialect-boost-track"><span class="dialect-boost-knob"></span></span>'
+        + '<span class="dialect-boost-label">方言加浓</span></button>';
+    }
     html += '<div class="dialect-picker" data-agent-id="' + escHtml(agent.id) + '">';
     html += '<button type="button" class="dialect-picker-btn' + (enabled ? ' is-on' : '') + '" data-act="toggle-picker">';
     html += '<span class="dialect-picker-label">' + escHtml(enabled ? dialectName(settings.dialect) : '选个方言') + '</span>';
@@ -2372,6 +2380,7 @@
       renderDialectList();
       bindDialectList();
       bindDialectSave();
+      bindUserstyleActions();
     }).catch(function () {
       list.innerHTML = '<div style="color:var(--text-muted);font-size:13px">加载失败，请稍后重试</div>';
     });
@@ -2398,8 +2407,17 @@
         if (!picker2) return;
         var agentId = picker2.getAttribute('data-agent-id');
         if (!agentId) return;
+        var newValue = pickBtn.getAttribute('data-value') || '';
+        // v0.30.0：选「用户名话」但模板还没总结时，引导先去设置（不直接选上）
+        if (newValue === 'userstyle' && !userstyleHasTemplate()) {
+          closeAllDialectMenus();
+          toast('「' + dialectName('userstyle') + '」还没模板：先去「' + userstyleName() + '」设置里总结一次吧', true);
+          showView('userstyle');
+          renderUserstyle();
+          return;
+        }
         var settings = getDialectSetting(agentId);
-        settings.dialect = pickBtn.getAttribute('data-value') || '';
+        settings.dialect = newValue;
         settings.enabled = !!settings.dialect;
         // v0.25.0：boost 对所有方言有效（动态回响不依赖精修文案），换方言无需清理
         closeAllDialectMenus();
@@ -2467,6 +2485,429 @@
           toast('保存失败：' + error.message, true);
         });
     });
+  }
+
+  // ═══════════════════════════════════
+  //  v0.30.0 用户名话（userstyle）· 风格模板设置
+  // ═══════════════════════════════════
+  var userstyleData = null;          // { template, levels, tasks }
+  var userstylePollTimer = null;
+  var userstyleSelectedLevel = 'balanced';
+
+  // 当前是否有已确认模板（方言选择器拦截用）
+  function userstyleHasTemplate() {
+    return !!(userstyleData && userstyleData.template && userstyleData.template.current);
+  }
+
+  // 用户名（方言展示名用）
+  function userstyleUserName() {
+    return (dialectMetaData && dialectMetaData.userName) || (userstyleData && userstyleData.userName) || '';
+  }
+  function userstyleName() {
+    var n = userstyleUserName();
+    return n ? n + '话' : '我的风格';
+  }
+
+  function renderUserstyle() {
+    var title = $('userstyle-title');
+    if (title) title.textContent = userstyleName();
+
+    // 档位按钮
+    var lvWrap = $('userstyle-levels');
+    if (lvWrap && !lvWrap.dataset.bound) {
+      lvWrap.dataset.bound = '1';
+      renderUserstyleLevels();
+    }
+
+    loadUserstyleData();
+  }
+
+  // v0.30.7：渲染「从哪些助手学」排除列表（默认全勾，取消勾选 = 排除）
+  function renderUserstyleAgents() {
+    var wrap = $('userstyle-agents');
+    if (!wrap || !userstyleData) return;
+    var agents = userstyleData.agents || [];
+    var excluded = new Set((userstyleData.template && userstyleData.template.excluded_agents) || []);
+    var html = '';
+    for (var i = 0; i < agents.length; i++) {
+      var a = agents[i];
+      var checked = !excluded.has(a.id);
+      html += '<label style="display:inline-flex;align-items:center;gap:4px;font-size:13px;cursor:pointer;background:var(--bg-soft,#f6f4ef);border-radius:999px;padding:4px 10px;border:1px solid var(--border)">'
+        + '<input type="checkbox" data-userstyle-agent="' + escHtml(a.id) + '"' + (checked ? ' checked' : '') + ' style="accent-color:var(--primary);cursor:pointer">'
+        + escHtml(a.name || a.id) + '</label>';
+    }
+    wrap.innerHTML = html;
+    if (wrap.dataset.bound === '1') return;
+    wrap.dataset.bound = '1';
+    wrap.addEventListener('change', function () {
+      var excludedIds = [];
+      wrap.querySelectorAll('input[data-userstyle-agent]').forEach(function (cb) {
+        if (!cb.checked) excludedIds.push(cb.getAttribute('data-userstyle-agent'));
+      });
+      // 记住排除名单（下次总结还用）
+      apiFetch(withAuth(API + '/api/style-template/excluded'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agent_ids: excludedIds }),
+        signal: AbortSignal.timeout(5000),
+      }).then(function (r) { return r.json(); }).catch(function () {});
+    });
+  }
+
+  // v0.30.9：移除一键套用逻辑（配方言是方言页的职责）
+
+  function renderUserstyleLevels() {
+    var lvWrap = $('userstyle-levels');
+    if (!lvWrap) return;
+    var levels = (userstyleData && userstyleData.levels) || {
+      light: { label: '轻量', count: 500, desc: '约 500 条聊天记录，适合刚用几天、聊天不多' },
+      balanced: { label: '均衡', count: 2000, desc: '约 2000 条聊天记录，默认推荐' },
+      deep: { label: '深度', count: 5000, desc: '约 5000 条聊天记录，聊得多更精准，会慢一些' },
+    };
+    // v0.30.1：三个等宽按钮，选中只改高亮色，不再撑满宽度（回归：btn-primary 自带 width:100% 导致选中拉长）
+    var html = '<div style="display:flex;gap:8px">';
+    var keys = ['light', 'balanced', 'deep'];
+    for (var i = 0; i < keys.length; i++) {
+      var lv = levels[keys[i]];
+      if (!lv) continue;
+      var active = userstyleSelectedLevel === keys[i];
+      html += '<button type="button" data-userstyle-level="' + keys[i] + '" title="' + escHtml(lv.desc || '') + '" style="flex:1;padding:8px 10px;border-radius:6px;cursor:pointer;font-family:inherit;font-size:13px;border:1px solid ' + (active ? 'var(--primary)' : 'var(--border)') + ';background:' + (active ? 'var(--primary-light)' : 'transparent') + ';color:' + (active ? 'var(--primary-dark)' : 'var(--text-muted)') + '">'
+        + escHtml(lv.label || keys[i]) + '<br><span style="font-size:11px;opacity:.85">约 ' + (lv.count || '?') + ' 条</span></button>';
+    }
+    html += '</div>';
+    lvWrap.innerHTML = html;
+    lvWrap.querySelectorAll('button[data-userstyle-level]').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        userstyleSelectedLevel = btn.getAttribute('data-userstyle-level');
+        renderUserstyleLevels();
+      });
+    });
+  }
+
+  function loadUserstyleData() {
+    var status = $('userstyle-task-status');
+    apiFetch(withAuth(API + '/api/style-template'), { signal: AbortSignal.timeout(5000) })
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || '加载失败');
+        userstyleData = result.data;
+        // v0.30.1：接口返回 userName 时刷新标题（兜底 dialectMetaData 未加载的情况）
+        if (result.data && result.data.userName) {
+          var title = $('userstyle-title');
+          if (title) title.textContent = userstyleName();
+        }
+        renderUserstyleTemplate();
+        renderUserstyleLevels();
+        renderUserstyleAgents(); // v0.30.7：排除列表
+        // v0.30.9：保存提示里的方言名动态刷新
+        var saveHint = $('userstyle-save-hint-name');
+        if (saveHint) saveHint.textContent = userstyleName();
+        // 有运行中的任务就继续轮询
+        var running = (result.data.tasks || []).find(function (t) { return t.status === 'running'; });
+        if (running) startUserstylePoll(running.id);
+      })
+      .catch(function (e) {
+        if (status) status.textContent = '加载失败：' + e.message;
+      });
+  }
+
+  function renderUserstyleTemplate() {
+    if (!userstyleData) return;
+    var tpl = userstyleData.template || {};
+    var current = tpl.current || '';
+    var history = tpl.history || [];
+
+    var curWrap = $('userstyle-current-wrap');
+    var curBox = $('userstyle-current');
+    if (curWrap) curWrap.hidden = !current;
+    if (curBox) curBox.textContent = current || '';
+
+    // v0.31.1：历史只留最近一版，不展示列表；有上一版时显示「返回上一版」按钮
+    var revertBtn = $('userstyle-revert-btn');
+    if (revertBtn) {
+      var last = history.length > 0 ? history[history.length - 1] : null;
+      revertBtn.hidden = !(current && last);
+      if (last) {
+        var prevText = (last.content || '').trim();
+        if (revertBtn.title !== prevText) revertBtn.title = '上一版内容：' + prevText;
+      }
+    }
+
+    // 草稿区：任务完成后展示
+    var runningTask = (userstyleData.tasks || []).find(function (t) { return t.status === 'running'; });
+    var lastTask = (userstyleData.tasks || []).find(function (t) { return t.status === 'completed' && !t.confirmed; });
+    if (!runningTask && lastTask && lastTask.draft) {
+      showUserstyleDraft(lastTask.draft, lastTask.id);
+    }
+  }
+
+  function showUserstyleDraft(draft, taskId) {
+    var wrap = $('userstyle-draft-wrap');
+    if (!wrap) return;
+    wrap.hidden = false;
+    var box = $('userstyle-draft');
+    if (box && !box.dataset.filled) {
+      box.value = draft;
+      box.dataset.filled = '1';
+      box.dataset.taskId = taskId || '';
+      // v0.30.5：实时字数计数（超 600 禁用确认，避免保存时才报错）
+      if (!box.dataset.countBound) {
+        box.dataset.countBound = '1';
+        box.addEventListener('input', updateUserstyleDraftCount);
+      }
+      updateUserstyleDraftCount();
+    }
+  }
+
+  // v0.30.5：草稿字数实时显示，超 600 红色提示 + 禁用确认按钮
+  var USERSTYLE_DRAFT_MAX = 600;
+  function updateUserstyleDraftCount() {
+    var box = $('userstyle-draft');
+    if (!box) return;
+    var count = $('userstyle-draft-count');
+    var btn = $('userstyle-confirm-btn');
+    var shortenBtn = $('userstyle-shorten-btn');
+    var len = (box.value || '').length;
+    if (count) {
+      count.textContent = len + ' / ' + USERSTYLE_DRAFT_MAX + ' 字';
+      count.style.color = len > USERSTYLE_DRAFT_MAX ? '#d9534f' : 'var(--text-muted)';
+    }
+    if (btn) {
+      btn.disabled = len > USERSTYLE_DRAFT_MAX;
+      btn.title = len > USERSTYLE_DRAFT_MAX ? '模板超过 ' + USERSTYLE_DRAFT_MAX + ' 字，先点「自动精简」' : '';
+    }
+    // v0.30.6：超长时显示「自动精简」按钮（分享版用户不用手动删）
+    if (shortenBtn) shortenBtn.hidden = len <= USERSTYLE_DRAFT_MAX;
+  }
+
+  // v0.30.9：保存草稿为当前模板（纯编辑器职责；配方言是方言页的事）
+  function confirmUserstyleDraft() {
+    var box = $('userstyle-draft');
+    if (!box || !box.value.trim()) { toast('草稿是空的', true); return; }
+    var btn = $('userstyle-confirm-btn');
+    if (btn) btn.disabled = true;
+    apiFetch(withAuth(API + '/api/style-template/confirm'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        draft: box.value,
+        task_id: box.dataset.taskId || '',
+        agent_id: '',
+        level: userstyleSelectedLevel,
+      }),
+      signal: AbortSignal.timeout(8000),
+    }).then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || '保存失败');
+        // v0.31.0：保存后已自动同步到开了「用户名话」的助手 ishiki.md
+        var synced = (result.sync && result.sync.synced) || [];
+        if (synced.length > 0) {
+          toast('模板已保存！已自动同步给 ' + synced.length + ' 个开了「' + userstyleName() + '」的助手，重启 Hana 后生效');
+        } else {
+          toast('模板已保存！去「方言口音」给助手选上「' + userstyleName() + '」就生效');
+        }
+        hideUserstyleDraft();
+        loadUserstyleData();
+      })
+      .catch(function (e) {
+        if (btn) btn.disabled = false;
+        toast('保存失败：' + e.message, true);
+      });
+  }
+
+  // v0.30.6：自动精简草稿（超长时一键压缩，不用手动删）
+  function shortenUserstyleDraft() {
+    var box = $('userstyle-draft');
+    if (!box || !box.value.trim()) return;
+    var shortenBtn = $('userstyle-shorten-btn');
+    var confirmBtn = $('userstyle-confirm-btn');
+    if (shortenBtn) { shortenBtn.disabled = true; shortenBtn.textContent = '精简中…'; }
+    apiFetch(withAuth(API + '/api/style-template/shorten'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ draft: box.value }),
+      signal: AbortSignal.timeout(60000),
+    }).then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || '精简失败');
+        box.value = result.data;
+        updateUserstyleDraftCount();
+        toast('已精简到 ' + result.data.length + ' 字，看看还满意不');
+      })
+      .catch(function (e) {
+        toast('精简失败：' + e.message + '（也可以自己删掉一些句子）', true);
+      })
+      .finally(function () {
+        if (shortenBtn) { shortenBtn.disabled = false; shortenBtn.textContent = '自动精简'; }
+        if (confirmBtn) confirmBtn.disabled = (box.value || '').length > USERSTYLE_DRAFT_MAX;
+      });
+  }
+
+  function hideUserstyleDraft() {
+    var wrap = $('userstyle-draft-wrap');
+    if (wrap) wrap.hidden = true;
+    var box = $('userstyle-draft');
+    if (box) { box.value = ''; delete box.dataset.filled; delete box.dataset.taskId; }
+  }
+
+  function startUserstyleTask() {
+    var btn = $('userstyle-start-btn');
+    if (btn) btn.disabled = true;
+    var status = $('userstyle-task-status');
+    if (status) status.textContent = '正在创建任务…';
+
+    apiFetch(withAuth(API + '/api/style-task'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level: userstyleSelectedLevel }), // v0.30.7：不用选助手，全量采集
+      signal: AbortSignal.timeout(8000),
+    }).then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || '创建任务失败');
+        hideUserstyleDraft();
+        startUserstylePoll(result.data.taskId);
+      })
+      .catch(function (e) {
+        if (btn) btn.disabled = false;
+        if (status) status.textContent = '';
+        toast('创建任务失败：' + e.message, true);
+      });
+  }
+
+  // 轮询任务进度（切走页面也不影响后端执行，回来继续显示）
+  function startUserstylePoll(taskId) {
+    stopUserstylePoll();
+    var status = $('userstyle-task-status');
+    var progress = $('userstyle-progress');
+    var btn = $('userstyle-start-btn');
+    if (btn) btn.disabled = true;
+    if (progress) progress.hidden = false;
+
+    var PHASE_TEXT = {
+      reading: '正在读取会话记录…',
+      sampling: '正在取样…',
+      distilling: '正在提炼风格（深度档可能要点时间）…',
+      drafting: '草稿生成中…',
+    };
+
+    userstylePollTimer = setInterval(function () {
+      apiFetch(withAuth(API + '/api/style-task/' + encodeURIComponent(taskId)), { signal: AbortSignal.timeout(5000) })
+        .then(function (r) { return r.json(); })
+        .then(function (result) {
+          if (!result.ok) { stopUserstylePoll(); if (status) status.textContent = '任务查询失败'; return; }
+          var t = result.data;
+          var pText = $('userstyle-progress-text');
+          if (t.status === 'running') {
+            var phase = PHASE_TEXT[t.phase] || '处理中…';
+            var detail = t.total_messages ? '（共 ' + t.total_messages + ' 条发言' + (t.sampled_count ? '，已取样 ' + t.sampled_count + ' 条' : '') + '）' : '';
+            if (pText) pText.textContent = phase + detail;
+            if (status) status.textContent = '总结中，可以先去干别的，回来就好';
+          } else if (t.status === 'completed') {
+            stopUserstylePoll();
+            if (pText) pText.textContent = '完成！共 ' + t.total_messages + ' 条发言，取样 ' + t.sampled_count + ' 条。';
+            if (status) status.textContent = '';
+            if (btn) btn.disabled = false;
+            loadUserstyleData(); // 刷新拿草稿
+          } else if (t.status === 'failed') {
+            stopUserstylePoll();
+            if (pText) pText.textContent = '';
+            if (status) status.textContent = '';
+            if (btn) btn.disabled = false;
+            toast('总结失败：' + (t.error || '未知错误'), true);
+          }
+        })
+        .catch(function () { /* 轮询失败等下一轮 */ });
+    }, 2000);
+  }
+
+  function stopUserstylePoll() {
+    if (userstylePollTimer) { clearInterval(userstylePollTimer); userstylePollTimer = null; }
+    var progress = $('userstyle-progress');
+    if (progress) progress.hidden = true;
+  }
+
+  function revertUserstyleTemplate(version) {
+    apiFetch(withAuth(API + '/api/style-template/revert'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ version: version }),
+      signal: AbortSignal.timeout(8000),
+    }).then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok) throw new Error(result.error || '回退失败');
+        toast('已返回上一版');
+        loadUserstyleData();
+      })
+      .catch(function (e) { toast('回退失败：' + e.message, true); });
+  }
+
+  function bindUserstyleActions() {
+    // v0.31.0：模型未配置提示条里的「去配置」→ 打开设置弹窗并定位到内容分析模型
+    var cfgBtn = $('userstyle-model-config-btn');
+    if (cfgBtn && !cfgBtn.dataset.bound) {
+      cfgBtn.dataset.bound = '1';
+      cfgBtn.addEventListener('click', function () {
+        openSettings();
+        var sec = $('text-settings-section');
+        if (sec && sec.scrollIntoView) sec.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
+    var startBtn = $('userstyle-start-btn');
+    if (startBtn && !startBtn.dataset.bound) {
+      startBtn.dataset.bound = '1';
+      startBtn.addEventListener('click', startUserstyleTask);
+    }
+    // v0.31.1：返回上一版（取历史最近一版；可逆，再点一次换回来）
+    var revertBtn = $('userstyle-revert-btn');
+    if (revertBtn && !revertBtn.dataset.bound) {
+      revertBtn.dataset.bound = '1';
+      revertBtn.addEventListener('click', function () {
+        var tpl = userstyleData && userstyleData.template;
+        var last = (tpl && tpl.history || []).slice(-1)[0];
+        if (!last) return;
+        revertUserstyleTemplate(last.version);
+      });
+    }
+    var confirmBtn = $('userstyle-confirm-btn');
+    if (confirmBtn && !confirmBtn.dataset.bound) {
+      confirmBtn.dataset.bound = '1';
+      confirmBtn.addEventListener('click', confirmUserstyleDraft);
+    }
+    // v0.30.6：自动精简按钮
+    var shortenBtn = $('userstyle-shorten-btn');
+    if (shortenBtn && !shortenBtn.dataset.bound) {
+      shortenBtn.dataset.bound = '1';
+      shortenBtn.addEventListener('click', shortenUserstyleDraft);
+    }
+    var clearBtn = $('userstyle-clear-btn');
+    if (clearBtn && !clearBtn.dataset.bound) {
+      clearBtn.dataset.bound = '1';
+      clearBtn.addEventListener('click', function () {
+        customConfirm('确定清空「' + userstyleName() + '」模板和历史版本吗？\n已选该方言的助手会失去效果（重启 Hana 后生效）。', function () {
+          apiFetch(withAuth(API + '/api/style-template/clear'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+            signal: AbortSignal.timeout(5000),
+          }).then(function (r) { return r.json(); })
+            .then(function (result) {
+              if (!result.ok) throw new Error(result.error || '清空失败');
+              toast('模板已清空');
+              loadUserstyleData();
+            })
+            .catch(function (e) { toast('清空失败：' + e.message, true); });
+        });
+      });
+    }
+    // v0.31.1：「从哪些助手学」展开/收起时切换箭头方向
+    var agentsDetails = $('userstyle-agents-details');
+    if (agentsDetails && !agentsDetails.dataset.bound) {
+      agentsDetails.dataset.bound = '1';
+      agentsDetails.addEventListener('toggle', function () {
+        var arrow = $('userstyle-agents-arrow');
+        if (arrow) arrow.textContent = agentsDetails.open ? '▴' : '▾';
+      });
+    }
   }
 
   // ═══════════════════════════════════
@@ -3142,8 +3583,18 @@
         if (target === 'preferences') initPreferencesView();
         if (target === 'agent-freq') renderAgentFreq();
         if (target === 'dialect') renderDialect();
+        if (target === 'userstyle') renderUserstyle();
       });
     });
+
+    // 导航：方言页 → 用户名话
+    var gotoUserstyleBtn = document.getElementById('goto-userstyle-btn');
+    if (gotoUserstyleBtn) {
+      gotoUserstyleBtn.addEventListener('click', function () {
+        showView('userstyle');
+        renderUserstyle();
+      });
+    }
 
     // 导航：添加入库卡片 -> 打开上传弹窗
     var uploadCard = document.querySelector('.entry-card[data-action="upload"]');

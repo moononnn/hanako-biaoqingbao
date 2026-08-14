@@ -1,4 +1,4 @@
-import test from 'node:test';
+﻿import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -12,19 +12,21 @@ import {
   applyDialectToIshiki, removeDialectFromIshiki, readDialectFromIshiki,
   syncDialectToIshiki, reconcileDialectToIshiki,
   appendDialectLog, readDialectLog,
+  agentIshikiPath,
   _resetDialectCache,
 } from '../lib/dialect.js';
 
 // ── 测试隔离：每次把配置路径指向临时文件，绝不碰正式配置 ──
 // （回归：测试曾直接写正式 data/dialect-config.json，把用户的配置覆盖丢了）
+// v0.28.0：同时隔离日志文件（apply/remove 默认联动配置，会写配置和日志）
 const tempConfigFiles = [];
 function useTempConfig() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-dialect-test-'));
-  const file = path.join(dir, 'dialect-config.json');
-  process.env.BIAOQINGBAO_DIALECT_CONFIG = file;
+  process.env.BIAOQINGBAO_DIALECT_CONFIG = path.join(dir, 'dialect-config.json');
+  process.env.BIAOQINGBAO_DIALECT_LOG = path.join(dir, 'dialect-log.json');
   tempConfigFiles.push(dir);
   _resetDialectCache();
-  return file;
+  return process.env.BIAOQINGBAO_DIALECT_CONFIG;
 }
 
 test.after(() => {
@@ -33,10 +35,13 @@ test.after(() => {
   }
 });
 
-test('方言库完整性：9 种方言齐全，字段非空，难度标注仅新疆话保留', () => {
-  assert.equal(DIALECT_LIST.length, 9);
+test('方言库完整性：10 种方言齐全（9 种地方话 + 用户名话），字段非空，难度标注仅新疆话保留', () => {
+  assert.equal(DIALECT_LIST.length, 10);
+  assert.ok(getDialect('userstyle'), '应包含 userstyle（用户名话）');
   const ids = new Set(DIALECT_LIST.map(d => d.id));
   for (const d of DIALECT_LIST) {
+    // v0.30.0：用户名话是动态模板方言，不走固定字段断言（无 markers/particles/examples）
+    if (d.id === 'userstyle') continue;
     assert.ok(d.name, `${d.id} 缺 name`);
     assert.ok(d.people, `${d.id} 缺 people`);
     assert.ok(d.tagline, `${d.id} 缺 tagline`);
@@ -130,7 +135,7 @@ test('配置归一化：只保留有效配置，非法值丢弃', () => {
     version: 2,
     agents: {
       hanako: { dialect: 'dongbei', enabled: true },
-      yumi: { dialect: '不存在的方言', enabled: true },
+      agentB: { dialect: '不存在的方言', enabled: true },
       xingxing: { dialect: 'henan', density: 'max' }, // 老格式非法浓度 → 丢弃
       '__proto__': { dialect: 'henan', enabled: true },
       ok2: null,
@@ -178,13 +183,13 @@ test('配置：读写往返一致（新格式）', () => {
     version: 2,
     agents: {
       hanako: { dialect: 'taiwan', enabled: true },
-      yumi: { dialect: 'sichuan', enabled: true },
+      agentB: { dialect: 'sichuan', enabled: true },
     },
   });
   const read = readDialectConfig();
   assert.deepEqual(read.agents, {
     hanako: { dialect: 'taiwan', enabled: true },
-    yumi: { dialect: 'sichuan', enabled: true },
+    agentB: { dialect: 'sichuan', enabled: true },
   });
   assert.deepEqual(getAgentDialectSetting('hanako'), { dialect: 'taiwan', enabled: true });
 });
@@ -209,7 +214,8 @@ function makeTempAgentsRoot() {
 
 test('applyDialectToIshiki：新建文件写入人格块', () => {
   const root = makeTempAgentsRoot();
-  const res = applyDialectToIshiki('hanako', 'dongbei', 'normal', root);
+  // v0.28.0：纯人格行为测试传 syncConfig:false，隔离配置联动（联动行为有专属测试覆盖）
+  const res = applyDialectToIshiki('hanako', 'dongbei', 'normal', root, 'normal', { syncConfig: false });
   assert.equal(res.ok, true);
   const content = fs.readFileSync(path.join(root, 'agents', 'hanako', 'ishiki.md'), 'utf-8');
   assert.ok(content.includes('<!-- biaoqingbao-dialect:start -->'));
@@ -223,7 +229,7 @@ test('applyDialectToIshiki：保留已有内容，追加人格块', () => {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, '# 人格定义\n\n- 你是一个温暖的人\n', 'utf-8');
 
-  applyDialectToIshiki('hanako', 'henan', 'on', root);
+  applyDialectToIshiki('hanako', 'henan', 'on', root, 'normal', { syncConfig: false });
   const content = fs.readFileSync(filePath, 'utf-8');
   assert.ok(content.startsWith('# 人格定义\n\n- 你是一个温暖的人'), '原有内容应保留');
   assert.ok(content.includes('土生土长的河南人'), '应为身份化习惯式描述');
@@ -232,9 +238,9 @@ test('applyDialectToIshiki：保留已有内容，追加人格块', () => {
 
 test('applyDialectToIshiki：重复写入幂等，只保留一个块', () => {
   const root = makeTempAgentsRoot();
-  applyDialectToIshiki('yumi', 'sichuan', 'on', root);
-  applyDialectToIshiki('yumi', 'sichuan', 'on', root);
-  const content = fs.readFileSync(path.join(root, 'agents', 'yumi', 'ishiki.md'), 'utf-8');
+  applyDialectToIshiki('agentB', 'sichuan', 'on', root, 'normal', { syncConfig: false });
+  applyDialectToIshiki('agentB', 'sichuan', 'on', root, 'normal', { syncConfig: false });
+  const content = fs.readFileSync(path.join(root, 'agents', 'agentB', 'ishiki.md'), 'utf-8');
   const starts = content.split('<!-- biaoqingbao-dialect:start -->').length - 1;
   const ends = content.split('<!-- biaoqingbao-dialect:end -->').length - 1;
   assert.equal(starts, 1);
@@ -248,7 +254,7 @@ test('removeDialectFromIshiki：移除块且保留其他内容', () => {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, '# 人格定义\n\n- 你是一个温暖的人\n\n<!-- biaoqingbao-dialect:start -->\n你是地道的东北人\n<!-- biaoqingbao-dialect:end -->\n', 'utf-8');
 
-  const res = removeDialectFromIshiki('hanako', root);
+  const res = removeDialectFromIshiki('hanako', root, { syncConfig: false });
   assert.equal(res.ok, true);
   assert.equal(res.removed, true);
   const content = fs.readFileSync(filePath, 'utf-8');
@@ -258,17 +264,78 @@ test('removeDialectFromIshiki：移除块且保留其他内容', () => {
 
 test('removeDialectFromIshiki：无块时返回 removed=false，不报错', () => {
   const root = makeTempAgentsRoot();
-  const res = removeDialectFromIshiki('hanako', root); // 文件不存在
+  const res = removeDialectFromIshiki('hanako', root, { syncConfig: false }); // 文件不存在
   assert.equal(res.ok, true);
   assert.equal(res.removed, false);
 });
 
 test('readDialectFromIshiki：读回写入的人格文案', () => {
   const root = makeTempAgentsRoot();
-  applyDialectToIshiki('hanako', 'taiwan', 'light', root);
+  applyDialectToIshiki('hanako', 'taiwan', 'light', root, 'normal', { syncConfig: false });
   const persona = readDialectFromIshiki('hanako', root);
   assert.ok(persona.includes('台湾'));
   assert.ok(persona.includes('超'));
+});
+
+// ── v0.28.0「焊死门」：apply/remove 默认联动配置+日志，杜绝配置与人格漂移 ──
+// 背景：曾出现手动 apply 写人格但配置停留在旧方言的漂移（人格生效、配置落后），
+// 根因是写人格文件存在绕过配置的旁路。现在默认联动，任何路径写人格都会同步配置。
+
+test('焊死门：applyDialectToIshiki 默认联动——写人格同时更新配置+日志（advanced 带 boost）', () => {
+  useTempConfig();
+  const root = makeTempAgentsRoot();
+  const res = applyDialectToIshiki('hanako', 'beijing', 'on', root, 'advanced');
+  assert.equal(res.ok, true);
+  const config = readDialectConfig();
+  assert.deepEqual(config.agents.hanako, { dialect: 'beijing', enabled: true, boost: true }, '配置应同步为北京话+加强版');
+  const logs = readDialectLog(10);
+  assert.equal(logs.length, 1, '应有 1 条保存日志');
+  assert.deepEqual(logs[0].changed, [{ agentId: 'hanako', from: '未配置', to: 'beijing' }]);
+});
+
+test('焊死门：同方言重复调用不新增日志，换方言记一条且 normal 不带 boost', () => {
+  useTempConfig();
+  const root = makeTempAgentsRoot();
+  applyDialectToIshiki('hanako', 'beijing', 'on', root, 'advanced');
+  applyDialectToIshiki('hanako', 'beijing', 'on', root, 'advanced'); // 无变化
+  assert.equal(readDialectLog(10).length, 1, '同方言重复写入不应新增日志');
+  applyDialectToIshiki('hanako', 'shanghai', 'on', root); // 换方言，默认 normal
+  const config = readDialectConfig();
+  assert.deepEqual(config.agents.hanako, { dialect: 'shanghai', enabled: true }, '切普通版应不带 boost');
+  const logs = readDialectLog(10);
+  assert.equal(logs.length, 2, '换方言应新增 1 条日志');
+  assert.deepEqual(logs[1].changed, [{ agentId: 'hanako', from: 'beijing', to: 'shanghai' }]);
+});
+
+test('焊死门：removeDialectFromIshiki 默认联动——移除人格同时从配置删除+记日志', () => {
+  useTempConfig();
+  const root = makeTempAgentsRoot();
+  applyDialectToIshiki('hanako', 'beijing', 'on', root, 'advanced');
+  const res = removeDialectFromIshiki('hanako', root);
+  assert.equal(res.ok, true);
+  assert.equal(res.removed, true);
+  const config = readDialectConfig();
+  assert.ok(!config.agents.hanako, '配置应移除该助手');
+  const logs = readDialectLog(10);
+  assert.equal(logs.length, 2, '关闭应新增 1 条日志');
+  assert.deepEqual(logs[1].changed, [{ agentId: 'hanako', from: 'beijing', to: '关闭' }]);
+  assert.equal(readDialectFromIshiki('hanako', root), '', '人格块应已移除');
+});
+
+test('焊死门：remove 无配置时不写配置不记日志，sync 内部路径不产生额外日志', () => {
+  useTempConfig();
+  const root = makeTempAgentsRoot();
+  const res = removeDialectFromIshiki('nobody', root);
+  assert.equal(res.ok, true);
+  assert.equal(readDialectLog(10).length, 0, '配置里没有该助手时不应记日志');
+
+  // sync 内部传 syncConfig:false：配置由调用方统一管，不应重复写日志
+  writeDialectConfig({ version: 3, agents: { hanako: { dialect: 'beijing', enabled: true, boost: true } } });
+  const syncRes = syncDialectToIshiki(readDialectConfig(), root);
+  assert.ok(syncRes.hanako && syncRes.hanako.ok, 'sync 应成功');
+  assert.equal(readDialectLog(10).length, 0, 'sync 内部不应写配置日志');
+  const persona = readDialectFromIshiki('hanako', root);
+  assert.ok(persona.includes('吃了吗您'), '加强版北京话文案应写入（回响/人格联动一致）');
 });
 
 test('syncDialectToIshiki：有配置写入、无配置移除（隔离目录，不碰真实人格文件）', () => {
@@ -305,10 +372,10 @@ test('关闭方言后 sync 应移除人格块（回归：POST 保存后缓存已
   assert.equal(readDialectFromIshiki('hanako', root), '', '人格文件里不应再有方言块');
   // 不传 previousConfig 的旧行为（读缓存）应保留：配置里本就没有的助手不会被误删别人的块
   const otherRoot = makeTempAgentsRoot();
-  const withAgent = { version: 2, agents: { yumi: { dialect: 'sichuan', enabled: true } } };
+  const withAgent = { version: 2, agents: { agentB: { dialect: 'sichuan', enabled: true } } };
   writeDialectConfig(withAgent);
   syncDialectToIshiki(withAgent, otherRoot, null);
-  assert.ok(readDialectFromIshiki('yumi', otherRoot).includes('四川'), '正常开启流程不受影响');
+  assert.ok(readDialectFromIshiki('agentB', otherRoot).includes('四川'), '正常开启流程不受影响');
 });
 
 test('已删除方言（闽南话）残留的人格块会被清理（回归：normalize 过滤后 remove 分支拿不到）', () => {
@@ -340,7 +407,7 @@ test('已删除方言（闽南话）残留的人格块会被清理（回归：no
 
 test('reconcileDialectToIshiki：配置有但文件缺块时补写，有块不动，无配置不碰', () => {
   const root = makeTempAgentsRoot();
-  // yumi：配置有，但文件里没有块 → 应补写
+  // agentB：配置有，但文件里没有块 → 应补写
   // hanako：配置有，文件已有块 → 不动
   const hanakoPath = path.join(root, 'agents', 'hanako', 'ishiki.md');
   fs.mkdirSync(path.dirname(hanakoPath), { recursive: true });
@@ -350,14 +417,14 @@ test('reconcileDialectToIshiki：配置有但文件缺块时补写，有块不�
     version: 2,
     agents: {
       hanako: { dialect: 'dongbei', enabled: true },
-      yumi: { dialect: 'taiwan', enabled: true },
+      agentB: { dialect: 'taiwan', enabled: true },
     },
   }, root);
 
-  assert.deepEqual(res.fixed, ['yumi'], '应只补写缺块的 yumi');
+  assert.deepEqual(res.fixed, ['agentB'], '应只补写缺块的 agentB');
   assert.deepEqual(res.failed, []);
-  // yumi 补写成功
-  assert.ok(readDialectFromIshiki('yumi', root).includes('台湾'));
+  // agentB 补写成功
+  assert.ok(readDialectFromIshiki('agentB', root).includes('台湾'));
   // hanako 内容未被改动（无重复块）
   const hanakoContent = fs.readFileSync(hanakoPath, 'utf-8');
   assert.equal(hanakoContent.split('biaoqingbao-dialect:start').length - 1, 1, 'hanako 不应被重复写块');
@@ -366,7 +433,7 @@ test('reconcileDialectToIshiki：配置有但文件缺块时补写，有块不�
     version: 2,
     agents: {
       hanako: { dialect: 'dongbei', enabled: true },
-      yumi: { dialect: 'taiwan', enabled: true },
+      agentB: { dialect: 'taiwan', enabled: true },
     },
   }, root);
   assert.deepEqual(res2.fixed, [], '第二次应无补写');
@@ -376,11 +443,11 @@ test('方言保存日志：写入读取往返，保留最近 200 条', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-dialect-log-'));
   const file = path.join(dir, 'dialect-log.json');
   appendDialectLog({ changed: [{ agentId: 'hanako', from: 'dongbei', to: 'henan' }], config: { version: 2 } }, file);
-  appendDialectLog({ changed: [{ agentId: 'yumi', from: '未配置', to: 'taiwan' }], config: { version: 2 } }, file);
+  appendDialectLog({ changed: [{ agentId: 'agentB', from: '未配置', to: 'taiwan' }], config: { version: 2 } }, file);
   const logs = readDialectLog(20, file);
   assert.equal(logs.length, 2);
   assert.ok(logs[0].ts, '应记录时间');
-  assert.deepEqual(logs[1].changed[0], { agentId: 'yumi', from: '未配置', to: 'taiwan' });
+  assert.deepEqual(logs[1].changed[0], { agentId: 'agentB', from: '未配置', to: 'taiwan' });
   try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
 });
 
@@ -433,6 +500,7 @@ test('加强版文案：四川话存在、身份化、零指令词、含语气�
 
 test('加强版文案：全部方言都有 personaAdvanced，通用硬性约束通过', () => {
   for (const d of DIALECT_LIST) {
+    if (d.id === 'userstyle') continue; // v0.30.0：用户名话是动态模板方言，无固定文案
     const advanced = buildDialectPersona(d.id, 'on', 'advanced');
     const normal = buildDialectPersona(d.id, 'on');
     assert.ok(d.personaAdvanced, `${d.id} 应有 personaAdvanced`);
@@ -463,7 +531,8 @@ test('加强版二轮增量：各方言语序/音调/情绪特征抽查（2026-0
     cantonese: ['俾本书我', '你去唔去先', '好mean'],
     taiwan: ['有在看', '穿看看', '不错吃'],
     shaanxi: ['克里马擦', '日塌啦'],
-    beijing: ['得嘞您呐', '不儿道'],
+    // v0.28.0：北京话加强版新增「您」后置、呢还倒装、口头禅；v0.28.1 对照式写法（普通话→北京话）
+    beijing: ['得嘞您呐', '不儿道', '吃了吗您', '还没吃呢还', '可说呢', '歇着吧您内', '普通话问'],
     xinjiang: ['给给我', '外江'],
   };
   for (const [id, words] of Object.entries(checks)) {
@@ -516,10 +585,10 @@ test('配置归一化：boost 开关保留，旧 mode=advanced 迁移为 boost�
 
 test('applyDialectToIshiki：mode=advanced 写入加强版文案，切回 normal 写普通文案', () => {
   const root = makeTempAgentsRoot();
-  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'advanced');
+  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'advanced', { syncConfig: false });
   const persona = readDialectFromIshiki('hanako', root);
   assert.ok(persona.includes('情绪的开关'), '加强版应写入加强文案');
-  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'normal');
+  applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'normal', { syncConfig: false });
   const persona2 = readDialectFromIshiki('hanako', root);
   assert.ok(persona2.includes('说话本能') && !persona2.includes('情绪的开关'), '切回普通版应写普通文案');
 });
@@ -555,8 +624,9 @@ test('buildDialectEcho：身份化锚点句 + 加强例句池随机示范（50% 
   assert.equal(buildDialectEcho('nope', 0.3), '', '无效方言应返回空串');
 });
 
-test('加强版回响例句池：九种方言齐全、句式级短句、零指令词', () => {
+test('加强版回响例句池：九种地方话齐全、句式级短句、零指令词（用户名话无回响）', () => {
   for (const d of DIALECT_LIST) {
+    if (d.id === 'userstyle') continue; // v0.30.0：用户名话不额外回响
     const pool = BOOST_EXAMPLES[d.id];
     assert.ok(pool && pool.length >= 3, `${d.id} 应至少有 3 句加强回响例句`);
     for (const ex of pool) {
@@ -566,6 +636,7 @@ test('加强版回响例句池：九种方言齐全、句式级短句、零指�
       }
     }
   }
+  assert.equal(buildDialectEcho('userstyle', 0.1), '', '用户名话不应有回响');
 });
 
 test('isWorkTalk：技术/工作关键词命中正事，闲聊放行', () => {
@@ -599,4 +670,125 @@ test('shouldBoostRound：前 8 条消息必注入，之后按 60% 概率衰减',
   assert.equal(shouldBoostRound(9, 0.9), false, 'warmup 后 random>=0.6 跳过');
   assert.equal(shouldBoostRound(-1), false, '非法长度不注入');
   assert.equal(shouldBoostRound(NaN), false, 'NaN 长度不注入');
+});
+
+// ────────────────────────────────────────────────
+//  v0.29.0 路径穿越防护（P0）
+//  第一道：normalizeConfig 白名单过滤；第二道：agentIshikiPath resolve 前缀兜底
+//  背景：agentId 直接拼进 <agentsRoot>/agents/<agentId>/ishiki.md，
+//  以前只排除 __proto__ 等，../../ 能逃出 agents 目录并递归建目录写文件
+// ────────────────────────────────────────────────
+
+const ESCAPE_AGENT_IDS = [
+  '../evil',
+  '..\\evil',
+  '.. ',
+  '..',
+  '.',
+  'a/../../b',
+  'C:\\x',
+  '/abs',
+  '\\\\.\\pipe\\x',
+  '',
+];
+
+const VALID_AGENT_IDS = [
+  'hanako',
+  'xiaoshenghuo-model-test-agent',
+  'A_1-Z',
+];
+
+function tmpEscapeRoot() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-escape-'));
+}
+
+function assertNoEscapeArtifacts(root) {
+  const parent = path.resolve(root, '..');
+  const evilDir = path.join(parent, 'evil');
+  assert.ok(!fs.existsSync(evilDir), 'agents 目录外不应产生目录');
+  assert.ok(!fs.existsSync(path.join(root, 'ishiki.md')), 'agents 目录外不应有 ishiki.md');
+}
+
+// 第一道：normalizeConfig 白名单（经 writeDialectConfig 保存→读回验证）
+test('路径穿越防护：非法 agentId 被过滤，合法 ID 保留，原型污染排除仍生效', () => {
+  useTempConfig();
+  const agents = {};
+  for (const id of ESCAPE_AGENT_IDS) agents[id] = { dialect: 'sichuan', enabled: true };
+  agents['__proto__'] = { dialect: 'sichuan', enabled: true };
+  for (const id of VALID_AGENT_IDS) agents[id] = { dialect: 'sichuan', enabled: true };
+
+  const saved = writeDialectConfig({ version: 3, agents });
+  const ids = Object.keys(saved.agents);
+  for (const id of ESCAPE_AGENT_IDS) {
+    assert.ok(!ids.includes(id), `非法 agentId ${JSON.stringify(id)} 应被过滤`);
+  }
+  assert.ok(!ids.includes('__proto__'), '原型污染键仍应被排除');
+  for (const id of VALID_AGENT_IDS) {
+    assert.ok(ids.includes(id), `合法 agentId ${id} 应保留`);
+  }
+});
+
+// 第二道：agentIshikiPath 直接对越界 ID 抛错（防绕过 normalizeConfig 的直调）
+test('路径穿越防护：agentIshikiPath 对越界 agentId 抛错，合法 ID 落在 agents 目录内', () => {
+  const root = tmpEscapeRoot();
+  try {
+    for (const bad of ESCAPE_AGENT_IDS) {
+      assert.throws(() => agentIshikiPath(bad, root), /非法助手ID/, `agentId=${JSON.stringify(bad)} 应被拦下`);
+    }
+    const okPath = agentIshikiPath('hanako', root);
+    assert.ok(okPath.startsWith(path.join(path.resolve(root), 'agents') + path.sep), '合法 ID 应解析在 agents 目录内');
+    assert.ok(okPath.endsWith('ishiki.md'), '文件名应保持 ishiki.md');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 全链路：apply 直调越界 ID 返回结构化失败且不落盘
+test('路径穿越防护：applyDialectToIshiki 对越界 agentId 返回 ok:false 且不写文件', () => {
+  const root = tmpEscapeRoot();
+  try {
+    const res = applyDialectToIshiki('../evil', 'sichuan', 'on', root, 'normal', { syncConfig: false });
+    assert.equal(res.ok, false, '越界 agentId 应返回失败');
+    assert.ok(res.error.includes('非法助手ID'), `错误信息应说明原因，实际: ${res.error}`);
+    assertNoEscapeArtifacts(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 全链路：remove 直调越界 ID 同样安全
+test('路径穿越防护：removeDialectFromIshiki 对越界 agentId 返回 ok:false 且不碰外部文件', () => {
+  const root = tmpEscapeRoot();
+  try {
+    const res = removeDialectFromIshiki('../../evil', root, { syncConfig: false });
+    assert.equal(res.ok, false, '越界 agentId 应返回失败');
+    assertNoEscapeArtifacts(root);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 全链路：sync 恶意配置不逃逸、不炸，合法 ID 正常写入
+test('路径穿越防护：syncDialectToIshiki 对恶意配置不逃逸，合法 ID 正常写入', () => {
+  useTempConfig();
+  const root = tmpEscapeRoot();
+  try {
+    const results = syncDialectToIshiki(
+      {
+        version: 3,
+        agents: {
+          '../evil': { dialect: 'sichuan', enabled: true },
+          '..\\evil': { dialect: 'sichuan', enabled: true },
+          'hanako': { dialect: 'sichuan', enabled: true },
+        },
+      },
+      root,
+    );
+    assert.ok(!('..' in results) && !results['../evil'] && !results['..\\evil'], '恶意 agentId 不应出现在同步结果里');
+    assert.ok(results['hanako'] && results['hanako'].ok === true, '合法 agentId 应正常写入');
+    assertNoEscapeArtifacts(root);
+    assert.ok(fs.existsSync(path.join(root, 'agents', 'hanako', 'ishiki.md')), '合法 ID 应写入 agents 目录内');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });

@@ -107,6 +107,17 @@ export async function onload(ctx = {}) {
     ctx.log?.warn?.('[biaoqingbao] 恢复批量任务失败:', e.message);
   }
 
+  // v0.30.0 — 用户名话：遗留的 running 总结任务标记失败（避免卡住新任务）
+  try {
+    const { recoverStyleTasks } = await import('./lib/style-template.js');
+    const recovered = recoverStyleTasks();
+    if (recovered > 0) {
+      ctx.log?.info?.(`[biaoqingbao] ${recovered} 个风格总结任务因重启中断已标记失败`);
+    }
+  } catch (e) {
+    ctx.log?.warn?.('[biaoqingbao] 恢复风格总结任务失败:', e.message);
+  }
+
   ctx.log?.info?.('[biaoqingbao] onload 完成');
 }
 
