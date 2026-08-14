@@ -1,4 +1,4 @@
-// 表情包插件 - API 路由
+﻿// 表情包插件 - API 路由
 // 提供：列表 / 图片 / 上传 / 修改 / 删除 / 识图自动打标 / 模型配置
 // v0.17.4-share: 公共函数统一从 lib/shared.js 导入，消除代码重复
 import fs from 'node:fs';
@@ -19,7 +19,7 @@ import {
   readTextConfig, writeTextConfig,
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
   json, atomicWriteJson,
-  readUserName, userstyleDisplayName,
+  readUserName,
 } from '../lib/shared.js';
 import { upsertTeachingSample, removeTeachingSample } from '../lib/teaching.js';
 import {
@@ -30,7 +30,7 @@ import {
 } from '../lib/dialect.js';
 import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
-// v0.30.0 - 用户名话：风格模板 + 总结任务
+// v0.30.0 - 学我说话：风格模板 + 总结任务
 import {
   STYLE_LEVELS, STYLE_LEVEL_IDS,
   readStyleTemplate, writeStyleTemplate, confirmStyleDraft, revertStyleTemplate, clearStyleTemplate,
@@ -38,7 +38,7 @@ import {
   readStyleTasks, getStyleTask, createStyleTask, updateStyleTask, runStyleTask,
 } from '../lib/style-template.js';
 
-// v0.30.1 - readUserName / userstyleDisplayName 已移到 lib/shared.js 共用
+// v0.30.1 - readUserName 已移到 lib/shared.js 共用；v0.30.10 移除 userstyleDisplayName（展示名固定「学我说话」）
 function nextStickerId(meta) {
   let max = 0;
   for (const sticker of meta) {
@@ -1723,13 +1723,11 @@ export default async function registerRoutes(app, ctx) {
         userName,
         dialects: DIALECT_LIST.map(d => ({
           id: d.id,
-          // v0.30.1：用户名话展示名动态拼用户名（如「XX话」），读不到用户名兜底「我的风格」
-          name: d.dynamicName ? userstyleDisplayName(userName) : d.name,
+          name: d.name,
           tagline: d.tagline,
           difficulty: d.difficulty,
           difficultyNote: d.difficultyNote,
           hasAdvanced: Boolean(d.personaAdvanced),
-          dynamicName: Boolean(d.dynamicName),
         })),
       },
     });
@@ -2019,7 +2017,7 @@ export default async function registerRoutes(app, ctx) {
   }
 
   // ════════════════════════════════════════════════════════════════
-  //  v0.30.0 用户名话（userstyle）· 风格模板 + 总结任务
+  //  v0.30.0 学我说话（userstyle）· 风格模板 + 总结任务
   // ════════════════════════════════════════════════════════════════
 
   // ── GET /api/style-template - 读取当前模板 + 历史版本 + 最近任务 + 助手列表（供设置区展示）──
@@ -2137,7 +2135,7 @@ export default async function registerRoutes(app, ctx) {
       const level = String(body.level || '');
       const res = confirmStyleDraft(draft, { sourceAgent, level });
       if (!res.ok) return json({ ok: false, error: res.error }, 400);
-      // v0.31.0：模板更新后自动同步到已开启「用户名话」的助手 ishiki.md，
+      // v0.31.0：模板更新后自动同步到已开启「学我说话」的助手 ishiki.md，
       // 否则重启后 Hana 组装系统提示词读到的还是旧模板（回归：保存不生效）
       const sync = syncUserstyleToIshiki();
       // 关联任务标记已确认（历史记录用）

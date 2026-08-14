@@ -35,12 +35,12 @@ test.after(() => {
   }
 });
 
-test('方言库完整性：10 种方言齐全（9 种地方话 + 用户名话），字段非空，难度标注仅新疆话保留', () => {
+test('方言库完整性：10 种方言齐全（9 种地方话 + 学我说话），字段非空，难度标注仅新疆话保留', () => {
   assert.equal(DIALECT_LIST.length, 10);
-  assert.ok(getDialect('userstyle'), '应包含 userstyle（用户名话）');
+  assert.ok(getDialect('userstyle'), '应包含 userstyle（学我说话）');
   const ids = new Set(DIALECT_LIST.map(d => d.id));
   for (const d of DIALECT_LIST) {
-    // v0.30.0：用户名话是动态模板方言，不走固定字段断言（无 markers/particles/examples）
+    // v0.30.0：学我说话是动态模板方言，不走固定字段断言（无 markers/particles/examples）
     if (d.id === 'userstyle') continue;
     assert.ok(d.name, `${d.id} 缺 name`);
     assert.ok(d.people, `${d.id} 缺 people`);
@@ -500,7 +500,7 @@ test('加强版文案：四川话存在、身份化、零指令词、含语气�
 
 test('加强版文案：全部方言都有 personaAdvanced，通用硬性约束通过', () => {
   for (const d of DIALECT_LIST) {
-    if (d.id === 'userstyle') continue; // v0.30.0：用户名话是动态模板方言，无固定文案
+    if (d.id === 'userstyle') continue; // v0.30.0：学我说话是动态模板方言，无固定文案
     const advanced = buildDialectPersona(d.id, 'on', 'advanced');
     const normal = buildDialectPersona(d.id, 'on');
     assert.ok(d.personaAdvanced, `${d.id} 应有 personaAdvanced`);
@@ -624,9 +624,9 @@ test('buildDialectEcho：身份化锚点句 + 加强例句池随机示范（50% 
   assert.equal(buildDialectEcho('nope', 0.3), '', '无效方言应返回空串');
 });
 
-test('加强版回响例句池：九种地方话齐全、句式级短句、零指令词（用户名话无回响）', () => {
+test('加强版回响例句池：九种地方话齐全、句式级短句、零指令词（学我说话无回响）', () => {
   for (const d of DIALECT_LIST) {
-    if (d.id === 'userstyle') continue; // v0.30.0：用户名话不额外回响
+    if (d.id === 'userstyle') continue; // v0.30.0：学我说话不额外回响
     const pool = BOOST_EXAMPLES[d.id];
     assert.ok(pool && pool.length >= 3, `${d.id} 应至少有 3 句加强回响例句`);
     for (const ex of pool) {
@@ -636,7 +636,7 @@ test('加强版回响例句池：九种地方话齐全、句式级短句、零�
       }
     }
   }
-  assert.equal(buildDialectEcho('userstyle', 0.1), '', '用户名话不应有回响');
+  assert.equal(buildDialectEcho('userstyle', 0.1), '', '学我说话不应有回响');
 });
 
 test('isWorkTalk：技术/工作关键词命中正事，闲聊放行', () => {

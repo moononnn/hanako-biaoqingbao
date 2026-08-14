@@ -1,4 +1,4 @@
-// 表情包插件 - 管理页面渲染（仅 GET /page）
+﻿// 表情包插件 - 管理页面渲染（仅 GET /page）
 // v0.15.0 - UI 改版：三视图架构 + 薄荷绿/樱花粉配色
 // v0.17.4-share: 公共函数从 lib/shared.js 导入
 import fs from 'node:fs';
@@ -10,7 +10,6 @@ import {
   readVisionConfig, getAvailableVisionModels, getAvailableTextModels,
   readTextConfig, readEmbeddingConfig, getAvailableEmbeddingModels,
   escapeHtml,
-  readUserName, userstyleDisplayName,
 } from '../lib/shared.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,10 +30,9 @@ function renderPage() {
   const textModels = getAvailableTextModels();
   const embeddingConfig = readEmbeddingConfig();
   const embeddingModels = getAvailableEmbeddingModels();
-  // v0.30.1：用户名话展示名服务端动态拼（入口按钮/标题不再写死「用户名话」）
-  const userName = readUserName();
-  const userstyleName = userstyleDisplayName(userName);
-  // v0.31.0：用户名话总结前置依赖「内容分析模型」——未配置时页面顶部直接给引导条
+  // v0.30.1：学我说话展示名固定（入口按钮/标题统一叫「学我说话」）
+  const userstyleName = '学我说话';
+  // v0.31.0：学我说话总结前置依赖「内容分析模型」——未配置时页面顶部直接给引导条
   const textReady = !!(textConfig.enabled && (
     (textConfig.source === 'custom' && textConfig.customBaseUrl && textConfig.customModel && textConfig.customApiKey) ||
     (textConfig.source !== 'custom' && textConfig.providerId && textConfig.modelId)
@@ -645,7 +643,7 @@ function renderPage() {
     + '</div>'
     + '<div class="pref-section">'
     + '<div class="dialect-desc">给每位助手挑个方言就行：挑上即开，选「(不选)」即关。\n开启后会在 ta 的意识栏注入一段方言设定（关闭时自动移除），打字自然带家乡味。\n所有方言都支持「方言加浓」开关：打开后浓度更高，每轮对话都有方言回响，聊到正事时自动让路；四川话另有精修文案，效果最浓。\n方言加浓的回响部分保存后即时生效，人格文件部分要<strong>重启 Hana</strong>才完整生效；重启后建议新开一个对话框聊天，方言味最正。</div>'
-    + '<div class="userstyle-entry" style="margin:0 0 12px"><button type="button" class="btn btn-primary" id="goto-userstyle-btn" data-goto="userstyle">我的「' + userstyleName + '」：让 ta 学你的说话方式 →</button></div>'
+    + '<div class="userstyle-entry" style="margin:0 0 12px"><button type="button" class="btn btn-primary" id="goto-userstyle-btn" data-goto="userstyle">「' + userstyleName + '」：让 ta 学你的说话方式 →</button></div>'
     + '<div id="dialect-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px">加载中...</div>'
     + '<div class="dialect-save-bar"><span class="dialect-save-status" id="dialect-save-status">已保存</span>'
     + '<button class="btn btn-primary" id="save-dialect-btn" disabled>保存设置</button></div>'
@@ -653,7 +651,7 @@ function renderPage() {
     + '</div>'
 
     // ═══════════════════════════════════
-    //  视图 6：用户名话（v0.30.0 自定义方言模板）
+    //  视图 6：学我说话（v0.30.0 自定义方言模板）
     // ═══════════════════════════════════
     + '<div class="view hidden" id="view-userstyle">'
     + '<div class="sub-header">'
@@ -697,7 +695,7 @@ function renderPage() {
     + '<button type="button" class="btn btn-primary" id="userstyle-confirm-btn">保存模板</button>'
     + '<button type="button" class="btn" id="userstyle-shorten-btn" hidden>自动精简</button>'
     + '</div>'
-    + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px">保存后到「方言口音」页，给助手选上「<span id="userstyle-save-hint-name">用户名话</span>」就生效了</div>'
+    + '<div style="font-size:12px;color:var(--text-muted);margin-top:6px">保存后到「方言口音」页，给助手选上「<span id="userstyle-save-hint-name">学我说话</span>」就生效了</div>'
     + '</div>'
     + '<div class="form-group" id="userstyle-current-wrap" hidden>'
     + '<label style="display:block;margin-bottom:6px">当前模板（已生效）</label>'

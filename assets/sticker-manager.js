@@ -1,4 +1,4 @@
-// 表情包页面 - 前端交互 v0.15.0
+﻿// 表情包页面 - 前端交互 v0.15.0
 // 三视图架构：首页 / 表情包库 / 偏好设置
 // 薄荷绿主色 + 樱花粉辅色
 (function () {
@@ -2270,8 +2270,8 @@
       if (dialectMetaData.dialects[i].id === dialectId) { d = dialectMetaData.dialects[i]; break; }
     }
     if (!d) return '';
-    // v0.30.0：用户名话预览特殊文案（提示模板状态）
-    if (d.dynamicName) {
+    // v0.30.0：学我说话预览特殊文案（提示模板状态）
+    if (d.id === 'userstyle') {
       return '开启后 ta 打字会自然带点你的味道，正事闲聊都这样 · 像 ta 一样说话';
     }
     var note = d.difficultyNote ? '（模型表现：' + d.difficultyNote + '）' : '';
@@ -2300,7 +2300,7 @@
     // 开启后 = 动态回响（每轮注入短提示，正事自动让路）+ 有精修文案的方言写加强人格
     var boostOn = !!settings.boost;
     var isUserstyle = settings.dialect === 'userstyle';
-    // v0.30.0：用户名话不走回响层，不显示「方言加浓」开关（模板本身就是用户风格）
+    // v0.30.0：学我说话不走回响层，不显示「方言加浓」开关（模板本身就是用户风格）
     if (!isUserstyle) {
       // v0.26.0 token 提示：只在开启后显示，放开关左边，让两个按钮挨着
       if (boostOn) html += '<span class="dialect-boost-tip">开加浓每轮多费一点 token</span>';
@@ -2408,7 +2408,7 @@
         var agentId = picker2.getAttribute('data-agent-id');
         if (!agentId) return;
         var newValue = pickBtn.getAttribute('data-value') || '';
-        // v0.30.0：选「用户名话」但模板还没总结时，引导先去设置（不直接选上）
+        // v0.30.0：选「学我说话」但模板还没总结时，引导先去设置（不直接选上）
         if (newValue === 'userstyle' && !userstyleHasTemplate()) {
           closeAllDialectMenus();
           toast('「' + dialectName('userstyle') + '」还没模板：先去「' + userstyleName() + '」设置里总结一次吧', true);
@@ -2488,7 +2488,7 @@
   }
 
   // ═══════════════════════════════════
-  //  v0.30.0 用户名话（userstyle）· 风格模板设置
+  //  v0.30.0 学我说话（userstyle）· 风格模板设置
   // ═══════════════════════════════════
   var userstyleData = null;          // { template, levels, tasks }
   var userstylePollTimer = null;
@@ -2499,13 +2499,9 @@
     return !!(userstyleData && userstyleData.template && userstyleData.template.current);
   }
 
-  // 用户名（方言展示名用）
-  function userstyleUserName() {
-    return (dialectMetaData && dialectMetaData.userName) || (userstyleData && userstyleData.userName) || '';
-  }
+  // 学我说话：固定展示名
   function userstyleName() {
-    var n = userstyleUserName();
-    return n ? n + '话' : '我的风格';
+    return '学我说话';
   }
 
   function renderUserstyle() {
@@ -2699,7 +2695,7 @@
     }).then(function (r) { return r.json(); })
       .then(function (result) {
         if (!result.ok) throw new Error(result.error || '保存失败');
-        // v0.31.0：保存后已自动同步到开了「用户名话」的助手 ishiki.md
+        // v0.31.0：保存后已自动同步到开了「学我说话」的助手 ishiki.md
         var synced = (result.sync && result.sync.synced) || [];
         if (synced.length > 0) {
           toast('模板已保存！已自动同步给 ' + synced.length + ' 个开了「' + userstyleName() + '」的助手，重启 Hana 后生效');
@@ -3587,7 +3583,7 @@
       });
     });
 
-    // 导航：方言页 → 用户名话
+    // 导航：方言页 → 学我说话
     var gotoUserstyleBtn = document.getElementById('goto-userstyle-btn');
     if (gotoUserstyleBtn) {
       gotoUserstyleBtn.addEventListener('click', function () {

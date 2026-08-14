@@ -1,4 +1,4 @@
-// 表情包插件 v0.5.0 — Plugin Entry (lifecycle)
+﻿// 表情包插件 v0.5.0 — Plugin Entry (lifecycle)
 // 负责 plugin 激活时的初始化工作
 //
 // 关键：只导出 onload/onunload, 不要 default export,
@@ -107,7 +107,7 @@ export async function onload(ctx = {}) {
     ctx.log?.warn?.('[biaoqingbao] 恢复批量任务失败:', e.message);
   }
 
-  // v0.30.0 — 用户名话：遗留的 running 总结任务标记失败（避免卡住新任务）
+  // v0.30.0 — 学我说话：遗留的 running 总结任务标记失败（避免卡住新任务）
   try {
     const { recoverStyleTasks } = await import('./lib/style-template.js');
     const recovered = recoverStyleTasks();

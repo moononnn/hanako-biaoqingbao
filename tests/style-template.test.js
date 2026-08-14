@@ -1,4 +1,4 @@
-﻿// tests/style-template.test.js - 用户名话：模板管理 + 采样 + 任务状态机
+﻿// tests/style-template.test.js - 学我说话：模板管理 + 采样 + 任务状态机
 // 覆盖：分层采样、自然语言过滤、模板确认/回退/清空、任务并发与状态迁移
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -408,7 +408,7 @@ test('recoverStyleTasks：重启后 running 任务标记失败，不卡新任务
   assert.equal(recoverStyleTasks(), 1);
 });
 
-// ── 用户名话模板同步到 ishiki.md（v0.31.0 回归：保存新模板后重启仍用旧模板）──
+// ── 学我说话模板同步到 ishiki.md（v0.31.0 回归：保存新模板后重启仍用旧模板）──
 // 隔离 dialect-config 路径，避免污染真实配置
 function useTempDialectConfig() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-dialect-test-'));
