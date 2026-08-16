@@ -55,7 +55,7 @@ test('collectUserMessages：只收 user 消息、跳过坏行、过滤非自然�
     '今天天气真好呀，晚上吃啥？',
     '这个方案我觉得不错',
     '```js\nconst x = 1;\n```',
-    'C:\\Users\\laotv\\test\\file.txt 看一下',
+    'C:\\Users\\demo\\test\\file.txt 看一下',
     '哈哈哈哈笑死我了',
     '帮我看看这个代码 bug',
     'https://github.com/moononnn/hanako-biaoqingbao/releases/tag/v0.29.0 这个版本更新了啥',

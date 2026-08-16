@@ -12,7 +12,7 @@ import {
   applyDialectToIshiki, removeDialectFromIshiki, readDialectFromIshiki,
   syncDialectToIshiki, reconcileDialectToIshiki,
   appendDialectLog, readDialectLog,
-  agentIshikiPath,
+  agentIshikiPath, agentPersonaFilePath,
   _resetDialectCache,
 } from '../lib/dialect.js';
 
@@ -260,6 +260,67 @@ test('removeDialectFromIshiki：移除块且保留其他内容', () => {
   const content = fs.readFileSync(filePath, 'utf-8');
   assert.ok(!content.includes('biaoqingbao-dialect'), '方言块应被移除');
   assert.ok(content.includes('# 人格定义'), '原有内容应保留');
+});
+
+// ── v0.31.3 AGENTS.md 新结构（Hana agents 迁移后人格文件改名）──
+// 回归：保存方言写入 ishiki.md，但 Hana 实际读 AGENTS.md → 重启后不生效
+
+test('agentPersonaFilePath：AGENTS.md 存在（新结构）优先，否则退回 ishiki.md（旧结构）', () => {
+  const root = makeTempAgentsRoot();
+  const dir = path.join(root, 'agents', 'hanako');
+  fs.mkdirSync(dir, { recursive: true });
+  // 旧结构：无 AGENTS.md → ishiki.md
+  assert.equal(agentPersonaFilePath('hanako', root), path.join(dir, 'ishiki.md'));
+  // 新结构：有 AGENTS.md → AGENTS.md
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), '# 人格定义\n', 'utf-8');
+  assert.equal(agentPersonaFilePath('hanako', root), path.join(dir, 'AGENTS.md'));
+});
+
+test('applyDialectToIshiki：新结构（AGENTS.md 存在）写入 AGENTS.md 而不是 ishiki.md', () => {
+  const root = makeTempAgentsRoot();
+  const dir = path.join(root, 'agents', 'hanako');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'), '# 人格定义\n\n- 你是一个有温度的存在\n', 'utf-8');
+
+  const res = applyDialectToIshiki('hanako', 'sichuan', 'on', root, 'advanced', { syncConfig: false });
+  assert.equal(res.ok, true);
+  const agentsContent = fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf-8');
+  assert.ok(agentsContent.includes('<!-- biaoqingbao-dialect:start -->'), '方言块应写入 AGENTS.md');
+  assert.ok(agentsContent.includes('土生土长的四川人'), '应为四川话加强版文案');
+  assert.ok(agentsContent.startsWith('# 人格定义'), 'AGENTS.md 原有内容应保留');
+  assert.ok(!fs.existsSync(path.join(dir, 'ishiki.md')), '新结构下不应再创建 ishiki.md');
+});
+
+test('read/removeDialectFromIshiki：新结构读写删除都走 AGENTS.md', () => {
+  const root = makeTempAgentsRoot();
+  const dir = path.join(root, 'agents', 'hanako');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'),
+    '# 人格定义\n\n<!-- biaoqingbao-dialect:start -->\n你是土生土长的四川人\n<!-- biaoqingbao-dialect:end -->\n', 'utf-8');
+
+  assert.ok(readDialectFromIshiki('hanako', root).includes('四川人'), '读取应命中 AGENTS.md 里的块');
+  const res = removeDialectFromIshiki('hanako', root, { syncConfig: false });
+  assert.equal(res.removed, true);
+  const content = fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf-8');
+  assert.ok(!content.includes('biaoqingbao-dialect'), 'AGENTS.md 方言块应被移除');
+  assert.ok(content.includes('# 人格定义'), 'AGENTS.md 原有内容应保留');
+});
+
+test('syncDialectToIshiki：新结构下换方言能覆盖 AGENTS.md 里的旧块（回归：学我说话残留）', () => {
+  const root = makeTempAgentsRoot();
+  const dir = path.join(root, 'agents', 'hanako');
+  fs.mkdirSync(dir, { recursive: true });
+  // 模拟真实事故现场：AGENTS.md 里是旧 userstyle 块，配置已切到 sichuan
+  fs.writeFileSync(path.join(dir, 'AGENTS.md'),
+    '# 人格定义\n\n<!-- biaoqingbao-dialect:start -->\n你是一个说话带着明显口语习惯的人，像 ta 一样说话\n<!-- biaoqingbao-dialect:end -->\n', 'utf-8');
+  const oldConfig = { version: 3, agents: { hanako: { dialect: 'userstyle', enabled: true, boost: true } } };
+  const newConfig = { version: 3, agents: { hanako: { dialect: 'sichuan', enabled: true, boost: true } } };
+
+  const results = syncDialectToIshiki(newConfig, root, oldConfig);
+  assert.ok(results.hanako && results.hanako.ok, '同步应成功');
+  const content = fs.readFileSync(path.join(dir, 'AGENTS.md'), 'utf-8');
+  assert.ok(!content.includes('学我说话'), '旧 userstyle 块应被覆盖');
+  assert.ok(content.includes('土生土长的四川人'), '应写入四川话新块');
 });
 
 test('removeDialectFromIshiki：无块时返回 removed=false，不报错', () => {
