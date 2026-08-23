@@ -1,6 +1,6 @@
 {
     "name":  "hana-biaoqingbao-plugin",
-    "version":  "0.33.50",
+    "version":  "0.33.51",
     "private":  true,
     "type":  "module",
     "scripts":  {
