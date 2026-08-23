@@ -1,9 +1,0 @@
-{
-  "enabled": false,
-  "source": "hana",
-  "providerId": "",
-  "modelId": "",
-  "customBaseUrl": "",
-  "customApiKey": "",
-  "customModel": ""
-}

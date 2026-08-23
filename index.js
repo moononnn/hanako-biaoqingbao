@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { resumeBatchTasks } from './routes/_batch-tasks.js';
 import { ensureDataDir } from './lib/shared.js';
+import { stopBall } from './lib/ball.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const HANA_HOME = process.env.HANA_HOME || join(homedir(), '.hanako');
@@ -123,6 +124,11 @@ export async function onload(ctx = {}) {
 
 export async function onunload(ctx = {}) {
   ctx.log?.info?.('[biaoqingbao] onunload 触发');
+  try {
+    await stopBall();
+  } catch (error) {
+    ctx.log?.warn?.('[biaoqingbao] 悬浮球停止失败:', error?.message || error);
+  }
 }
 
 // 注意：observer.js 现在使用 Pi SDK Extension API（pi.on() 事件订阅）

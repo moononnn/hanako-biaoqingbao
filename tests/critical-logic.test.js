@@ -1,12 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 
 import {
   getConditionalScenePercent,
   passesFrequency,
 } from '../extensions/observer.js';
 import { recoverInterruptedItems } from '../routes/_batch-tasks.js';
-import { scoreStickers, applyVectorBonus } from '../tools/express.js';
+import {
+  scoreStickers,
+  applyVectorBonus,
+  buildStickerCard,
+  buildStickerMediaDetails,
+  buildStickerDeliveryDetails,
+  supportsNativeMediaDetails,
+  trySendDeferredImage,
+} from '../tools/express.js';
 import { collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT } from '../lib/shared.js';
 import { KNOWN_CONFUSABLES, buildConfusableSection } from '../lib/known-confusables.js';
 
@@ -17,6 +26,116 @@ function seededRandom(seed = 1) {
     return state / 0x100000000;
   };
 }
+
+test('deferred 原生图片块：成功时注册为 ui-only image task 并返回 taskId', async () => {
+  const calls = [];
+  const ctx = {
+    sessionId: 'sess_test_1',
+    sessionPath: 'C:/sessions/test.jsonl',
+    log: { debug() {}, warn() {} },
+    bus: {
+      async request(type, payload) {
+        calls.push({ type, payload });
+        return { ok: true };
+      },
+    },
+  };
+  const staged = {
+    file: { fileId: 'sf_1', filePath: 'C:/stickers/a.jpg', kind: 'image', mime: 'image/jpeg', storageKind: 'plugin_data', status: 'available' },
+    mediaItem: { type: 'session_file', fileId: 'sf_1', filePath: 'C:/stickers/a.jpg', kind: 'image' },
+  };
+  const result = await trySendDeferredImage(ctx, staged);
+  assert.equal(result.ok, true);
+  assert.match(result.taskId, /^bqbq-/);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].type, 'deferred:register');
+  assert.equal(calls[0].payload.taskId, calls[1].payload.taskId);
+  assert.equal(calls[0].payload.taskId, result.taskId);
+  assert.equal(calls[0].payload.sessionPath, 'C:/sessions/test.jsonl');
+  assert.equal(calls[0].payload.meta.type, 'image-generation');
+  assert.equal(calls[0].payload.meta.mediaKind, 'image');
+  assert.equal(calls[0].payload.meta.toolName, 'biaoqingbao');
+  assert.equal(calls[0].payload.meta.deliveryIntent, 'ui_only');
+  assert.equal(calls[0].payload.meta.triggerParentTurn, false);
+  assert.equal(calls[1].type, 'deferred:resolve');
+  assert.deepEqual(calls[1].payload.result.sessionFiles, [staged.file]);
+});
+
+test('deferred 原生图片块：bus 请求失败时返回 false 供降级', async () => {
+  const ctx = {
+    sessionPath: 'C:/sessions/test.jsonl',
+    log: { debug() {}, warn() {} },
+    bus: {
+      async request() {
+        throw new Error('no handler');
+      },
+    },
+  };
+  const staged = { file: { filePath: 'C:/stickers/a.jpg' } };
+  assert.equal((await trySendDeferredImage(ctx, staged)).ok, false);
+});
+
+test('deferred 原生图片块：register/resolve 返回错误对象也降级（不误判假成功）', async () => {
+  const staged = { file: { filePath: 'C:/stickers/a.jpg' } };
+  // register 返回 { ok: false }（旧宿主可能不抛错而返回错误对象）→ 必须降级
+  let registerCalled = 0;
+  const ctxRegisterFail = {
+    sessionPath: 'C:/sessions/test.jsonl',
+    log: { debug() {}, warn() {} },
+    bus: {
+      async request(type) {
+        if (type === 'deferred:register') {
+          registerCalled += 1;
+          return { ok: false, error: 'unknown bus type' };
+        }
+        throw new Error('should not reach resolve');
+      },
+    },
+  };
+  assert.equal((await trySendDeferredImage(ctxRegisterFail, staged)).ok, false);
+  assert.equal(registerCalled, 1, 'register 失败后不应继续 resolve');
+
+  // resolve 返回 { ok: false } → 也降级
+  const ctxResolveFail = {
+    sessionPath: 'C:/sessions/test.jsonl',
+    log: { debug() {}, warn() {} },
+    bus: {
+      async request(type) {
+        if (type === 'deferred:register') return { ok: true };
+        if (type === 'deferred:resolve') return { ok: false, error: 'resolve failed' };
+        return { ok: true };
+      },
+    },
+  };
+  assert.equal((await trySendDeferredImage(ctxResolveFail, staged)).ok, false);
+
+  // register 返回 undefined（无返回值）→ 也降级
+  const ctxNoReturn = {
+    sessionPath: 'C:/sessions/test.jsonl',
+    log: { debug() {}, warn() {} },
+    bus: {
+      async request() {
+        return undefined;
+      },
+    },
+  };
+  assert.equal((await trySendDeferredImage(ctxNoReturn, staged)).ok, false);
+});
+
+test('deferred 原生图片块：无 bus / 无 session / 无文件路径时直接降级', async () => {
+  assert.equal((await trySendDeferredImage({ sessionPath: 'C:/s.jsonl' }, { file: { filePath: 'C:/a.jpg' } })).ok, false);
+  assert.equal((await trySendDeferredImage({ bus: { request: async () => ({ ok: true }) } }, { file: { filePath: 'C:/a.jpg' } })).ok, false);
+  assert.equal((await trySendDeferredImage({ bus: { request: async () => ({ ok: true }) }, sessionPath: 'C:/s.jsonl' }, { file: {} })).ok, false);
+  assert.equal((await trySendDeferredImage({ bus: { request: async () => ({ ok: true }) }, sessionPath: 'C:/s.jsonl' }, null)).ok, false);
+});
+
+test('deferred 降级路径：非 0.679 宿主仍走 iframe 卡片', () => {
+  const staged = { fileId: 'sf_x', filePath: 'C:/a.jpg' };
+  const cardOptions = { id: 'stk_1', description: 'd', score: 1, emotion: '开心' };
+  assert.deepEqual(buildStickerDeliveryDetails(staged, cardOptions, '0.678.9'), {
+    card: buildStickerCard(cardOptions),
+  });
+});
 
 test('两阶段抽样保持目标场景频率', () => {
   assert.equal(getConditionalScenePercent(20, 80), 25);
@@ -38,6 +157,97 @@ test('两阶段抽样保持目标场景频率', () => {
   }
   const actual = hits / trials;
   assert.ok(Math.abs(actual - 0.2) < 0.01, `目标 20%，实际 ${(actual * 100).toFixed(2)}%`);
+});
+
+test('表情包配图卡片显式给出高度比例，避免新宿主只显示文字不创建图片 iframe', () => {
+  const card = buildStickerCard({
+    id: 'stk_352',
+    description: '鲸鱼娘少女睁大蓝色眼睛',
+    score: 12.5,
+    emotion: '开心',
+    agentId: 'hanako',
+    sessionId: 'sess_test',
+    sessionPath: 'C:/sessions/test.jsonl',
+  });
+
+  assert.equal(card.type, 'iframe');
+  assert.equal(card.pluginId, 'biaoqingbao');
+  // v0.33.0 - 未传图片尺寸时回退默认宽高比（异常不炸）
+  assert.equal(card.aspectRatio, '400:430');
+  assert.match(card.route, /id=stk_352/);
+  assert.match(card.route, /emotion=%E5%BC%80%E5%BF%83/);
+  assert.equal(card.description, '表情包配图 · biaoqingbao');
+});
+
+test('新版 Hana 前端配图走 details.media，并从 stageFile 包装结果取出 session_file', () => {
+  const mediaItem = { type: 'session_file', fileId: 'sf_test', mime: 'image/png', label: '测试表情包' };
+  const staged = { file: { fileId: 'sf_test', filePath: 'C:/tmp/test.png' }, mediaItem };
+  assert.deepEqual(buildStickerMediaDetails(staged), {
+    media: { items: [mediaItem] },
+  });
+  assert.deepEqual(buildStickerMediaDetails(staged, 'bqbq-test'), {
+    media: { items: [mediaItem] },
+    mediaGeneration: {
+      source: 'plugin',
+      kind: 'image',
+      tasks: [{ taskId: 'bqbq-test' }],
+    },
+  });
+});
+
+test('表情包按 Hana 宿主版本分流：新版 media、旧版和未知版本 card', () => {
+  const mediaItem = { type: 'session_file', fileId: 'sf_test', mime: 'image/png', label: '测试表情包' };
+  const staged = { file: { fileId: 'sf_test', filePath: 'C:/tmp/test.png' }, mediaItem };
+  const cardOptions = {
+    id: 'stk_test',
+    description: '测试表情包',
+    score: 10,
+    emotion: '兴奋',
+    agentId: 'hanako',
+    sessionId: 'session_test',
+    sessionPath: 'C:/tmp/session.jsonl',
+  };
+
+  assert.equal(supportsNativeMediaDetails('0.679.3'), true);
+  assert.equal(supportsNativeMediaDetails('v0.679.3-beta'), true);
+  assert.equal(supportsNativeMediaDetails('0.678.9'), false);
+  assert.equal(supportsNativeMediaDetails('0.448.3'), false);
+  assert.equal(supportsNativeMediaDetails(null), false);
+  assert.deepEqual(buildStickerDeliveryDetails(staged, cardOptions, '0.679.3'), {
+    media: { items: [mediaItem] },
+  });
+  assert.deepEqual(buildStickerDeliveryDetails(staged, cardOptions, '0.678.9'), {
+    card: buildStickerCard(cardOptions),
+  });
+  assert.deepEqual(buildStickerDeliveryDetails(staged, cardOptions, null), {
+    card: buildStickerCard(cardOptions),
+  });
+});
+
+test('配图卡片按图片实际尺寸动态定宽高比（小图小卡、大图按宿主上限截顶）', () => {
+  // 微小图（短边 100）：保持原尺寸不放大，高度按比例+按钮预留（BTN_RESERVE=64），宽度恒 400（宿主槽位基线）
+  assert.equal(buildStickerCard({ id: 'a', description: '小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: true }).aspectRatio, '400:164');
+  // 横向小图 100x60
+  assert.equal(buildStickerCard({ id: 'a', description: '横向小图', score: 1, emotion: '开心', size: { width: 100, height: 60 }, smart: true }).aspectRatio, '400:124');
+  // 中等图 200px（v0.33.1 二分：<400 一律贴原图，不再放大到 280）
+  assert.equal(buildStickerCard({ id: 'a', description: '200图', score: 1, emotion: '开心', size: { width: 200, height: 200 }, smart: true }).aspectRatio, '400:264');
+  // 中图 600px（短边 ≥400 → 填满 400，正方形图高度按 400 算）
+  assert.equal(buildStickerCard({ id: 'a', description: '600图', score: 1, emotion: '开心', size: { width: 600, height: 600 }, smart: true }).aspectRatio, '400:464');
+  // 大图 2000px（≥400 → 填满 400）
+  assert.equal(buildStickerCard({ id: 'a', description: '大图', score: 1, emotion: '开心', size: { width: 2000, height: 2000 }, smart: true }).aspectRatio, '400:464');
+  // 关闭智能：回退旧行为（短边≥200 按 400 放大填满）
+  assert.equal(buildStickerCard({ id: 'a', description: '关智能', score: 1, emotion: '开心', size: { width: 400, height: 200 }, smart: false }).aspectRatio, '400:264');
+  // 尺寸缺失/非法回退默认
+  assert.equal(buildStickerCard({ id: 'a', description: '缺尺寸', score: 1, emotion: '开心' }).aspectRatio, '400:430');
+  assert.equal(buildStickerCard({ id: 'a', description: '非法尺寸', score: 1, emotion: '开心', size: { width: -1, height: 0 } }).aspectRatio, '400:430');
+});
+
+test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {
+  const source = fs.readFileSync(new URL('../routes/ui.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("type: 'hana.ready'"), '卡片页面必须发送 hana.ready');
+  assert.ok(source.includes("type: 'ui.resize'"), '卡片页面必须发送 ui.resize（宿主可识别的尺寸事件名）');
+  assert.ok(!source.includes("type: 'hana.ui.resize'"), '旧错误事件名 hana.ui.resize 必须移除，宿主不识别');
+  assert.doesNotMatch(source, /type:\s*['\"]resize-request['\"]/);
 });
 
 test('标签打分遵守偏好、否决和排除名单', () => {

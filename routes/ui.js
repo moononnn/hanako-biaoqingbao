@@ -11,6 +11,7 @@ import {
   readTextConfig, readEmbeddingConfig, getAvailableEmbeddingModels,
   escapeHtml,
 } from '../lib/shared.js';
+import { AUTO_FIT_MAX } from '../lib/smart-fit.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, '..', 'assets');
@@ -105,6 +106,16 @@ function renderPage() {
     // v0.17.5 - 右上角「模型设置」胶囊按钮，参考「任务 (X)」的细线胶囊样式
     + '.home-text-btn{font-size:13px;padding:5px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surface);cursor:pointer;color:var(--text-muted);font-family:inherit;display:inline-flex;align-items:center;white-space:nowrap;transition:all .15s}'
     + '.home-text-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
+    // v0.31.0 - 悬浮球开关放在插件主页，图库只负责加入/移出表情包
+    + '.ball-toggle-wrap{display:inline-flex;align-items:center;gap:8px;padding:5px 10px 5px 12px;border:1px solid var(--border);border-radius:16px;background:var(--surface);color:var(--text-muted);font-size:12px;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}'
+    + '.ball-toggle-wrap:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
+    + '.ball-toggle-wrap.on{border-color:var(--primary);background:var(--primary-light);color:var(--primary-dark)}'
+    + '.ball-toggle-label{line-height:18px}'
+    + '.ball-toggle-switch{width:32px;height:18px;border-radius:999px;background:var(--border);padding:2px;display:inline-flex;align-items:center;transition:background .2s}'
+    + '.ball-toggle-switch.on{background:var(--primary)}'
+    + '.ball-toggle-thumb{width:14px;height:14px;border-radius:50%;background:var(--surface);box-shadow:0 1px 2px rgba(45,58,53,.16);transition:transform .2s}'
+    + '.ball-toggle-switch.on .ball-toggle-thumb{transform:translateX(14px)}'
+    + '.ball-status-top{font-size:11px;color:var(--text-light);white-space:nowrap}'
     + '.model-guide{background:var(--surface);border:1px dashed var(--accent);border-radius:18px;padding:16px 18px;box-shadow:var(--shadow);display:flex;align-items:center;gap:16px;flex-wrap:wrap}'
     + '.model-guide-copy{flex:1;min-width:220px}'
     + '.model-guide-title{font-size:15px;font-weight:600;color:var(--text);margin-bottom:8px}'
@@ -181,10 +192,12 @@ function renderPage() {
     + '.tag{display:inline-block;padding:1px 7px;font-size:10px;border-radius:3px;background:var(--primary-light);color:var(--primary-dark)}'
     + '.tag.scene{background:#f0eee6;color:#8a8a6a}'
     + '.card-tagged-at{font-size:10px;color:var(--text-light);margin-top:4px;font-family:monospace}'
-    + '.card-actions{display:flex;gap:4px;margin-top:6px}'
+    + '.card-actions{display:flex;gap:4px;margin-top:6px;flex-wrap:wrap}'
     + '.card-actions button{font-size:11px;padding:3px 8px;border:1px solid var(--border);border-radius:3px;background:transparent;cursor:pointer;color:var(--text-muted);font-family:inherit;transition:all .15s}'
     + '.card-actions .edit-btn:hover{background:var(--primary-light);color:var(--primary);border-color:var(--primary)}'
     + '.card-actions .retag-btn:hover{background:#f5f0e8;color:#9d7b53;border-color:#c9b88a}'
+    + '.card-actions .ball-pin-btn.active{background:var(--primary-light);color:var(--primary-dark);border-color:var(--primary)}'
+    + '.card-actions .ball-pin-btn:hover{background:var(--primary-light);color:var(--primary-dark);border-color:var(--primary)}'
     + '.card-actions .delete-btn{color:var(--danger)}'
     + '.card-actions .delete-btn:hover{background:var(--danger-light);border-color:var(--danger)}'
     // 多选模式
@@ -493,7 +506,10 @@ function renderPage() {
     + '<span class="spacer"></span>'
     + '<button class="home-text-btn" id="btn-check-update" title="检查 GitHub 上的新版本">检查更新</button>'
     + '<button class="home-text-btn" id="btn-feedback" title="遇到 bug 或有建议，来 GitHub 提 issue">反馈</button>'
-    + '<button class="home-text-btn" id="btn-settings" title="设置">模型设置</button>'
+    + '<button class="ball-toggle-wrap" id="ball-toggle-top" type="button" title="开关桌面纸飞机悬浮球；右键可刷新表情包或关闭" aria-label="纸飞机悬浮球开关" aria-pressed="false">'
+    + '<span class="ball-toggle-label">悬浮球</span><span class="ball-toggle-switch"><span class="ball-toggle-thumb"></span></span></button>'
+    + '<span class="ball-status-top" id="ball-status-top" role="status">未开启</span>'
+    + '<button class="home-text-btn" id="btn-settings" title="模型设置">模型设置</button>'
     + '</div>'
     + '<div class="home-main">'
     + '<div class="model-guide" id="model-guide">'
@@ -563,9 +579,9 @@ function renderPage() {
     + '<button class="back-btn" id="btnToggleMulti">多选图片识图</button>'
     + '</div>'
     + '<div class="filter-bar">'
-    + '<div class="fit-toggle" id="sticker-fit-toggle" role="switch" aria-checked="true" title="小图（短边 200px 以下）放大容易发糊：开 = 也放大填满卡片，关 = 保持原尺寸不糊。大图始终自动填满。">'
+    + '<div class="fit-toggle" id="sticker-fit-toggle" role="switch" aria-checked="true" title="智能多档自适应：小图不放大防糊、中大图自动缩放不撑满（默认开启）。关 = 回到旧行为：大图放大填满、小图保持原尺寸。">'
     + '<span class="fit-track"><span class="fit-knob"></span></span>'
-    + '<span class="fit-label">小图自适应</span>'
+    + '<span class="fit-label">智能自适应</span>'
     + '</div>'
     + '<select id="filter-emotion"><option value="">全部情绪</option><option value="开心">开心</option><option value="搞笑">搞笑</option><option value="鼓励">鼓励</option><option value="感谢">感谢</option><option value="难过">难过</option><option value="无语">无语</option><option value="可爱">可爱</option><option value="嘲讽">嘲讽</option><option value="治愈">治愈</option></select>'
     + '<input type="text" id="filter-search" placeholder="搜索描述 / 关键词...">'
@@ -809,6 +825,10 @@ function renderPage() {
     + '<div class="select-group" style="margin-top:8px">'
     + '<button class="btn btn-secondary" id="embedding-test-btn" style="width:auto;font-size:12px">测试连通</button>'
     + '<span id="embedding-test-result" style="font-size:12px;color:var(--text-muted);flex:1;min-width:120px"></span></div>'
+    // v0.33.29 - 悬浮球识图确认入库时自动生成向量（分享版默认关）
+    + '<div class="form-group" style="margin-top:10px"><label>悬浮球识图入库自动向量</label>'
+    + '<div class="switch-row"><input type="checkbox" id="embedding-auto-vector">'
+    + '<span style="font-size:12px;color:var(--text-muted)">在悬浮球拖图/粘贴识图、确认入库时自动生成一次向量。关闭则不消耗向量模型，需要时到图库页点「图库语义索引」批量补。</span></div></div>'
         + '</div>'
     + '</div>'
 
@@ -915,6 +935,13 @@ export default async function registerRoutes(app, ctx) {
     const label = c.req.query('label') || '表情包';
     const description = c.req.query('description') || '';
     const score = c.req.query('score') || '';
+    // 临时诊断：确认聊天 iframe 是否真的请求到了插件页面；不记录 token/ticket 原文。
+    const authKind = c.req.query('pluginIframeTicket')
+      ? 'iframe-ticket'
+      : c.req.query('token')
+        ? 'query-token'
+        : 'none';
+    ctx?.log?.info?.(`[biaoqingbao] sticker iframe 请求: id=${id}, auth=${authKind}, surface=${c.req.query('pluginSurfaceSession') ? 'yes' : 'no'}`);
 
     if (!id) return c.text('missing id', 400);
 
@@ -976,12 +1003,16 @@ export default async function registerRoutes(app, ctx) {
   <title>表情包</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; }
-    body { display: flex; flex-direction: column; gap: 8px; padding: 6px; background: transparent; }
+    html, body { height: 100%; }
+    /* v0.33.3 - 根绝滚动条：iframe 内容必须完全贴合上报尺寸，任何超宽（toast 长提示等）只裁不滚 */
+    html, body { overflow: hidden; }
+    body { width: fit-content; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 6px; background: transparent; }
+    /* v0.32.3 - align-items:center 兜底：宿主槽位比内容宽时（如微小图小于宿主 50px 下限）内容居中，不再挤左上角 */
     /* v0.25.1 - hidden 必须真生效：display:flex 等显式样式会覆盖 hidden 属性（经典坑） */
     [hidden] { display: none !important; }
     .img-card {
-      flex: 1; min-height: 0;
+      width: fit-content; max-width: 100%; /* v0.32.3 - 卡片跟图片走：小图不再被 flex:1 撑满 400px 留大白边 */
+      min-height: 0;
       display: flex; align-items: center; justify-content: center;
       background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px; padding: 6px;
     }
@@ -991,6 +1022,7 @@ export default async function registerRoutes(app, ctx) {
     /* v0.28.0 - 去掉外层容器框：按钮直接贴在图片下，不再套白底圆角框（保留 flex 居中与 toast 定位） */
     .fb-card {
       position: relative; margin: 0 auto;
+      align-self: center; /* v0.32.3 - 跟随 body 居中对齐（原 flex-start 在收窄后会让按钮偏离图片中轴） */
       display: flex; align-items: center; gap: 8px;
       padding: 2px 0;
     }
@@ -999,6 +1031,8 @@ export default async function registerRoutes(app, ctx) {
       background: transparent; cursor: pointer;
       font-size: 12px; padding: 4px 14px;
       color: #4a9277; transition: all .15s;
+      /* v0.33.2 - 按钮永不被挤压：不收缩、不换行，保证「喜欢/不喜欢」始终横排一行 */
+      flex-shrink: 0; white-space: nowrap;
     }
     .fb-btn:hover { background: #e6f3ed; }
     .fb-btn.on-love { background: #5dae8e; border-color: #5dae8e; color: #fff; }
@@ -1009,7 +1043,10 @@ export default async function registerRoutes(app, ctx) {
       position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%);
       background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px;
       padding: 4px 10px; font-size: 11px; color: #2d3a35;
-      opacity: 0; transition: opacity .15s; white-space: nowrap; pointer-events: none;
+      opacity: 0; transition: opacity .15s;
+      /* v0.33.3 - 不再 nowrap 硬撑：限在按钮区宽内，长提示折行显示，绝不顶出横向滚动条 */
+      max-width: 100%; white-space: normal; line-height: 1.4; text-align: left;
+      pointer-events: none;
     }
     .fb-toast.show { opacity: 1; }
     /* v0.25.0 - 不喜欢后的「聊聊」入口条 */
@@ -1127,6 +1164,13 @@ export default async function registerRoutes(app, ctx) {
   <script>window.__STICKER__ = ${STICKER_CFG};</script>
   <script>
     (function () {
+      // v0.31.8 - sticker iframe 必须完成 Hana UI 握手；否则宿主可能只保留卡片文字回退，不显示实际 iframe 内容。
+      window.parent.postMessage({
+        protocol: 'hana.plugin.ui',
+        version: 1,
+        kind: 'event',
+        type: 'hana.ready'
+      }, '*');
       var cfg = window.__STICKER__;
       var posBtn = document.getElementById('fb-pos');
       var negBtn = document.getElementById('fb-neg');
@@ -1157,13 +1201,16 @@ export default async function registerRoutes(app, ctx) {
         return pagePath.substring(0, pagePath.lastIndexOf('/'));
       }
       // 透传 iframe URL 上的插件会话凭证（Hana 页面鉴权必需）
+      // 旧版 Hana 用 server token（query），新版用 pluginSurfaceSession（query/header）。
+      // token 优先、surface 兜底，与管理页 withAuth 保持一致；
+      // pluginIframeTicket 是一次性文档加载凭证，不复用到 API 请求。
       function authQuery() {
         var parts = [];
         var locParams = new URLSearchParams(window.location.search);
-        ['pluginSurfaceSession', 'pluginIframeTicket'].forEach(function (k) {
-          var v = locParams.get(k);
-          if (v) parts.push(k + '=' + encodeURIComponent(v));
-        });
+        var token = locParams.get('token');
+        var surface = locParams.get('pluginSurfaceSession');
+        if (token) parts.push('token=' + encodeURIComponent(token));
+        else if (surface) parts.push('pluginSurfaceSession=' + encodeURIComponent(surface));
         return parts.length > 0 ? '?' + parts.join('&') : '';
       }
       function showToast(msg, isErr) {
@@ -1415,7 +1462,14 @@ export default async function registerRoutes(app, ctx) {
       function reportChatSize() {
         if (!chatMode) return;
         var h = chatPanel.offsetHeight + 26;
-        window.parent.postMessage({ type: 'resize-request', payload: { height: Math.round(h), width: window.innerWidth } }, '*');
+        window.parent.postMessage({
+          protocol: 'hana.plugin.ui',
+          version: 1,
+          kind: 'event',
+          // v0.33.0 - 协议修正：宿主在 hana.plugin.ui 命名空间下期望的事件名是 ui.resize（带 hana. 前缀被忽略，导致 size 上报一直无效）
+          type: 'ui.resize',
+          payload: { height: clampH(Math.round(h)), width: clampW(window.innerWidth) }
+        }, '*');
       }
 
       posBtn.addEventListener('click', function () { sendFb('positive'); });
@@ -1442,50 +1496,76 @@ export default async function registerRoutes(app, ctx) {
   <script>
     // v0.22.0 - 卡片高度自适应：按图片比例上报高度，消除四周大白边
     // v0.24.0 - 小图自适应开关：尺寸够大的图永远放大填满；小于阈值的小图才看开关（怕糊可关）
+    // v0.33.1 - 自适应二分化：图片短边 < 400 保持原尺寸贴图，≥ 400 放大填满 400。废弃四档。
     (function () {
       var FIT = ${fitEnabled ? 'true' : 'false'};
       var FIT_THRESHOLD = ${fitThreshold};
+      var AUTO_FIT_MAX = ${AUTO_FIT_MAX}; // 宿主槽位宽上限（前后端同源）
       // v0.28.0 - 反馈按钮开关：关闭时宽度不再给按钮区留空间
       var FBN = ${showFb ? 'true' : 'false'};
       var IMG = document.querySelector('.img-card img');
       var FB_CARD = document.querySelector('.fb-card');
-      function shouldFit() {
-        if (!IMG || !IMG.naturalWidth) return FIT;
-        var minSide = Math.min(IMG.naturalWidth, IMG.naturalHeight);
-        if (minSide >= FIT_THRESHOLD) return true;   // 大图：永远自适应
-        return FIT;                                   // 小图：看开关
+      // v0.33.0 - 与宿主槽位口径一致：宽度生效区间 [50,400]，高度 [30,600]（宿主对 card 槽位的 clamp）
+      function clampW(v) { return Math.max(50, Math.min(400, Math.round(v))); }
+      function clampH(v) { return Math.max(30, Math.min(600, Math.round(v))); }
+      // v0.33.1 - 二分决策：fit=是否放大填满，cap=目标显示宽度（null=不放大/原尺寸）
+      function fitDecision(minSide) {
+        if (!FIT) return { fit: minSide >= FIT_THRESHOLD, cap: null };  // 关：回退旧行为（阈值默认 200）
+        return minSide >= AUTO_FIT_MAX ? { fit: true, cap: AUTO_FIT_MAX } : { fit: false, cap: null };
       }
       function fitCard() {
         // v0.25.0 - 聊天模式：高度由聊天面板决定（脚本1 reportChatSize 负责），这里不覆盖
         if (window.__CHAT_MODE__) return;
         if (!IMG || !IMG.naturalWidth) return;
-        var fit = shouldFit();
-        if (fit) IMG.classList.add('fit');
+        var d = fitDecision(Math.min(IMG.naturalWidth, IMG.naturalHeight));
+        if (d.fit) IMG.classList.add('fit');
         else IMG.classList.remove('fit');
         var ratio = IMG.naturalHeight / IMG.naturalWidth;
         var w = window.innerWidth;
-        var displayW = fit ? w : Math.min(w, IMG.naturalWidth);
+        var displayW = d.fit ? (d.cap ? Math.min(w, d.cap) : w) : Math.min(w, IMG.naturalWidth);
+        // v0.32.3 - 改回仓库版「卡片包着图」机制：给 .img-card 容器设内联宽度（displayW + 14 含 padding+border）
+        document.getElementById('img-card').style.width = (displayW + 14) + 'px';
         // v0.28.0 - 高度自适应：按钮显示时按按钮区实际高度放大卡片；隐藏时只留图片卡片自身留白，底部不再有白边
         var imgH = Math.round(displayW * ratio);
-        var fbH = FBN && FB_CARD && !FB_CARD.hidden ? FB_CARD.offsetHeight : 0;
+        // v0.33.2 - 按钮「真实可见」统一判定（配置显示且未 hidden）
+        var fbBtnVisible = FBN && FB_CARD && !FB_CARD.hidden;
+        var fbH = fbBtnVisible ? FB_CARD.offsetHeight : 0;
+        if (fbBtnVisible && fbH < 30) fbH = 30;  // 高度兜底：按钮区至少 30px，防止首帧太低冒出滚动条把宽度吃掉
         var extra = 12;                 // body 上下 padding 6*2
         if (fbH > 0) extra += 8 + fbH;  // 图片卡片与按钮区的 gap 8 + 按钮区实际高度
         var target = imgH + 14 + extra; // img-card 自身 padding 6*2 + 边框 1*2 = 14
-        target = Math.min(600, Math.max(30, target));
+        target = clampH(target);
         var payload = { height: target };
-        // v0.24.0 - 宽度自适应：关开关时卡片包着图；下限取按钮区实际宽度，绝不挤压喜欢/不喜欢按钮
-        // v0.28.0 - 反馈按钮关闭时直接按图片宽度，不给按钮区留白
-        if (!fit) {
-          var btnW = FBN ? (FB_CARD ? FB_CARD.offsetWidth : 150) : 0;
-          var targetW = Math.max(displayW, btnW) + (FBN ? 26 : 0);
-          targetW = Math.min(w, Math.max(30, targetW));
-          payload.width = targetW;
+        // v0.33.2 - 按钮显示时「喜欢/不喜欢」横排最小宽兜底：
+        //   图片刚加载时按钮区可能还没布局（offsetWidth=0），若只按图宽上报，宿主把 iframe 开太窄会把按钮挤变形，
+        //   所以只要按钮可见，宽度至少能横排放下两枚按钮（~130px）。隐藏按钮时纯贴图。
+        var BTN_MIN_W = 132;
+        // v0.33.1 - 宽度上报贴内容真实宽（去掉旧 +26 冗余，解决左右间距不匀）：
+        //   内容宽 = 图卡外宽(displayW+14) 与 按钮区实际宽 的最大值；隐藏按钮时只剩图卡本身
+        if (displayW < w) {
+          var fbBtnW = fbBtnVisible ? FB_CARD.offsetWidth : 0;
+          var needBtnW = fbBtnVisible ? Math.max(fbBtnW, BTN_MIN_W) : 0;
+          var imgCardW = displayW + 14;
+          var contentW = fbBtnVisible ? Math.max(imgCardW, needBtnW) : imgCardW;
+          var targetW = clampW(contentW);
+          if (targetW > 0) payload.width = targetW;
         }
-        window.parent.postMessage({ type: 'resize-request', payload: payload }, '*');
+        window.parent.postMessage({
+          protocol: 'hana.plugin.ui',
+          version: 1,
+          kind: 'event',
+          type: 'ui.resize',
+          payload: payload
+        }, '*');
       }
       if (IMG) {
-        if (IMG.complete) fitCard();
-        else IMG.addEventListener('load', fitCard);
+        // v0.33.2 - 加载完成后等两帧再量尺寸：让下方反馈按钮区完成布局（off-…Width/Height 就绪），
+        //   避免首帧把按钮区当作 0 高度/宽度导致上报过窄过矮、按钮被裁或变形。
+        function runFit() {
+          window.requestAnimationFrame(function () { window.requestAnimationFrame(fitCard); });
+        }
+        if (IMG.complete) runFit();
+        else IMG.addEventListener('load', runFit);
       }
       window.addEventListener('resize', fitCard);
     })();

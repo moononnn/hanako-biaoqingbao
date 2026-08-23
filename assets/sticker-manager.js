@@ -9,21 +9,28 @@
   // ═══════════════════════════════════
   function getAuthParams() {
     var params = new URLSearchParams(window.location.search);
-    var result = {};
-    var surface = params.get('pluginSurfaceSession');
-    if (surface) result.pluginSurfaceSession = surface;
-    return result;
+    return {
+      // 新版页面 API 用请求头回传 surface session；同名 query 仍保留给图片等子资源。
+      surface: params.get('pluginSurfaceSession') || '',
+      // 旧版直连页面使用 server token，继续走 query 兼容。
+      token: params.get('token') || '',
+    };
   }
 
   function withAuth(url) {
     var auth = getAuthParams();
-    var parts = [];
-    for (var k in auth) {
-      parts.push(k + '=' + encodeURIComponent(auth[k]));
+    var key = '';
+    var value = '';
+    if (auth.token) {
+      key = 'token';
+      value = auth.token;
+    } else if (auth.surface) {
+      key = 'pluginSurfaceSession';
+      value = auth.surface;
     }
-    if (parts.length === 0) return url;
+    if (!key) return url;
     var sep = url.indexOf('?') >= 0 ? '&' : '?';
-    return url + sep + parts.join('&');
+    return url + sep + key + '=' + encodeURIComponent(value);
   }
 
   function baseUrl() {
@@ -47,6 +54,12 @@
     }
     var init = {};
     for (var k in opts) if (k !== 'timeout') init[k] = opts[k];
+    var auth = getAuthParams();
+    if (auth.surface && !auth.token) {
+      var headers = new Headers(init.headers || {});
+      headers.set('X-Hana-Plugin-Surface-Session', auth.surface);
+      init.headers = headers;
+    }
     if (!init.signal) init.signal = AbortSignal.timeout(timeout);
     return fetch(url, init);
   }
@@ -160,7 +173,7 @@
       if (data.ok) {
         window.__DISPLAY_CONFIG__ = data.data;
         t.setAttribute('aria-checked', next ? 'true' : 'false');
-        toast(next ? '小图自适应已开启：小图也会放大填满' : '小图自适应已关闭：小图保持原尺寸');
+        toast(next ? '自适应已开启：小图贴原图，大图自动填满' : '自适应已关闭：大图放大填满、小图保持原尺寸');
       } else {
         t.classList.toggle('on', !next);
         toast('保存失败: ' + (data.error || '出错了'), true);
@@ -178,6 +191,14 @@
   var selectedIds = new Set();
   var batchMode = false;
 
+  // v0.33.37 - 悬浮球等其他入口入库后页面自动刷新：轻量轮询列表指纹（数量+最新图），变了才重载
+  var lastListFingerprint = '';
+  function listFingerprint(list) {
+    if (!list || !list.length) return '0';
+    var last = list[list.length - 1];
+    return list.length + '|' + last.id + '|' + (last.added_at || '');
+  }
+
   async function loadStickers() {
     var emotion = $('filter-emotion').value;
     var search = $('filter-search').value.trim().toLowerCase();
@@ -192,6 +213,7 @@
       var data = await resp.json();
       if (data.ok) {
         allStickers = data.data || [];
+        lastListFingerprint = listFingerprint(allStickers);
         updateHomeCount();
         applyFilter();
         loadSemanticIndexStatus();
@@ -253,6 +275,7 @@
         card.className = 'sticker-card' + (selectedIds.has(s.id) ? ' selected' : '');
         card.setAttribute('data-id', s.id);
         var imgUrl = withAuth(API + '/api/image?id=' + encodeURIComponent(s.id));
+        var ballPinned = ballPinnedIds.has(String(s.id));
         var emTags = '';
         var scTags = '';
         for (var j = 0; j < (s.tags.emotion || []).length; j++) {
@@ -271,10 +294,12 @@
           + '<div class="card-actions">'
           + '<button class="edit-btn" data-id="' + escHtml(s.id) + '">编辑</button>'
           + '<button class="retag-btn" data-id="' + escHtml(s.id) + '">识图</button>'
+          + '<button class="ball-pin-btn' + (ballPinned ? ' active' : '') + '" data-id="' + escHtml(s.id) + '" aria-pressed="' + (ballPinned ? 'true' : 'false') + '">' + (ballPinned ? '已加入悬浮球' : '加入悬浮球') + '</button>'
           + '<button class="delete-btn" data-id="' + escHtml(s.id) + '">删除</button>'
           + '</div></div>';
         card.querySelector('.edit-btn').onclick = function (e) { e.stopPropagation(); openEditor(s); };
         card.querySelector('.retag-btn').onclick = function (e) { e.stopPropagation(); retagSticker(s); };
+        card.querySelector('.ball-pin-btn').onclick = function (e) { e.stopPropagation(); toggleBallPinButton(e.currentTarget); };
         card.querySelector('.delete-btn').onclick = function (e) { e.stopPropagation(); deleteSticker(s.id); };
         card.querySelector('.sticker-check').onclick = function (e) { e.stopPropagation(); toggleSelect(s.id); };
         card.addEventListener('click', function () {
@@ -934,6 +959,144 @@
     openModal('settings-modal');
   }
 
+  var ballStatus = null;
+  var ballPinnedIds = new Set();
+
+  async function loadBallState() {
+    var statusEl = $('ball-status-top');
+    if (!statusEl) return;
+    statusEl.textContent = '读取中…';
+    try {
+      var results = await Promise.all([
+        apiFetch(withAuth(API + '/api/ball/status'), { signal: AbortSignal.timeout(20000) }).then(function (r) { return r.json(); }),
+        apiFetch(withAuth(API + '/api/ball/config'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); }),
+      ]);
+      ballStatus = results[0];
+      var config = results[1] && results[1].data ? results[1].data : { pinnedIds: [] };
+      ballPinnedIds = new Set(config.pinnedIds || []);
+      renderBallStatus(ballStatus);
+      updateBallPinButtons();
+    } catch (e) {
+      statusEl.textContent = '状态读取失败';
+      var toggle = $('ball-toggle-top');
+      if (toggle) toggle.title = '悬浮球状态读取失败：' + (e.message || '请稍后再试');
+    }
+  }
+
+  function renderBallStatus(data) {
+    var statusEl = $('ball-status-top');
+    var toggle = $('ball-toggle-top');
+    if (!statusEl || !toggle) return;
+    var running = !!(data && data.running);
+    var switchEl = toggle.querySelector('.ball-toggle-switch');
+    toggle.classList.toggle('on', running);
+    toggle.setAttribute('aria-pressed', running ? 'true' : 'false');
+    if (switchEl) switchEl.classList.toggle('on', running);
+    if (running) {
+      statusEl.textContent = data.connected ? '已开启' : '连接中…';
+      toggle.title = '关闭桌面纸飞机悬浮球；右键可刷新表情包或关闭';
+    } else {
+      statusEl.textContent = data && (data.error || data.dependencyError) ? (data.error || data.dependencyError) : '未开启';
+      toggle.title = '开启桌面纸飞机悬浮球；右键可刷新表情包或关闭';
+    }
+  }
+
+  function updateBallPinButtons() {
+    document.querySelectorAll('.ball-pin-btn[data-id]').forEach(function (button) {
+      var id = button.getAttribute('data-id');
+      var pinned = ballPinnedIds.has(id);
+      button.textContent = pinned ? '已加入悬浮球' : '加入悬浮球';
+      button.classList.toggle('active', pinned);
+      button.setAttribute('aria-pressed', pinned ? 'true' : 'false');
+    });
+  }
+
+  async function toggleBall() {
+    var button = $('ball-toggle-top');
+    var statusEl = $('ball-status-top');
+    if (!button || button.disabled) return;
+    button.disabled = true;
+    if (statusEl) statusEl.textContent = '处理中…';
+    try {
+      var current = await apiFetch(withAuth(API + '/api/ball/status'), { signal: AbortSignal.timeout(20000) }).then(function (r) { return r.json(); });
+      var action = current && current.running ? 'stop' : 'start';
+      var resp = await apiFetch(withAuth(API + '/api/ball/' + action), {
+        method: 'POST',
+        signal: AbortSignal.timeout(action === 'start' ? 30000 : 10000),
+      });
+      var result = await resp.json();
+      if (!result.ok) throw new Error(result.error || '操作失败');
+      toast(action === 'start' ? '悬浮球已启动' : '悬浮球已停止');
+      await loadBallState();
+    } catch (e) {
+      toast('悬浮球操作失败：' + (e.message || '未知错误'), true);
+      await loadBallState();
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function setBallPin(id, pinned, control) {
+    if (!id || (control && control.disabled)) return;
+    if (control) control.disabled = true;
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/ball/pin'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stickerId: id, pinned: pinned }),
+      });
+      var data = await resp.json();
+      if (!data.ok) throw new Error(data.error || '保存失败');
+      if (Array.isArray(data.pinnedIds)) ballPinnedIds = new Set(data.pinnedIds);
+      else if (pinned) ballPinnedIds.add(id);
+      else ballPinnedIds.delete(id);
+      updateBallPinButtons();
+      toast(pinned ? '已加入悬浮球' : '已从悬浮球移除');
+    } catch (e) {
+      updateBallPinButtons();
+      toast('保存失败：' + (e.message || '未知错误'), true);
+    } finally {
+      if (control) control.disabled = false;
+    }
+  }
+
+  function toggleBallPinButton(button) {
+    var id = button && button.getAttribute('data-id');
+    if (id) setBallPin(id, !ballPinnedIds.has(id), button);
+  }
+
+  // ─── 打开插件页面自动启动悬浮球（半自动：手动关过则本次不再弹）───
+  async function autoBootBall() {
+    var st;
+    try {
+      st = await apiFetch(withAuth(API + '/api/ball/autoboot'), { signal: AbortSignal.timeout(10000) }).then(function (r) { return r.json(); });
+    } catch { return; }
+    if (!st || !st.ok) return;
+    if (st.running) return; // 已经在跑不重复启动
+    if (st.dismissed) return; // 上次手动关过：本次打开页面不弹
+    if (!st.pyQtOk) {
+      toast('悬浮球需要 Python + PyQt6，当前环境还不能加载它', true);
+      return;
+    }
+    toast('正在启动纸飞机…');
+    try {
+      var start = await apiFetch(withAuth(API + '/api/ball/start'), {
+        method: 'POST',
+        signal: AbortSignal.timeout(30000),
+      }).then(function (r) { return r.json(); });
+      if (start && start.ok) {
+        toast('纸飞机起飞啦 ✈');
+        await loadBallState();
+      } else {
+        toast((start && start.error) || '悬浮球启动失败', true);
+        await loadBallState();
+      }
+    } catch (e) {
+      toast('悬浮球启动失败', true);
+      await loadBallState();
+    }
+  }
+
   function updateVisionModelDropdown(providerId, selectedModel) {
     var modelSel = $('vision-model');
     modelSel.innerHTML = '<option value="">选择模型...</option>';
@@ -1077,6 +1240,9 @@
       $('embedding-custom-key').value = cfg.customApiKey ? '********' : '';
       $('embedding-custom-model').value = cfg.customModel || '';
       $('embedding-custom-dimensions').value = cfg.customDimensions || '';
+      // v0.33.29 - 悬浮球识图入库自动向量开关
+      var autoVec = $('embedding-auto-vector');
+      if (autoVec) autoVec.checked = cfg.autoVectorOnSave !== false;
     } catch (e) { console.warn('[embed cfg] load err:', e); }
     toggleEmbeddingBlocks();
   }
@@ -1161,6 +1327,7 @@
         customApiKey: '',
         customModel: '',
         customDimensions: 1024,
+        autoVectorOnSave: $('embedding-auto-vector') ? $('embedding-auto-vector').checked : false,
       };
     }
     return {
@@ -1172,6 +1339,7 @@
       customApiKey: $('embedding-custom-key').value || '',
       customModel: $('embedding-custom-model').value || '',
       customDimensions: parseInt($('embedding-custom-dimensions').value, 10) || 1024,
+      autoVectorOnSave: $('embedding-auto-vector') ? $('embedding-auto-vector').checked : false,
     };
   }
 
@@ -3566,10 +3734,12 @@
   // ═══════════════════════════════════
   document.addEventListener('DOMContentLoaded', function () {
     loadStickers();
+    loadBallState();
     loadSemanticIndexStatus();
     checkBatchTasks();
     updateModelGuide();
     updateUploadBtnState();
+    autoBootBall(); // 打开插件页面自动启动悬浮球（半自动：手动关过则本次不再弹）
 
     // 导航：首页卡片点击
     document.querySelectorAll('.entry-card[data-goto]').forEach(function (card) {
@@ -3605,9 +3775,11 @@
       });
     });
 
-    // 设置按钮
+    // 设置按钮与主页悬浮球开关
     $('btn-settings').addEventListener('click', openSettings);
     $('guide-settings-btn').addEventListener('click', openSettings);
+    var ballToggleBtn = $('ball-toggle-top');
+    if (ballToggleBtn) ballToggleBtn.addEventListener('click', toggleBall);
     // v0.19.5 - 检查更新按钮
     $('btn-check-update').addEventListener('click', checkUpdate);
     // v0.27.1 - 反馈入口：打开 GitHub Issues（弹窗被拦时降级为复制链接）
@@ -3794,6 +3966,20 @@
 
     // v0.25.1 - 角标定时刷新：识别时切去聊天页，回来角标状态也是最新的
     setInterval(function () { checkBatchTasks(); }, 5000);
+
+    // v0.33.37 - 悬浮球/其他进程入库后图库自动刷新（列表本身是元数据，轻量轮询；变了才重绘，不打断操作）
+    setInterval(async function () {
+      try {
+        var resp = await apiFetch(withAuth(API + '/api/list'));
+        if (!resp.ok) return;
+        var data = await resp.json();
+        if (!data.ok) return;
+        var list = data.data || [];
+        var fp = listFingerprint(list);
+        if (lastListFingerprint !== '' && fp !== lastListFingerprint) loadStickers();
+        lastListFingerprint = fp;
+      } catch (e) { /* 网络抖动/页面切走忽略，下轮再试 */ }
+    }, 20000);
 
     // 筛选
     $('filter-emotion').addEventListener('change', loadStickers);

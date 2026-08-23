@@ -12,30 +12,17 @@ import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolveAgentId, atomicWriteJson, DATA_DIR } from '../lib/shared.js';
+import { applyPreferenceFeedback } from '../lib/feedback.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const DATA_DIR_LOCAL = DATA_DIR;
 const STICKERS_FILE = join(DATA_DIR_LOCAL, 'stickers.json');
 const BAD_MATCHES_FILE = join(DATA_DIR_LOCAL, 'bad-matches.json');
-const PREFERENCES_FILE = join(DATA_DIR_LOCAL, 'preferences.json');
 const DECISION_LOG_FILE = join(DATA_DIR_LOCAL, 'decision-log.json');
 const MISSING_CATS_FILE = join(DATA_DIR_LOCAL, 'missing-categories.json');
 
 function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
-}
-
-// ── 读写偏好记忆库 ──
-async function loadPreferences() {
-  try {
-    return JSON.parse(await readFile(PREFERENCES_FILE, 'utf-8'));
-  } catch {
-    return { version: 1, users: {} };
-  }
-}
-
-async function savePreferences(data) {
-  atomicWriteJson(PREFERENCES_FILE, data);
 }
 
 // ── 读写决策日志 ──
@@ -54,43 +41,6 @@ async function saveDecisionLog(data) {
 // ── 获取当前 agent ID（v0.19.5 - 统一走 resolveAgentId，与 express 一致，避免反馈落到 unknown）──
 function getAgentId(ctx) {
   return resolveAgentId(null, ctx);
-}
-
-// ── 查找或创建用户的偏好映射 ──
-function ensureUserMapping(prefs, agentId, emotion, keywords) {
-  if (!prefs.users[agentId]) {
-    prefs.users[agentId] = { mappings: [] };
-  }
-  const user = prefs.users[agentId];
-  const kwList = keywords || [];
-  const sortedKws = [...kwList].sort();
-
-  // 找已有映射（同 emotion + 关键词重叠；v0.19.5 - 双方都无关键词也算匹配，避免重复新建）
-  let mapping = user.mappings.find(m => {
-    if (m.context.emotion !== emotion) return false;
-    const mKws = m.context.keywords || [];
-    if (kwList.length === 0 && mKws.length === 0) return true;
-    return sortedKws.some(k => mKws.includes(k)) && mKws.some(k => sortedKws.includes(k));
-  });
-
-  if (!mapping) {
-    mapping = {
-      context: { emotion, keywords: kwList },
-      preferred_ids: [],
-      vetoed_ids: [],
-      dislike_counts: {},
-      weight: 1,
-      updated_at: new Date().toISOString()
-    };
-    user.mappings.push(mapping);
-  } else {
-    // 旧数据兼容：没有 dislike_counts 时补上
-    if (!mapping.dislike_counts) mapping.dislike_counts = {};
-    // 合并关键词
-    const merged = [...new Set([...mapping.context.keywords, ...kwList])];
-    mapping.context.keywords = merged;
-  }
-  return mapping;
 }
 
 export const name = "report_bad_match";
@@ -154,28 +104,17 @@ export async function execute(input, ctx) {
 
   ctx?.log?.info?.(`[biaoqingbao] 反馈: sticker=${sid} type=${feedback_type} agent=${agentId}`);
 
-  // ── 1. 写偏好记忆库 ──
-  const prefs = await loadPreferences();
-  const mapping = ensureUserMapping(prefs, agentId, emotion, kwList);
-
-  if (fbType === 'negative') {
-    // v0.25.0 - 不喜欢改为累计计数（多轮不喜欢 → 频率衰减），不再写入 vetoed 硬拉黑
-    // 历史 vetoed 数据保留硬排除语义（-20），不迁移
-    mapping.preferred_ids = mapping.preferred_ids.filter(id => id !== sid);
-    mapping.dislike_counts = mapping.dislike_counts || {};
-    mapping.dislike_counts[sid] = (mapping.dislike_counts[sid] || 0) + 1;
-  } else {
-    // positive —— 从 vetoed 中移除（如果之前拉黑过），清零不喜欢次数，加入 preferred
-    mapping.vetoed_ids = mapping.vetoed_ids.filter(id => id !== sid);
-    if (mapping.dislike_counts) delete mapping.dislike_counts[sid];
-    if (!mapping.preferred_ids.includes(sid)) {
-      mapping.preferred_ids.push(sid);
-    }
-  }
-  mapping.weight = Math.min(10, mapping.weight + 1);
-  mapping.updated_at = new Date().toISOString();
-  await savePreferences(prefs);
-  ctx?.log?.info?.(`[biaoqingbao] 偏好已更新: ${fbType}, mapping.weight=${mapping.weight}`);
+  // ── 1. 写偏好记忆库（与卡片、纸飞机共用） ──
+  const feedbackResult = await applyPreferenceFeedback({
+    stickerId: sid,
+    feedbackType: fbType,
+    agentId,
+    contextEmotion: emotion,
+    contextKeywords: kwList,
+  });
+  if (!feedbackResult.ok) return reply({ ok: false, error: feedbackResult.error });
+  const mapping = feedbackResult.mapping;
+  ctx?.log?.info?.(`[biaoqingbao] 偏好已更新: ${fbType}, mapping.weight=${mapping?.weight || 1}`);
 
   // ── 2. 兼容旧 bad-matches.json（仅 negative） ──
   if (fbType === 'negative') {
@@ -239,7 +178,7 @@ export async function execute(input, ctx) {
     ts: new Date().toISOString(),
     agent: agentId,
     type: 'user_feedback',
-    feedback_type,
+    feedback_type: fbType,
     sticker_id: sid,
     emotion,
     keywords: kwList,
@@ -249,7 +188,7 @@ export async function execute(input, ctx) {
   if (log.entries.length > 500) log.entries = log.entries.slice(-500);
   await saveDecisionLog(log);
 
-  const msg = feedback_type === 'positive'
+  const msg = fbType === 'positive'
     ? '已记住，以后类似情景优先推荐这张图'
     : `已记录，以后类似情景会少配这张图（累计 ${mapping.dislike_counts?.[sid] || 1} 次）`;
 
@@ -257,7 +196,7 @@ export async function execute(input, ctx) {
     ok: true,
     data: {
       sticker_id: sid,
-      feedback_type,
+      feedback_type: fbType,
       message: msg
     }
   });

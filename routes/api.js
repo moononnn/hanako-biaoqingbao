@@ -30,6 +30,11 @@ import {
 } from '../lib/dialect.js';
 import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
+import { applyPreferenceFeedback, mutatePreferences } from '../lib/feedback.js';
+import {
+  startBall, stopBall, getBallState, checkBallDeps, readBallConfig, setBallPinned,
+  getRecentBallMatch, submitBallFeedback, consumeBallDismissed,
+} from '../lib/ball.js';
 // v0.30.0 - 学我说话：风格模板 + 总结任务
 import {
   STYLE_LEVELS, STYLE_LEVEL_IDS,
@@ -902,52 +907,16 @@ export default async function registerRoutes(app, ctx) {
       if (!sticker_id || !feedback_type) {
         return json({ ok: false, error: '缺少必要参数' }, 400);
       }
-
-      const prefsFile = path.join(DATA_DIR, 'preferences.json');
-      let prefs = { version: 1, users: {} };
-      try { prefs = JSON.parse(fs.readFileSync(prefsFile, 'utf-8')); } catch {}
-
-      const agentId = agent || 'default';
-      if (!prefs.users[agentId]) prefs.users[agentId] = { mappings: [] };
-      const user = prefs.users[agentId];
-
-      const kwList = (context_keywords || '').split(',').map(s => s.trim()).filter(Boolean);
-      const emotion = context_emotion || '';
-
-      let mapping = user.mappings.find(m => {
-        if (m.context.emotion !== emotion) return false;
-        const mKws = m.context.keywords || [];
-        // v0.19.5 - 双方都无关键词也视为匹配（之前空数组 some 恒 false，导致每次反馈都新建重复 mapping）
-        if (kwList.length === 0 && mKws.length === 0) return true;
-        return kwList.some(k => mKws.includes(k)) && mKws.some(k => kwList.includes(k));
+      const result = await applyPreferenceFeedback({
+        dataDir: DATA_DIR,
+        stickerId: sticker_id,
+        feedbackType: feedback_type,
+        agentId: agent || 'default',
+        contextEmotion: context_emotion || '',
+        contextKeywords: context_keywords || '',
       });
-
-      if (!mapping) {
-        mapping = {
-          context: { emotion, keywords: kwList },
-          preferred_ids: [], vetoed_ids: [], dislike_counts: {}, weight: 1,
-          updated_at: new Date().toISOString()
-        };
-        user.mappings.push(mapping);
-      }
-
-      if (feedback_type === 'positive') {
-        // v0.25.0 - 喜欢：清掉累计不喜欢次数，移除历史拉黑，加入 preferred
-        mapping.vetoed_ids = mapping.vetoed_ids.filter(id => id !== sticker_id);
-        if (mapping.dislike_counts) delete mapping.dislike_counts[sticker_id];
-        if (!mapping.preferred_ids.includes(sticker_id)) mapping.preferred_ids.push(sticker_id);
-      } else {
-        // v0.25.0 - 不喜欢改为累计计数（多轮不喜欢 → 频率衰减），不再写入 vetoed 硬拉黑
-        mapping.preferred_ids = mapping.preferred_ids.filter(id => id !== sticker_id);
-        if (!mapping.dislike_counts) mapping.dislike_counts = {};
-        mapping.dislike_counts[sticker_id] = (mapping.dislike_counts[sticker_id] || 0) + 1;
-      }
-      mapping.weight = Math.min(10, mapping.weight + 1);
-      mapping.updated_at = new Date().toISOString();
-
-      atomicWriteJson(prefsFile, prefs);
-      const dislikeCount = (mapping.dislike_counts || {})[sticker_id] || 0;
-      return json({ ok: true, message: '偏好已更新', dislike_count: dislikeCount });
+      if (!result.ok) return json({ ok: false, error: result.error }, result.status || 400);
+      return json({ ok: true, message: '偏好已更新', dislike_count: result.dislike_count });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -961,44 +930,42 @@ export default async function registerRoutes(app, ctx) {
       const { action, agent, mapping_index, list, sticker_id, weight } = body || {};
       if (!action) return json({ ok: false, error: '缺少 action' }, 400);
 
-      const prefsFile = path.join(DATA_DIR, 'preferences.json');
-      let prefs = { version: 1, users: {} };
-      try { prefs = JSON.parse(fs.readFileSync(prefsFile, 'utf-8')); } catch {}
+      const result = await mutatePreferences({
+        dataDir: DATA_DIR,
+        mutator: (prefs) => {
+          const agentId = agent || 'default';
+          const user = prefs.users?.[agentId];
+          if (!user || !Array.isArray(user.mappings) || !user.mappings[mapping_index]) {
+            return { ok: false, status: 404, error: '未找到该映射' };
+          }
+          const mapping = user.mappings[mapping_index];
 
-      const agentId = agent || 'default';
-      const user = prefs.users[agentId];
-      if (!user || !user.mappings || !user.mappings[mapping_index]) {
-        return json({ ok: false, error: '未找到该映射' }, 404);
-      }
-      const mapping = user.mappings[mapping_index];
-
-      if (action === 'set_weight') {
-        const w = parseInt(weight, 10);
-        if (Number.isNaN(w)) return json({ ok: false, error: '权重必须是数字' }, 400);
-        mapping.weight = Math.max(0, Math.min(10, w));
-      } else if (action === 'remove_from_list') {
-        if (!sticker_id || !list) return json({ ok: false, error: '缺少 sticker_id 或 list' }, 400);
-        if (list === 'preferred') {
-          mapping.preferred_ids = (mapping.preferred_ids || []).filter(id => id !== sticker_id);
-        } else if (list === 'vetoed') {
-          mapping.vetoed_ids = (mapping.vetoed_ids || []).filter(id => id !== sticker_id);
-        } else if (list === 'dislikes') {
-          // v0.25.0 - 移除某张图的不喜欢累计次数
-          if (mapping.dislike_counts) delete mapping.dislike_counts[sticker_id];
-        } else {
-          return json({ ok: false, error: 'list 必须是 preferred / vetoed / dislikes' }, 400);
-        }
-      } else if (action === 'delete_mapping') {
-        user.mappings.splice(mapping_index, 1);
-      } else {
-        return json({ ok: false, error: '未知 action: ' + action }, 400);
-      }
-      mapping.updated_at = new Date().toISOString();
-      user.updated_at = new Date().toISOString();
-
-      // 确保目录存在并写入（原子写，避免断电/崩溃损坏）
-      atomicWriteJson(prefsFile, prefs);
-      return json({ ok: true, message: '已更新' });
+          if (action === 'set_weight') {
+            const w = parseInt(weight, 10);
+            if (Number.isNaN(w)) return { ok: false, status: 400, error: '权重必须是数字' };
+            mapping.weight = Math.max(0, Math.min(10, w));
+          } else if (action === 'remove_from_list') {
+            if (!sticker_id || !list) return { ok: false, status: 400, error: '缺少 sticker_id 或 list' };
+            if (list === 'preferred') {
+              mapping.preferred_ids = (mapping.preferred_ids || []).filter(id => id !== sticker_id);
+            } else if (list === 'vetoed') {
+              mapping.vetoed_ids = (mapping.vetoed_ids || []).filter(id => id !== sticker_id);
+            } else if (list === 'dislikes') {
+              if (mapping.dislike_counts) delete mapping.dislike_counts[sticker_id];
+            } else {
+              return { ok: false, status: 400, error: 'list 必须是 preferred / vetoed / dislikes' };
+            }
+          } else if (action === 'delete_mapping') {
+            user.mappings.splice(mapping_index, 1);
+          } else {
+            return { ok: false, status: 400, error: '未知 action: ' + action };
+          }
+          if (action !== 'delete_mapping') mapping.updated_at = new Date().toISOString();
+          user.updated_at = new Date().toISOString();
+          return { ok: true, message: '已更新' };
+        },
+      });
+      return json(result, result.ok ? 200 : (result.status || 400));
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -1311,15 +1278,14 @@ export default async function registerRoutes(app, ctx) {
       if (!sticker_id || !new_tags) return json({ ok: false, error: '缺少 sticker_id 或 new_tags' }, 400);
       if (typeof new_tags !== 'object' || Array.isArray(new_tags)) return json({ ok: false, error: 'new_tags 必须是对象' }, 400);
 
-      // v0.25.0 - 会话归属校验：提供了 session_id 就必须存在且属于该 sticker（防跨图确认）
-      // 会话过期（TTL 30 分钟）时降级放行并记日志：页面有鉴权，边缘情况不让用户白点一次
-      if (session_id) {
-        const session = chatSessions.get(session_id);
-        if (!session) {
-          ctx?.log?.warn?.('[biaoqingbao] confirm 会话不存在（可能已过期）: ' + session_id);
-        } else if (session.sticker_id !== sticker_id) {
-          return json({ ok: false, error: '会话与表情包不匹配' }, 400);
-        }
+      // 确认必须绑定仍在 TTL 内的聊天会话；不能把这个端点当成任意改标签接口。
+      if (!session_id) return json({ ok: false, error: '缺少有效聊天会话，请重新聊聊这张图' }, 400);
+      const session = chatSessions.get(session_id);
+      if (!session) {
+        return json({ ok: false, error: '聊天会话已过期，请重新聊聊这张图' }, 409);
+      }
+      if (session.sticker_id !== sticker_id) {
+        return json({ ok: false, error: '会话与表情包不匹配' }, 400);
       }
 
       const meta = readMeta();
@@ -1396,7 +1362,7 @@ export default async function registerRoutes(app, ctx) {
           // v0.19.5 - 用解析后的真实 model/dimensions（schema 字段是 modelId，不能用 embCfg.model）
           const { model: currentModel, dimensions: currentDims } = resolveEmbeddingApi();
           if (vectorsData.model && currentModel && vectorsData.model !== currentModel) {
-            vectorError = `向量模型已更换（${vectorsData.model} → ${currentModel}），请到「生成向量」里整体重算`;
+            vectorError = `向量模型已更换（${vectorsData.model} → ${currentModel}），请到图库页「图库语义索引」里整体重算`;
             ctx?.log?.warn?.('[biaoqingbao] 单条重算被跳过:', vectorError);
           } else {
             if (!vectorsData.vectors) vectorsData.vectors = {};
@@ -1896,6 +1862,8 @@ export default async function registerRoutes(app, ctx) {
         customApiKey: body.customApiKey ?? oldCfg.customApiKey ?? '',
         customModel: body.customModel ?? oldCfg.customModel ?? '',
         customDimensions: body.customDimensions ?? oldCfg.customDimensions ?? 1024,
+        // v0.33.29 - 悬浮球识图入库自动向量开关（分享版默认关）
+        autoVectorOnSave: typeof body.autoVectorOnSave === 'boolean' ? body.autoVectorOnSave : oldCfg.autoVectorOnSave === true,
       };
       writeEmbeddingConfig(cfg);
       return json({ ok: true, message: '配置已保存' });
@@ -2266,6 +2234,52 @@ ${draft}
         repoUrl: 'https://github.com/moononnn/hanako-biaoqingbao',
       });
     }
+  });
+
+  // ═══ 表情包悬浮球 — 管理端点 ═══
+  app.post('/api/ball/start', async () => {
+    const result = await startBall(ctx);
+    return json(result, result.ok ? 200 : 400);
+  });
+  app.post('/api/ball/stop', async () => {
+    const result = await stopBall();
+    return json(result, result.ok ? 200 : 400);
+  });
+  app.get('/api/ball/status', async () => {
+    const state = getBallState();
+    const deps = await checkBallDeps();
+    return json({
+      ...state,
+      python: deps.python,
+      pyQtOk: !!deps.pyQtOk,
+      dependencyError: deps.ok ? null : deps.error,
+    });
+  });
+  // 半自动启动状态（消费式读取：dismissed 读一次即清除；Hana 重启内存重置）
+  app.get('/api/ball/autoboot', async () => {
+    const state = getBallState();
+    const dismissed = consumeBallDismissed();
+    const deps = await checkBallDeps();
+    return json({ ok: true, running: state.running, dismissed, pyQtOk: !!deps.pyQtOk });
+  });
+  app.get('/api/ball/config', () => json({ ok: true, data: readBallConfig(ctx) }));
+  app.post('/api/ball/pin', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body?.stickerId !== 'string' || typeof body?.pinned !== 'boolean') {
+      return json({ ok: false, error: '参数不完整' }, 400);
+    }
+    const result = await setBallPinned(ctx, body.stickerId, body.pinned);
+    return json(result, result.ok ? 200 : (result.status || 400));
+  });
+  app.get('/api/ball/recent-match', async (c) => {
+    const sessionPath = c.req.query('sessionPath') || '';
+    const result = await getRecentBallMatch(ctx, sessionPath, { exposeSessionPath: false });
+    return json(result, result.ok ? 200 : (result.status || 400));
+  });
+  app.post('/api/ball/feedback', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const result = await submitBallFeedback(ctx, body);
+    return json(result, result.ok ? 200 : (result.status || 400));
   });
 }
 

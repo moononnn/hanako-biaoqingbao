@@ -8,6 +8,20 @@ if (idx < 0) {
   console.log('anchor not found');
   process.exit(1);
 }
+if (!src.includes("type: 'hana.ready'")) {
+  console.log('CARD INLINE SCRIPT HANDSHAKE MISSING');
+  process.exit(1);
+}
+if (!src.includes("type: 'ui.resize'")) {
+  // v0.33.0 - 协议修正：宿主在 hana.plugin.ui 命名空间下期望 ui.resize，带 hana. 前缀的事件名会被忽略
+  console.log('CARD INLINE SCRIPT RESIZE PROTOCOL MISSING');
+  process.exit(1);
+}
+// 旧错误写法必须清干净：hana.ui.resize 不会被宿主识别，会直接导致卡片尺寸不生效
+if (src.includes("type: 'hana.ui.resize'")) {
+  console.log('CARD INLINE SCRIPT WRONG RESIZE TYPE FOUND');
+  process.exit(1);
+}
 const scriptStart = src.indexOf('<script>', idx) + '<script>'.length;
 const scriptEnd = src.indexOf('</script>', scriptStart);
 let code = src.slice(scriptStart, scriptEnd);

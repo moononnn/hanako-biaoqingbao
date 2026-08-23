@@ -13,11 +13,40 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+      - name: 元数据与运行时文件检查
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (manifest.version !== pkg.version) {
+            console.error(`版本号不一致: manifest=${manifest.version}, package=${pkg.version}`);
+            process.exit(1);
+          }
+          console.log(`版本号一致: ${manifest.version}`);
+          NODE
+          if git ls-files | grep -E '^(data/|stickers/|PENDING_CHANGES\.md$|PROJECT_LOG\.md$|.*\.(log|bak|zip)$)'; then
+            echo "::error::仓库包含运行时数据或本地产物"
+            exit 1
+          fi
+          echo "运行时文件检查通过 ✓"
       - run: npm test
       - name: 命名红线检查
         run: |
           if git grep -n -I -E "玥儿|绯月|雪奈|悠米|柚月|星眠" -- . ':(exclude).github/workflows/ci.yml'; then
-            echo "::error::外传内容命名红线命中（玥儿/绯月/雪奈/悠米/柚月/星眠），请清理后重新提交"
+            echo "::error::外传内容命名红线命中，请清理后重新提交"
             exit 1
           fi
           echo "命名红线检查通过 ✓"
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: 安装 PyQt6
+        run: python -m pip install PyQt6
+      - name: Python 离屏测试
+        run: QT_QPA_PLATFORM=offscreen python -m unittest python/test_ball_app.py -v
