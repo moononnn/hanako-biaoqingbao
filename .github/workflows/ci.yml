@@ -46,6 +46,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: 安装 Qt 运行库
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libgl1
       - name: 安装 PyQt6
         run: python -m pip install PyQt6
       - name: Python 离屏测试
