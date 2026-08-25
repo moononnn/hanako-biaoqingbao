@@ -17,6 +17,7 @@ import {
   validatePinnedReorder,
 } from '../lib/ball-core.js';
 import { findMostActiveSession, listRecentSessions } from '../lib/ball-session.js';
+import { recordRecentMatch, readRecentRecord } from '../lib/recent-match.js';
 import {
   BALL_VARIANTS,
   normalizeBallVariant,
@@ -31,6 +32,7 @@ import {
   filterRecentMatchesForPublicSessions,
   submitBallFeedback,
   shouldAutoVectorOnSave,
+  buildBallStickerEntry,
 } from '../lib/ball.js';
 
 function tempDir() {
@@ -51,6 +53,26 @@ test('normalizePinnedIds 只保留现存 id、去重并固定版本', () => {
     { id: 'stk_002' },
   ]);
   assert.deepEqual(result, { version: 1, pinnedIds: ['stk_002'] });
+});
+
+test('纸飞机识图入库记录 tagged_at，图库不会误判为未识图', () => {
+  const now = '2026-08-24T07:00:00.000Z';
+  const entry = buildBallStickerEntry({
+    id: 'stk_new',
+    file: 'stk_new.png',
+    now,
+    tags: {
+      description: '一只开心的小猫',
+      semantic_description: '适合分享好消息时使用',
+      emotion: ['开心'],
+      scene: ['分享'],
+      keywords: ['小猫'],
+    },
+  });
+  assert.equal(entry.added_at, now);
+  assert.equal(entry.tagged_at, now);
+  assert.equal(entry.description, '一只开心的小猫');
+  assert.deepEqual(entry.tags.emotion, ['开心']);
 });
 
 test('safeStickerPath 拒绝路径穿越和目录外文件', () => {
@@ -495,8 +517,8 @@ test('持续自运动主体用全局光标、滞回热区和离开宽限判断 h
 });
 
 test('sessionFileDirFor 目录名与 Hana 会话托管目录一致（sha256(id:sessionId) 前 24 位）', () => {
-  const dir = sessionFileDirFor({ hanaHome: 'C:\\Users\\laotv\\.hanako', sessionId: 'sess_0mszdn321_e339768dc1780076a60a' });
-  assert.equal(dir, 'C:\\Users\\laotv\\.hanako\\session-files\\98bb85ae89d38f9f7368f4a7');
+  const dir = sessionFileDirFor({ hanaHome: 'C:\\Users\\alice\\.hanako', sessionId: 'sess_0mszdn321_e339768dc1780076a60a' });
+  assert.equal(dir, 'C:\\Users\\alice\\.hanako\\session-files\\98bb85ae89d38f9f7368f4a7');
   // 空/非法入参返回 null
   assert.equal(sessionFileDirFor({ hanaHome: null, sessionId: 'x' }), null);
   assert.equal(sessionFileDirFor({ hanaHome: 'H', sessionId: '  ' }), null);
@@ -638,6 +660,88 @@ test('配图手帐只返回公开、非插件会话的记录', () => {
     [matches[0]],
   );
   assert.deepEqual(filterRecentMatchesForPublicSessions(matches, null), []);
+});
+
+test('纸飞机正反馈可区分图片喜欢与场景应景，并能替换和撤销', async () => {
+  const dataDir = tempDir();
+  const root = tempDir();
+  const sessionPath = writeSession(root, 'hanako', 'feedback.jsonl', [
+    { sessionId: 'sess_feedback', type: 'session' },
+  ]);
+  fs.writeFileSync(path.join(dataDir, 'stickers.json'), JSON.stringify([{ id: 'stk_feedback' }]), 'utf8');
+  await recordRecentMatch({
+    dataDir,
+    ctx: { sessionId: 'sess_feedback', sessionPath },
+    stickerId: 'stk_feedback',
+    description: '测试图',
+    emotion: '开心',
+    agentId: 'hanako',
+    delivery: 'deferred',
+    ts: 100,
+  });
+  const ctx = { dataDir, bus: { request: async () => ({ sessions: [{ sessionId: 'sess_feedback', visibility: 'public', title: '公开对话' }] }) } };
+
+  const context = await submitBallFeedback(ctx, {
+    dataDir,
+    sessionId: 'sess_feedback',
+    stickerId: 'stk_feedback',
+    feedback: 'positive',
+    feedbackKind: 'context',
+    expectedTs: 100,
+  });
+  assert.equal(context.ok, true);
+  assert.equal(context.feedback_kind, 'context');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'context-feedback.json'), 'utf8')).byAgent.hanako['开心'].stk_feedback.count, 1);
+  assert.equal(fs.existsSync(path.join(dataDir, 'preferences.json')), false, '只记应景不应创建全局喜欢偏好');
+
+  const image = await submitBallFeedback(ctx, {
+    dataDir,
+    sessionId: 'sess_feedback',
+    stickerId: 'stk_feedback',
+    feedback: 'positive',
+    feedbackKind: 'image',
+    expectedTs: 100,
+  });
+  assert.equal(image.ok, true);
+  assert.equal(image.feedback_kind, 'image');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dataDir, 'context-feedback.json'), 'utf8')).byAgent.hanako['开心']?.stk_feedback, undefined);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8')).users.hanako.mappings[0].preferred_ids, ['stk_feedback']);
+
+  const cleared = await submitBallFeedback(ctx, {
+    dataDir,
+    sessionId: 'sess_feedback',
+    stickerId: 'stk_feedback',
+    feedback: 'clear',
+    expectedTs: 100,
+  });
+  assert.equal(cleared.ok, true);
+  assert.equal(readRecentRecord({ dataDir, sessionId: 'sess_feedback' })[0].feedback, null);
+});
+
+test('纸飞机跨会话撤销不会抹掉同一情绪下后来图片的偏好', async () => {
+  const dataDir = tempDir();
+  const root = tempDir();
+  const firstPath = writeSession(root, 'hanako', 'first-feedback.jsonl', [{ sessionId: 'sess_first_feedback', type: 'session' }]);
+  const secondPath = writeSession(root, 'hanako', 'second-feedback.jsonl', [{ sessionId: 'sess_second_feedback', type: 'session' }]);
+  fs.writeFileSync(path.join(dataDir, 'stickers.json'), JSON.stringify([{ id: 'stk_first' }, { id: 'stk_second' }]), 'utf8');
+  await recordRecentMatch({ dataDir, ctx: { sessionId: 'sess_first_feedback', sessionPath: firstPath }, stickerId: 'stk_first', description: '第一张', emotion: '开心', agentId: 'hanako', delivery: 'deferred', ts: 100 });
+  await recordRecentMatch({ dataDir, ctx: { sessionId: 'sess_second_feedback', sessionPath: secondPath }, stickerId: 'stk_second', description: '第二张', emotion: '开心', agentId: 'hanako', delivery: 'deferred', ts: 200 });
+  const ctx = { dataDir, bus: { request: async () => ({ sessions: [
+    { sessionId: 'sess_first_feedback', visibility: 'public', title: '第一段对话' },
+    { sessionId: 'sess_second_feedback', visibility: 'public', title: '第二段对话' },
+  ] }) } };
+
+  assert.equal((await submitBallFeedback(ctx, { sessionId: 'sess_first_feedback', stickerId: 'stk_first', feedback: 'positive', feedbackKind: 'image', expectedTs: 100 })).ok, true);
+  assert.equal((await submitBallFeedback(ctx, { sessionId: 'sess_second_feedback', stickerId: 'stk_second', feedback: 'positive', feedbackKind: 'image', expectedTs: 200 })).ok, true);
+  const clearFirst = await submitBallFeedback(ctx, { sessionId: 'sess_first_feedback', stickerId: 'stk_first', feedback: 'clear', expectedTs: 100 });
+  assert.equal(clearFirst.ok, true);
+  let prefs = JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8'));
+  assert.deepEqual(prefs.users.hanako.mappings[0].preferred_ids, ['stk_second']);
+
+  const clearSecond = await submitBallFeedback(ctx, { sessionId: 'sess_second_feedback', stickerId: 'stk_second', feedback: 'clear', expectedTs: 200 });
+  assert.equal(clearSecond.ok, true);
+  prefs = JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8'));
+  assert.deepEqual(prefs.users.hanako.mappings, []);
 });
 
 test('显式 sessionId 的手帐反馈拒绝私密或插件私有会话', async () => {

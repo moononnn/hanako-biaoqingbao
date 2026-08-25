@@ -12,7 +12,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { resumeBatchTasks } from './routes/_batch-tasks.js';
-import { ensureDataDir } from './lib/shared.js';
+import { backfillTaggedAt, ensureDataDir } from './lib/shared.js';
 import { stopBall } from './lib/ball.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -69,6 +69,14 @@ export async function onload(ctx = {}) {
 
   // v0.17.4 - 确保 data 目录存在（首次安装时）
   ensureDataDir();
+  try {
+    const taggedBackfilled = backfillTaggedAt();
+    if (taggedBackfilled > 0) {
+      ctx.log?.info?.(`[biaoqingbao] 已为 ${taggedBackfilled} 张已有标签的图片补写 tagged_at`);
+    }
+  } catch (error) {
+    ctx.log?.warn?.('[biaoqingbao] tagged_at 回填失败:', error?.message || error);
+  }
 
   const dataDir = ctx.dataDir;
   if (!dataDir) {

@@ -8,6 +8,7 @@ import {
   readRecentMatchForPath,
   readRecentMatches,
   readRecentRecord,
+  removeStickerRecentMatches,
   updateRecentFeedback,
 } from '../lib/recent-match.js';
 
@@ -63,6 +64,22 @@ test('最近配图按 session 隔离，覆盖时只保留该会话最后一张',
   assert.equal(readRecentRecord({ dataDir, sessionId: 'missing' }).length, 0);
 });
 
+test('删除图片时清理所有会话里的最近配图记录', async () => {
+  const dataDir = tempDir();
+  const root = tempDir();
+  const firstPath = sessionFile(root, 'one', 'sess_first');
+  const secondPath = sessionFile(root, 'two', 'sess_second');
+  await recordRecentMatch({ dataDir, ctx: { sessionPath: firstPath }, stickerId: 'stk_delete', description: '待删', emotion: '开心' });
+  await recordRecentMatch({ dataDir, ctx: { sessionPath: secondPath }, stickerId: 'stk_delete', description: '待删', emotion: '无语' });
+  await recordRecentMatch({ dataDir, ctx: { sessionPath: secondPath }, stickerId: 'stk_keep', description: '保留', emotion: '开心' });
+
+  const result = await removeStickerRecentMatches({ dataDir, stickerId: 'stk_delete' });
+  assert.equal(result.ok, true);
+  assert.equal(result.removed, 2);
+  assert.equal(readRecentRecord({ dataDir, sessionId: 'sess_first' }).length, 0);
+  assert.deepEqual(readRecentRecord({ dataDir, sessionId: 'sess_second' }).map((item) => item.stickerId), ['stk_keep']);
+});
+
 test('最近配图记录只公开允许字段，不写绝对路径，反馈状态可更新', async () => {
   const dataDir = tempDir();
   const root = tempDir();
@@ -111,9 +128,23 @@ test('最近配图记录只公开允许字段，不写绝对路径，反馈状�
   });
   assert.equal(updated.ok, true);
   assert.equal(updated.match.feedback, 'negative');
+  const positive = await updateRecentFeedback({
+    dataDir,
+    sessionId: 'sess_one',
+    stickerId: 'stk_001',
+    feedback: 'positive',
+    feedbackKind: 'context',
+    feedbackBase: { preference: null, context: { hadEntry: false, count: 0, contextEmotion: '开心', stickerId: 'stk_001' } },
+    expectedTs: current[0].ts,
+    expectedFeedback: 'negative',
+  });
+  assert.equal(positive.ok, true);
+  assert.equal(positive.match.feedback, 'positive');
+  assert.equal(positive.match.feedbackKind, 'context');
   const raw = fs.readFileSync(path.join(dataDir, 'recent-match.json'), 'utf8');
   assert.doesNotMatch(raw, new RegExp(root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
-  assert.equal(readRecentRecord({ dataDir, sessionId: 'sess_one' })[0].feedback, 'negative');
+  assert.equal(readRecentRecord({ dataDir, sessionId: 'sess_one' })[0].feedback, 'positive');
+  assert.equal(readRecentRecord({ dataDir, sessionId: 'sess_one' })[0].feedbackKind, 'context');
 });
 
 test('配图手帐：每会话保留多条记录，readRecentMatches 按时间倒序返回', async () => {

@@ -471,6 +471,80 @@ class BallLayoutTests(unittest.TestCase):
         ball.close()
         self.app.processEvents()
 
+    def test_recent_two_button_positive_feedback_kinds(self):
+        # v0.33.63 - 喜欢/应景两键：再点同维度=取消，跨维度=both，both 再点某维度=只剩另一维度
+        next_kind = ball_app.BallPanel._next_positive_kind
+        self.assertEqual(next_kind(None, None, "image"), "image")
+        self.assertEqual(next_kind("positive", "image", "image"), None)
+        self.assertEqual(next_kind("positive", "image", "context"), "both")
+        self.assertEqual(next_kind("positive", "context", "image"), "both")
+        self.assertEqual(next_kind("positive", "both", "image"), "context")
+        self.assertEqual(next_kind("positive", "both", "context"), "image")
+        self.assertEqual(next_kind("negative", None, "context"), "context")
+        self.assertEqual(next_kind(None, None, "context"), "context")
+
+    def test_recent_two_button_positive_state_sync(self):
+        ball = ball_app.Ball()
+        ball.panel.show()
+        base = {"ok": True, "sessionId": "sess_pos2", "sessionPath": "C:/agents/hanako/sessions/pos2.jsonl", "match": {
+            "stickerId": "stk_001", "description": "一张图", "emotion": "开心", "agentId": "hanako", "ts": 1,
+            "feedback": None, "feedbackKind": None, "imageData": b""
+        }}
+        ball.panel.apply_recent(base)
+        # 应景
+        ball.panel.recent_feedback_seq = 1
+        ball.panel.on_recent_feedback_done({"ok": True, "feedback": "positive", "feedback_kind": "context"}, 1)
+        self.assertEqual(ball.panel.recent_fit_button.text(), "已应景")
+        self.assertEqual(ball.panel.recent_like_button.text(), "喜欢")
+        # both（喜欢+应景都亮）
+        ball.panel.recent_feedback_seq = 2
+        ball.panel.on_recent_feedback_done({"ok": True, "feedback": "positive", "feedback_kind": "both"}, 2)
+        self.assertEqual(ball.panel.recent_fit_button.text(), "已应景")
+        self.assertEqual(ball.panel.recent_like_button.text(), "已喜欢")
+        # 取消（再点同维度=clear）
+        ball.panel.recent_feedback_seq = 3
+        ball.panel.on_recent_feedback_done({"ok": True, "feedback": None, "feedback_kind": None}, 3)
+        self.assertEqual(ball.panel.recent_fit_button.text(), "应景")
+        self.assertEqual(ball.panel.recent_like_button.text(), "喜欢")
+        # 不喜欢后聊一聊才出现
+        ball.panel.recent_feedback_seq = 4
+        ball.panel.on_recent_feedback_done({"ok": True, "feedback": "negative", "dislike_count": 1}, 4)
+        self.assertEqual(ball.panel.recent_dislike_button.text(), "已反馈")
+        self.assertTrue(ball.panel.recent_chat_button.isVisible())
+        ball.close()
+        self.app.processEvents()
+
+    def test_history_feedback_failure_reenables_row_buttons(self):
+        ball = ball_app.Ball()
+        ball.panel._add_history_row({
+            "sessionId": "sess_history_error",
+            "stickerId": "stk_001",
+            "description": "一张图",
+            "emotion": "开心",
+            "feedback": None,
+            "feedbackKind": None,
+            "imageData": b"",
+        })
+        row = ball.panel.history_list.itemAt(0).widget()
+        buttons = row.findChildren(QPushButton)
+        likes = [button for button in buttons if button.property("feedback") == "positive"]
+        dislike = next(button for button in buttons if button.property("feedback") == "negative")
+        chat = next(button for button in buttons if button.objectName() == "recentChat")
+        self.assertEqual(len(likes), 2)  # 喜欢 + 应景
+        state = {"feedback": None, "feedbackKind": None}
+        ball.panel.history_busy = True
+        for button in likes + [dislike, chat]:
+            button.setEnabled(False)
+        ball.panel._on_history_feedback_done(
+            {"ok": False, "error": "网络失败"},
+            ball.panel.history_feedback_seq,
+            likes[0], likes[1], dislike, chat, state,
+        )
+        for button in likes + [dislike]:
+            self.assertTrue(button.isEnabled())
+        ball.close()
+        self.app.processEvents()
+
     def test_recent_feedback_button_state_and_tail_arrival_on_match_change(self):
         ball = ball_app.Ball()
         base = {"ok": True, "sessionId": "sess_a", "sessionPath": "C:/agents/hanako/sessions/a.jsonl", "match": {
@@ -1217,6 +1291,26 @@ class BallLayoutTests(unittest.TestCase):
         for i in r['items']:
             self.assertEqual(i['imageData'], b'img-' + i['id'].encode())
 
+    def test_history_stale_response_does_not_replace_newer_result(self):
+        """手帐旧请求晚回时不能覆盖重新打开后拿到的新列表。"""
+        ball = ball_app.Ball()
+        try:
+            panel = ball.panel
+            panel.history_request_seq = 2
+            panel._render_history({"ok": True, "items": [
+                {"stickerId": "new", "sessionTitle": "刚刚的新记录", "imageData": b"", "feedback": None},
+            ]}, 2)
+            panel._render_history({"ok": True, "items": [
+                {"stickerId": "old", "sessionTitle": "打开前的旧记录", "imageData": b"", "feedback": None},
+            ]}, 1)
+            self.assertEqual(panel.history_list.count(), 1)
+            labels = [label.text() for label in panel.history_list.itemAt(0).widget().findChildren(QLabel)]
+            self.assertIn("刚刚的新记录", labels)
+            self.assertNotIn("打开前的旧记录", labels)
+        finally:
+            ball.close()
+            self.app.processEvents()
+
     def test_history_panel_button_and_switch(self):
         """配图手帐：入口按钮存在，打开/关闭在图集与手帐间切换，记录行可渲染。"""
         ball = ball_app.Ball()
@@ -1239,8 +1333,8 @@ class BallLayoutTests(unittest.TestCase):
             self.assertNotIn("开心", labels, "手帐不再显示情绪标签")
             self.assertEqual(
                 [button.text() for button in row.findChildren(QPushButton)],
-                ["喜欢", "不喜欢", "和小花聊聊"],
-                "手帐按钮应和旧版反馈入口保持一致",
+                ["喜欢", "应景", "不喜欢", "和小花聊聊"],
+                "手帐按钮应为：喜欢/应景/不喜欢/聊一聊",
             )
             thumb = row.findChildren(QLabel)[0]
             panel._set_history_compact(True)

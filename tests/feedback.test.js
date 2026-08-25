@@ -114,6 +114,74 @@ test('撤销当前反馈不会抹掉同一 mapping 下其他图片的偏好', as
   assert.deepEqual(mapping.dislike_counts, {});
 });
 
+test('mapping 创建者撤销时，只撤回自己的图片，不抹掉后来复用 mapping 的偏好', async () => {
+  const dataDir = prepareDataDir();
+  const first = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_001',
+    feedbackType: 'positive',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+  });
+  const second = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_002',
+    feedbackType: 'positive',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+  });
+
+  const clearedFirst = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_001',
+    feedbackType: 'clear',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+    restoreSnapshot: first.snapshot,
+  });
+  assert.equal(clearedFirst.ok, true);
+  let mappings = readPrefs(dataDir).users.hanako.mappings;
+  assert.equal(mappings.length, 1);
+  assert.deepEqual(mappings[0].preferred_ids, ['stk_002']);
+
+  const clearedSecond = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_002',
+    feedbackType: 'clear',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+    restoreSnapshot: second.snapshot,
+  });
+  assert.equal(clearedSecond.ok, true);
+  mappings = readPrefs(dataDir).users.hanako.mappings;
+  assert.deepEqual(mappings, [], '两个反馈都撤销后不应留下空 mapping');
+});
+
+test('旧反馈对应的 mapping 被后续操作移除时，撤销返回可见冲突而非静默成功', async () => {
+  const dataDir = prepareDataDir();
+  const positive = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_001',
+    feedbackType: 'positive',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+  });
+  const prefs = readPrefs(dataDir);
+  prefs.users.hanako.mappings = [];
+  fs.writeFileSync(path.join(dataDir, 'preferences.json'), JSON.stringify(prefs), 'utf8');
+
+  const cleared = await applyPreferenceFeedback({
+    dataDir,
+    stickerId: 'stk_001',
+    feedbackType: 'clear',
+    agentId: 'hanako',
+    contextEmotion: '开心',
+    restoreSnapshot: positive.snapshot,
+  });
+  assert.equal(cleared.ok, false);
+  assert.equal(cleared.status, 409);
+});
+
 test('公共反馈逻辑按助手和情绪隔离，并拒绝不存在的图片', async () => {
   const dataDir = prepareDataDir();
   const first = await applyPreferenceFeedback({

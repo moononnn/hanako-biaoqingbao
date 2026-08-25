@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QMenu,
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
@@ -1460,6 +1461,8 @@ class BallPanel(QFrame):
         # v0.33.48 - 配图手帐：独立忙碌/序号，不跟最近配图互锁
         self.history_busy = False
         self.history_feedback_seq = 0
+        # 手帐读取走后台线程；独立代次防旧请求晚回时覆盖新列表
+        self.history_request_seq = 0
         self.history_thumbs = []
         self.recent_timer = QTimer(self)
         self.recent_timer.setInterval(RECENT_POLL_MS)
@@ -1514,6 +1517,9 @@ class BallPanel(QFrame):
             "QPushButton#recentChat { min-height:26px; padding:0 8px; color:#a05e72; background:#fff7f9; border:1px solid #e8b7c8; border-radius:9px; font-family:'Microsoft YaHei UI'; font-size:11px; }"
             "QPushButton#recentChat:hover { background:#fdf0f4; border-color:#e89bb0; }"
             "QPushButton#recentFeedback:disabled, QPushButton#recentChat:disabled { color:#aabbb2; background:#f1f5f2; border-color:#d7e5dc; }"
+            "QMenu#positiveFeedbackMenu { background:#fffdf7; border:1px solid #d7e5dc; border-radius:10px; padding:5px; }"
+            "QMenu#positiveFeedbackMenu::item { color:#46574f; background:transparent; padding:7px 14px; border-radius:7px; font-family:'Microsoft YaHei UI'; font-size:11px; }"
+            "QMenu#positiveFeedbackMenu::item:selected { color:#437a65; background:#eef8f2; }"
             "QFrame#chatPanel { background:#f8fcf9; border:1px solid #d7e5dc; border-radius:13px; }"
             "QFrame#historyPanel { background:transparent; border:none; }"
             "QLabel#historyEmpty { color:#84978d; font-family:'Microsoft YaHei UI'; font-size:11px; padding:28px 0; }"
@@ -1679,7 +1685,12 @@ class BallPanel(QFrame):
         self.recent_like_button = QPushButton("喜欢", self.recent_button_host)
         self.recent_like_button.setObjectName("recentFeedback")
         self.recent_like_button.setProperty("feedback", "positive")
-        self.recent_like_button.clicked.connect(lambda: self.feedback_recent("positive"))
+        # v0.33.63 - 正反馈拆两键：喜欢（图本身）/ 应景（这次配得贴），不再弹下拉
+        self.recent_like_button.clicked.connect(lambda: self.feedback_recent("positive", "image"))
+        self.recent_fit_button = QPushButton("应景", self.recent_button_host)
+        self.recent_fit_button.setObjectName("recentFeedback")
+        self.recent_fit_button.setProperty("feedback", "positive")
+        self.recent_fit_button.clicked.connect(lambda: self.feedback_recent("positive", "context"))
         self.recent_dislike_button = QPushButton("不喜欢", self.recent_button_host)
         self.recent_dislike_button.setObjectName("recentFeedback")
         self.recent_dislike_button.setProperty("feedback", "negative")
@@ -1687,7 +1698,7 @@ class BallPanel(QFrame):
         self.recent_chat_button = QPushButton("和小花聊一聊", self.recent_button_host)
         self.recent_chat_button.setObjectName("recentChat")
         self.recent_chat_button.clicked.connect(self.open_recent_chat)
-        self.recent_buttons = [self.recent_like_button, self.recent_dislike_button, self.recent_chat_button]
+        self.recent_buttons = [self.recent_like_button, self.recent_fit_button, self.recent_dislike_button, self.recent_chat_button]
         info.addWidget(self.recent_button_host)
         root.addLayout(info, 1)
         self.recent_card.hide()
@@ -1752,6 +1763,8 @@ class BallPanel(QFrame):
         self.move_to_ball()
 
     def _load_history(self):
+        self.history_request_seq += 1
+        request_seq = self.history_request_seq
         self.history_thumbs.clear()
         while self.history_list.count():
             item = self.history_list.takeAt(0)
@@ -1763,7 +1776,7 @@ class BallPanel(QFrame):
         self.history_empty.show()
         worker = BackgroundRequest(self._fetch_history, self, "biaoqingbao-history")
         self.workers.append(worker)
-        worker.done.connect(self._render_history)
+        worker.done.connect(lambda result, seq=request_seq: self._render_history(result, seq))
         worker.finished.connect(lambda: self.workers.remove(worker) if worker in self.workers else None)
         worker.start()
 
@@ -1782,7 +1795,9 @@ class BallPanel(QFrame):
             items = list(ex.map(_load, matches))
         return {"ok": True, "items": items}
 
-    def _render_history(self, result):
+    def _render_history(self, result, request_seq=None):
+        if request_seq is not None and request_seq != self.history_request_seq:
+            return
         if not result.get("ok"):
             self.history_empty.setText(str(result.get("error") or "读取失败，再试一下"))
             self.history_empty.show()
@@ -1834,6 +1849,11 @@ class BallPanel(QFrame):
         like_btn.setObjectName("recentFeedback")
         like_btn.setProperty("feedback", "positive")
         like_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        # v0.33.63 - 正反馈拆两键：喜欢（图本身）/ 应景（这次配得贴）
+        fit_btn = QPushButton("应景")
+        fit_btn.setObjectName("recentFeedback")
+        fit_btn.setProperty("feedback", "positive")
+        fit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         dislike_btn = QPushButton("不喜欢")
         dislike_btn.setObjectName("recentFeedback")
         dislike_btn.setProperty("feedback", "negative")
@@ -1842,10 +1862,12 @@ class BallPanel(QFrame):
         chat_btn.setObjectName("recentChat")
         chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         buttons.addWidget(like_btn, 0, 0)
-        buttons.addWidget(dislike_btn, 0, 1)
-        buttons.addWidget(chat_btn, 1, 0, 1, 2)
+        buttons.addWidget(fit_btn, 0, 1)
+        buttons.addWidget(dislike_btn, 0, 2)
+        buttons.addWidget(chat_btn, 1, 0, 1, 3)
         buttons.setColumnStretch(0, 1)
         buttons.setColumnStretch(1, 1)
+        buttons.setColumnStretch(2, 1)
         info.addLayout(buttons)
         lay.addLayout(info, 1)
 
@@ -1854,10 +1876,12 @@ class BallPanel(QFrame):
             "stickerId": m.get("stickerId") or "",
             "ts": m.get("ts") or 0,
             "feedback": m.get("feedback") or None,
+            "feedbackKind": m.get("feedbackKind") or None,
         }
-        self._sync_history_buttons(like_btn, dislike_btn, state["feedback"])
-        like_btn.clicked.connect(lambda checked=False, b=like_btn, d=dislike_btn, s=state: self._toggle_history_feedback(b, d, s, "positive"))
-        dislike_btn.clicked.connect(lambda checked=False, b=like_btn, d=dislike_btn, s=state: self._toggle_history_feedback(b, d, s, "negative"))
+        self._sync_history_buttons(like_btn, fit_btn, dislike_btn, chat_btn, state["feedback"], state["feedbackKind"])
+        like_btn.clicked.connect(lambda checked=False, b=like_btn, f=fit_btn, d=dislike_btn, c=chat_btn, s=state: self._toggle_history_feedback(b, f, d, c, s, "positive", "image"))
+        fit_btn.clicked.connect(lambda checked=False, b=like_btn, f=fit_btn, d=dislike_btn, c=chat_btn, s=state: self._toggle_history_feedback(b, f, d, c, s, "positive", "context"))
+        dislike_btn.clicked.connect(lambda checked=False, b=like_btn, f=fit_btn, d=dislike_btn, c=chat_btn, s=state: self._toggle_history_feedback(b, f, d, c, s, "negative"))
         chat_btn.clicked.connect(lambda checked=False, m=m: self.open_chat_for(m.get("stickerId"), m.get("imageData")))
         self.history_list.addWidget(row)
 
@@ -1866,22 +1890,50 @@ class BallPanel(QFrame):
         for thumb in self.history_thumbs:
             thumb.setVisible(not compact)
 
-    def _sync_history_buttons(self, like_btn, dislike_btn, feedback):
-        for btn, kind in ((like_btn, "positive"), (dislike_btn, "negative")):
-            btn.setProperty("active", "true" if feedback == kind else "false")
-            btn.setEnabled(True)
+    def _sync_history_buttons(self, like_btn, fit_btn, dislike_btn, chat_btn, feedback, feedback_kind=None):
+        # v0.33.63 - 三键独立状态：喜欢=image、应景=context，两个都点=both；聊一聊只在点过不喜欢后出现
+        like_active = feedback == "positive" and feedback_kind in ("image", "both")
+        fit_active = feedback == "positive" and feedback_kind in ("context", "both")
+        dislike_active = feedback == "negative"
+        like_btn.setProperty("active", "true" if like_active else "false")
+        like_btn.setText("已喜欢" if like_active else "喜欢")
+        fit_btn.setProperty("active", "true" if fit_active else "false")
+        fit_btn.setText("已应景" if fit_active else "应景")
+        dislike_btn.setProperty("active", "true" if dislike_active else "false")
+        dislike_btn.setText("已反馈" if dislike_active else "不喜欢")
+        for btn in (like_btn, fit_btn, dislike_btn):
+            btn.setEnabled(not self.history_busy)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+        if chat_btn is not None:
+            chat_btn.setVisible(dislike_active)
+            chat_btn.setEnabled(not self.history_busy)
 
-    def _toggle_history_feedback(self, like_btn, dislike_btn, state, kind):
+    def _toggle_history_feedback(self, like_btn, fit_btn, dislike_btn, chat_btn, state, kind, feedback_kind=None):
         if self.history_busy:
             return
         current = state.get("feedback")
-        feedback = "clear" if current == kind else kind
+        current_kind = state.get("feedbackKind")
+        if kind == "positive":
+            next_kind = self._next_positive_kind(current, current_kind, feedback_kind)
+            if next_kind is None:
+                feedback = "clear"
+                feedback_kind = None
+            else:
+                feedback = "positive"
+                feedback_kind = next_kind
+        elif kind == "negative":
+            feedback = "clear" if current == "negative" else "negative"
+            feedback_kind = None
+        else:
+            feedback = "clear"
+            feedback_kind = None
         self.history_busy = True
+        self._sync_history_buttons(like_btn, fit_btn, dislike_btn, chat_btn, state.get("feedback"), state.get("feedbackKind"))
         payload = {
             "stickerId": state["stickerId"],
             "feedback": feedback,
+            "feedbackKind": feedback_kind,
             "sessionId": state["sessionId"],
             "expectedTs": state["ts"],
         }
@@ -1889,20 +1941,22 @@ class BallPanel(QFrame):
         self.history_feedback_seq = seq
         worker = BackgroundRequest(lambda: request_json("POST", "/feedback", payload, timeout=12), self, "biaoqingbao-history-feedback")
         self.workers.append(worker)
-        worker.done.connect(lambda result, s=seq: self._on_history_feedback_done(result, s, like_btn, dislike_btn, state))
+        worker.done.connect(lambda result, s=seq: self._on_history_feedback_done(result, s, like_btn, fit_btn, dislike_btn, chat_btn, state))
         worker.finished.connect(lambda: self.workers.remove(worker) if worker in self.workers else None)
         worker.start()
 
-    def _on_history_feedback_done(self, result, seq, like_btn, dislike_btn, state):
+    def _on_history_feedback_done(self, result, seq, like_btn, fit_btn, dislike_btn, chat_btn, state):
         if seq != self.history_feedback_seq:
             return
         self.history_busy = False
         if result and result.get("ok"):
             state["feedback"] = result.get("feedback") or None
-            self._sync_history_buttons(like_btn, dislike_btn, state["feedback"])
+            state["feedbackKind"] = result.get("feedback_kind") or None
+            self._sync_history_buttons(like_btn, fit_btn, dislike_btn, chat_btn, state["feedback"], state["feedbackKind"])
         else:
             self.history_empty.setText("反馈失败：" + str((result or {}).get("error") or "再试一下"))
             self.history_empty.show()
+            self._sync_history_buttons(like_btn, fit_btn, dislike_btn, chat_btn, state.get("feedback"), state.get("feedbackKind"))
 
     # ── 聊天（配图手帐/最近配图共用） ──
     def open_chat_for(self, sticker_id, image_data=None, pixmap=None):
@@ -1938,18 +1992,20 @@ class BallPanel(QFrame):
         while self.recent_button_layout.count():
             self.recent_button_layout.takeAt(0)
         compact = self.width() < 230
-        narrow = self.width() < 278
+        # v0.33.63 - 聊一聊只在点过不喜欢的这条配图上出现（不露面就不占位）
+        chat_visible = self.recent_chat_button.isVisible()
         if compact:
             self.recent_button_layout.addWidget(self.recent_like_button, 0, 0, 1, 2)
-            self.recent_button_layout.addWidget(self.recent_dislike_button, 1, 0, 1, 2)
-            self.recent_button_layout.addWidget(self.recent_chat_button, 2, 0, 1, 2)
+            self.recent_button_layout.addWidget(self.recent_fit_button, 1, 0, 1, 2)
+            self.recent_button_layout.addWidget(self.recent_dislike_button, 2, 0, 1, 2)
+            if chat_visible:
+                self.recent_button_layout.addWidget(self.recent_chat_button, 3, 0, 1, 2)
         else:
             self.recent_button_layout.addWidget(self.recent_like_button, 0, 0)
-            self.recent_button_layout.addWidget(self.recent_dislike_button, 0, 1)
-            if narrow:
-                self.recent_button_layout.addWidget(self.recent_chat_button, 1, 0, 1, 2)
-            else:
-                self.recent_button_layout.addWidget(self.recent_chat_button, 0, 2)
+            self.recent_button_layout.addWidget(self.recent_fit_button, 0, 1)
+            self.recent_button_layout.addWidget(self.recent_dislike_button, 0, 2)
+            if chat_visible:
+                self.recent_button_layout.addWidget(self.recent_chat_button, 1, 0, 1, 3)
         for column in range(3):
             self.recent_button_layout.setColumnStretch(column, 1)
 
@@ -2233,26 +2289,60 @@ class BallPanel(QFrame):
             self.close_chat()
         self.move_to_ball()
 
+    @staticmethod
+    def _next_positive_kind(current, current_kind, tapped):
+        """喜欢/应景两键：再点同维度 = 取消；点另一维度 = 叠成 both；both 再点某维度 = 只剩另一维度。"""
+        if current != "positive":
+            return tapped
+        if current_kind == tapped:
+            return None  # 取消这次反馈
+        if current_kind == "both":
+            return "context" if tapped == "image" else "image"
+        return "both"
+
     def update_recent_feedback_buttons(self):
         current = self.recent_match.get("feedback") if self.recent_match else None
-        for button, kind, label in (
-            (self.recent_like_button, "positive", "喜欢"),
-            (self.recent_dislike_button, "negative", "不喜欢"),
+        current_kind = self.recent_match.get("feedbackKind") if self.recent_match else None
+        like_active = current == "positive" and current_kind in ("image", "both")
+        fit_active = current == "positive" and current_kind in ("context", "both")
+        dislike_active = current == "negative"
+        for button, active, normal_text, active_text in (
+            (self.recent_like_button, like_active, "喜欢", "已喜欢"),
+            (self.recent_fit_button, fit_active, "应景", "已应景"),
+            (self.recent_dislike_button, dislike_active, "不喜欢", "已反馈"),
         ):
-            active = current == kind
             button.setProperty("active", "true" if active else "false")
-            button.setText("已反馈" if active else label)
+            button.setText(active_text if active else normal_text)
             button.setEnabled(not self.recent_busy)
             button.style().unpolish(button)
             button.style().polish(button)
             button.update()
+        # v0.33.63 - 聊一聊只在点过不喜欢后出现
+        self.recent_chat_button.setVisible(dislike_active)
         self.recent_chat_button.setEnabled(not self.chat_busy and not self.recent_busy)
+        self._layout_recent_buttons()
 
-    def feedback_recent(self, feedback_type):
+    def feedback_recent(self, feedback_type, feedback_kind=None):
         if not self.recent_match or self.recent_busy:
             return
         current = self.recent_match.get("feedback")
-        feedback = "clear" if current == feedback_type else feedback_type
+        current_kind = self.recent_match.get("feedbackKind")
+        if feedback_type == "positive":
+            if feedback_kind not in ("image", "context"):
+                return
+            next_kind = self._next_positive_kind(current, current_kind, feedback_kind)
+            if next_kind is None:
+                feedback = "clear"
+                feedback_kind = None
+            else:
+                feedback = "positive"
+                feedback_kind = next_kind
+        elif feedback_type == "clear":
+            feedback = "clear"
+            feedback_kind = None
+        else:
+            feedback = "clear" if current == "negative" else "negative"
+            feedback_kind = None
         self.recent_busy = True
         self.recent_feedback_seq += 1
         seq = self.recent_feedback_seq
@@ -2260,6 +2350,7 @@ class BallPanel(QFrame):
         payload = {
             "stickerId": self.recent_match.get("stickerId") or "",
             "feedback": feedback,
+            "feedbackKind": feedback_kind,
             "sessionPath": self.ball.target_session_path or "",
             "agentId": self.recent_match.get("agentId") or "",
         }
@@ -2280,10 +2371,16 @@ class BallPanel(QFrame):
         if result.get("ok"):
             if self.recent_match:
                 self.recent_match["feedback"] = result.get("feedback")
+                self.recent_match["feedbackKind"] = result.get("feedback_kind")
             if result.get("feedback") is None:
                 self.hint.setText("已撤销这次反馈")
             elif result.get("feedback") == "positive":
-                self.hint.setText("已记下喜欢，会更懂你的偏好")
+                kind = result.get("feedback_kind")
+                self.hint.setText({
+                    "image": "已记下喜欢这张图",
+                    "context": "已记下这次很应景",
+                    "both": "已记下喜欢这张图，也很应景",
+                }.get(kind, "已记下喜欢这张图"))
             else:
                 count = result.get("dislike_count") or 1
                 self.hint.setText(f"已记下不喜欢（累计 {count} 次）")
