@@ -17,6 +17,7 @@ import {
   readEmbeddingConfig, writeEmbeddingConfig, resolveEmbeddingApi,
   generateEmbeddings, readVectors, writeVectors,
   readTextConfig, writeTextConfig,
+  isRetriableTextCallError,
   readAgentFreq as readAgentFreqConfig, writeAgentFreq as writeAgentFreqConfig,
   json, atomicWriteJson,
   readUserName,
@@ -31,6 +32,9 @@ import {
 import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
 import { applyPreferenceFeedback, mutatePreferences } from '../lib/feedback.js';
+import { removeStickerExposure } from '../lib/exposure.js';
+import { removeStickerContextFeedback, readContextFeedback, removeContextFitEntry, applyContextFit } from '../lib/context-feedback.js';
+import { removeStickerRecentMatches } from '../lib/recent-match.js';
 import {
   startBall, stopBall, getBallState, checkBallDeps, readBallConfig, setBallPinned,
   getRecentBallMatch, submitBallFeedback, consumeBallDismissed,
@@ -322,6 +326,10 @@ export default async function registerRoutes(app, ctx) {
       } catch {}
       // v0.26.0 - 同步清理该图的教学样本（删图后不再参与后续识别参考）
       try { removeTeachingSample(id); } catch {}
+      // v0.33.53 - 删除图片时同步清理曝光账本与场景正反馈，避免留下孤儿统计。
+      try { await removeStickerExposure({ dataDir: DATA_DIR, stickerId: id }); } catch {}
+      try { await removeStickerContextFeedback({ dataDir: DATA_DIR, stickerId: id }); } catch {}
+      try { await removeStickerRecentMatches({ dataDir: DATA_DIR, stickerId: id }); } catch {}
 
       const msg = cleanedRefs > 0 ? `已删除（清理了 ${cleanedRefs} 条偏好引用）` : '已删除';
       return json({ ok: true, message: msg, cleanedReferences: cleanedRefs });
@@ -788,19 +796,41 @@ export default async function registerRoutes(app, ctx) {
         if (!cfg.providerId || !cfg.modelId) {
           return json({ ok: false, error: '未配置 Hana 模型', fallback: true }, 200);
         }
-        const result = await ctx.bus.request('utility:call-text', {
-          messages: [
-            { role: 'system', content: usePrompt },
-            { role: 'user', content: `最近的对话：\n${toAnalyze}` }
-          ],
-          providerId: cfg.providerId,
-          modelId: cfg.modelId,
-          maxTokens: 250,
-          temperature: 0.3,
-          operation: 'biaoqingbao-text-analysis'
-        }, { timeoutMs: 15000 });
+        // v0.33.73 - 兜底重试：思考型模型（如 MiniMax-M3）可能只吐思考不吐正文，
+        // 宿主抛「模型未回复正文」（EMPTY_AFTER_THINKING，输出契约）；
+        // 或长上下文 15s 超时。这类概率性失败重试一次，第二次大概率拿到正文。
+        let analysisErr = null;
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const result = await ctx.bus.request('utility:call-text', {
+              messages: [
+                { role: 'system', content: usePrompt },
+                { role: 'user', content: `最近的对话：\n${toAnalyze}` }
+              ],
+              providerId: cfg.providerId,
+              modelId: cfg.modelId,
+              // v0.33.73 - 250→800：思考型模型会把输出配额花在思考上，250 上限下正文只剩 1 token，
+              // 宿主剥掉思考后报「模型未回复正文」（实测 outputTokens=1）；800 与聊标签一致，思考+正文都住得下
+              maxTokens: 800,
+              temperature: 0.3,
+              operation: 'biaoqingbao-text-analysis'
+            }, { timeoutMs: 15000 });
 
-        analysisText = typeof result === 'string' ? result : (result.text || result.content || JSON.stringify(result));
+            // result 无 text/content（如只剩思考字段或空对象）按空正文处理，也算可重试
+            analysisText = typeof result === 'string' ? result : (result.text || result.content || '');
+            if (analysisText && analysisText.trim()) {
+              analysisErr = null;
+              break;
+            }
+            analysisErr = new Error('模型返回空正文（仅思考）');
+          } catch (e) {
+            analysisErr = e;
+            if (!isRetriableTextCallError(e)) break;
+          }
+        }
+        if (analysisErr) {
+          return json({ ok: false, error: analysisErr.message || '模型调用失败', fallback: true }, 200);
+        }
       } else if (cfg.source === 'custom') {
         if (!cfg.customBaseUrl || !cfg.customApiKey || !cfg.customModel) {
           return json({ ok: false, error: '未配置自定义模型', fallback: true }, 200);
@@ -900,12 +930,24 @@ export default async function registerRoutes(app, ctx) {
   });
 
   // ═══ POST /api/preferences/correct — 纠正偏好 ═══
+  // v0.33.63 - feedback_type 支持 context（记一次“这次很应景”）/ context_clear（撤销这次应景）
   app.post('/api/preferences/correct', async (c) => {
     try {
       const body = await c.req.json();
       const { agent, sticker_id, context_emotion, context_keywords, feedback_type } = body || {};
       if (!sticker_id || !feedback_type) {
         return json({ ok: false, error: '缺少必要参数' }, 400);
+      }
+      if (feedback_type === 'context' || feedback_type === 'context_clear') {
+        const result = await applyContextFit({
+          dataDir: DATA_DIR,
+          stickerId: sticker_id,
+          agentId: agent || 'default',
+          contextEmotion: context_emotion || '',
+          action: feedback_type === 'context' ? 'add' : 'clear',
+        });
+        if (!result.ok) return json({ ok: false, error: result.error }, result.status || 400);
+        return json({ ok: true, message: feedback_type === 'context' ? '偏好已更新' : '已取消这次应景', count: result.count });
       }
       const result = await applyPreferenceFeedback({
         dataDir: DATA_DIR,
@@ -1013,7 +1055,48 @@ export default async function registerRoutes(app, ctx) {
       if (cleanedPrefs > 0 || cleanedMappings > 0) {
         atomicWriteJson(prefsFile, prefs);
       }
-      return json({ ok: true, cleanedReferences: cleanedPrefs, cleanedMappings, message: `已清理 ${cleanedPrefs} 条引用、${cleanedMappings} 条空映射` });
+      // v0.33.63 - 应景账本里已删除表情包的引用一并清理
+      let cleanedContext = 0;
+      try {
+        const ctxFile = path.join(DATA_DIR, 'context-feedback.json');
+        const ctxData = JSON.parse(fs.readFileSync(ctxFile, 'utf-8'));
+        for (const agentBuckets of Object.values(ctxData?.byAgent || {})) {
+          if (!agentBuckets || typeof agentBuckets !== 'object') continue;
+          for (const bucket of Object.values(agentBuckets)) {
+            if (!bucket || typeof bucket !== 'object') continue;
+            for (const k of Object.keys(bucket)) {
+              if (!validIds.has(k)) {
+                delete bucket[k];
+                cleanedContext += 1;
+              }
+            }
+          }
+        }
+        if (cleanedContext > 0) atomicWriteJson(ctxFile, ctxData);
+      } catch {}
+      return json({ ok: true, cleanedReferences: cleanedPrefs, cleanedMappings, cleanedContext, message: `已清理 ${cleanedPrefs} 条引用、${cleanedMappings} 条空映射` });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ═══ GET /api/context-feedback — 读取应景账本（“这次很应景”记录，管理页展示） ═══
+  // v0.33.63 - 结构：byAgent[agentId][contextEmotion][stickerId] = { count, lastAt }
+  app.get('/api/context-feedback', (c) => {
+    return json({ ok: true, data: readContextFeedback({ dataDir: DATA_DIR }) });
+  });
+
+  // ═══ POST /api/context-feedback/remove — 删除单条应景记录（管理页手动移除） ═══
+  app.post('/api/context-feedback/remove', async (c) => {
+    try {
+      const body = await c.req.json();
+      const result = await removeContextFitEntry({
+        dataDir: DATA_DIR,
+        agentId: body?.agentId || 'default',
+        contextEmotion: body?.contextEmotion ?? body?.context ?? '',
+        stickerId: body?.stickerId,
+      });
+      return json(result, result.ok ? 200 : (result.status || 400));
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
