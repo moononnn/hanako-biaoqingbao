@@ -9,14 +9,17 @@ import {
 import { recoverInterruptedItems } from '../routes/_batch-tasks.js';
 import {
   scoreStickers,
+  selectPreferenceMappings,
   applyVectorBonus,
   buildStickerCard,
+  primaryEmotionOf,
   buildStickerMediaDetails,
   buildStickerDeliveryDetails,
   supportsNativeMediaDetails,
+  isMediaOnlyHost,
   trySendDeferredImage,
 } from '../tools/express.js';
-import { collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT } from '../lib/shared.js';
+import { backfillTaggedAtEntries, collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT } from '../lib/shared.js';
 import { KNOWN_CONFUSABLES, buildConfusableSection } from '../lib/known-confusables.js';
 
 function seededRandom(seed = 1) {
@@ -44,12 +47,12 @@ test('deferred 原生图片块：成功时注册为 ui-only image task 并返回
     file: { fileId: 'sf_1', filePath: 'C:/stickers/a.jpg', kind: 'image', mime: 'image/jpeg', storageKind: 'plugin_data', status: 'available' },
     mediaItem: { type: 'session_file', fileId: 'sf_1', filePath: 'C:/stickers/a.jpg', kind: 'image' },
   };
-  const result = await trySendDeferredImage(ctx, staged);
+  // v0.33.64 - resolve 延迟到占位块挂载后：短延迟 + 等待断言
+  const result = await trySendDeferredImage(ctx, staged, { resolveDelayMs: 20 });
   assert.equal(result.ok, true);
   assert.match(result.taskId, /^bqbq-/);
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1, 'register 同步完成，resolve 延迟执行');
   assert.equal(calls[0].type, 'deferred:register');
-  assert.equal(calls[0].payload.taskId, calls[1].payload.taskId);
   assert.equal(calls[0].payload.taskId, result.taskId);
   assert.equal(calls[0].payload.sessionPath, 'C:/sessions/test.jsonl');
   assert.equal(calls[0].payload.meta.type, 'image-generation');
@@ -57,7 +60,10 @@ test('deferred 原生图片块：成功时注册为 ui-only image task 并返回
   assert.equal(calls[0].payload.meta.toolName, 'biaoqingbao');
   assert.equal(calls[0].payload.meta.deliveryIntent, 'ui_only');
   assert.equal(calls[0].payload.meta.triggerParentTurn, false);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(calls.length, 2, '延迟后应执行 resolve');
   assert.equal(calls[1].type, 'deferred:resolve');
+  assert.equal(calls[1].payload.taskId, result.taskId);
   assert.deepEqual(calls[1].payload.result.sessionFiles, [staged.file]);
 });
 
@@ -75,10 +81,11 @@ test('deferred 原生图片块：bus 请求失败时返回 false 供降级', asy
   assert.equal((await trySendDeferredImage(ctx, staged)).ok, false);
 });
 
-test('deferred 原生图片块：register/resolve 返回错误对象也降级（不误判假成功）', async () => {
+test('deferred 原生图片块：register/resolve 返回错误对象时处理', async () => {
   const staged = { file: { filePath: 'C:/stickers/a.jpg' } };
-  // register 返回 { ok: false }（旧宿主可能不抛错而返回错误对象）→ 必须降级
+  // register 返回 { ok: false }（旧宿主可能不抛错而返回错误对象）→ 必须降级，且不再延迟 resolve
   let registerCalled = 0;
+  let resolveCalled = 0;
   const ctxRegisterFail = {
     sessionPath: 'C:/sessions/test.jsonl',
     log: { debug() {}, warn() {} },
@@ -88,17 +95,22 @@ test('deferred 原生图片块：register/resolve 返回错误对象也降级（
           registerCalled += 1;
           return { ok: false, error: 'unknown bus type' };
         }
-        throw new Error('should not reach resolve');
+        resolveCalled += 1;
+        return { ok: true };
       },
     },
   };
-  assert.equal((await trySendDeferredImage(ctxRegisterFail, staged)).ok, false);
+  assert.equal((await trySendDeferredImage(ctxRegisterFail, staged, { resolveDelayMs: 5 })).ok, false);
   assert.equal(registerCalled, 1, 'register 失败后不应继续 resolve');
+  assert.equal(resolveCalled, 0, 'register 失败后不应触发延迟 resolve');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(resolveCalled, 0, '延迟窗口内也不应出现 resolve');
 
-  // resolve 返回 { ok: false } → 也降级
+  // v0.33.64 - resolve 失败改为后台异步：工具已返回成功（任务已注册），resolve 失败只记 warn，不再同步降级
+  const warns = [];
   const ctxResolveFail = {
     sessionPath: 'C:/sessions/test.jsonl',
-    log: { debug() {}, warn() {} },
+    log: { debug() {}, warn() { warns.push(arguments); } },
     bus: {
       async request(type) {
         if (type === 'deferred:register') return { ok: true };
@@ -107,7 +119,10 @@ test('deferred 原生图片块：register/resolve 返回错误对象也降级（
       },
     },
   };
-  assert.equal((await trySendDeferredImage(ctxResolveFail, staged)).ok, false);
+  const resolveFailResult = await trySendDeferredImage(ctxResolveFail, staged, { resolveDelayMs: 5 });
+  assert.equal(resolveFailResult.ok, true, 'register 成功即视为通道可用，resolve 异步执行');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.ok(warns.length > 0, 'resolve 失败应记 warn 日志');
 
   // register 返回 undefined（无返回值）→ 也降级
   const ctxNoReturn = {
@@ -165,6 +180,7 @@ test('表情包配图卡片显式给出高度比例，避免新宿主只显示�
     description: '鲸鱼娘少女睁大蓝色眼睛',
     score: 12.5,
     emotion: '开心',
+    primaryEmotion: '开心',
     agentId: 'hanako',
     sessionId: 'sess_test',
     sessionPath: 'C:/sessions/test.jsonl',
@@ -176,7 +192,19 @@ test('表情包配图卡片显式给出高度比例，避免新宿主只显示�
   assert.equal(card.aspectRatio, '400:430');
   assert.match(card.route, /id=stk_352/);
   assert.match(card.route, /emotion=%E5%BC%80%E5%BF%83/);
-  assert.equal(card.description, '表情包配图 · biaoqingbao');
+  assert.equal(card.title, '开心小表情来啦');
+  assert.equal(card.description, undefined);
+});
+
+test('表情包卡片标题优先取图片主情绪标签，缺失时回退当前情绪', () => {
+  assert.equal(primaryEmotionOf({ tags: { emotion: ['', '委屈', '开心'] } }), '委屈');
+  assert.equal(primaryEmotionOf({ tags: { emotion: ['这是一个过长的情绪标签'] } }), '');
+
+  const card = buildStickerCard({ id: 'stk_title', description: '测试', emotion: '开心', primaryEmotion: '委屈' });
+  assert.equal(card.title, '委屈小表情来啦');
+
+  const fallback = buildStickerCard({ id: 'stk_fallback', description: '测试', emotion: '开心' });
+  assert.equal(fallback.title, '开心小表情来啦');
 });
 
 test('新版 Hana 前端配图走 details.media，并从 stageFile 包装结果取出 session_file', () => {
@@ -213,6 +241,16 @@ test('表情包按 Hana 宿主版本分流：新版 media、旧版和未知版�
   assert.equal(supportsNativeMediaDetails('0.678.9'), false);
   assert.equal(supportsNativeMediaDetails('0.448.3'), false);
   assert.equal(supportsNativeMediaDetails(null), false);
+
+  // v0.33.65 - 0.686+ 宿主对插件 details.media 直接渲染且不生成插件占位块，必须走 media-only。
+  assert.equal(isMediaOnlyHost('0.686.15'), true);
+  assert.equal(isMediaOnlyHost('v0.686.0-beta'), true);
+  assert.equal(isMediaOnlyHost('0.687.0'), true);
+  assert.equal(isMediaOnlyHost('1.0.0'), true);
+  assert.equal(isMediaOnlyHost('0.685.9'), false);
+  assert.equal(isMediaOnlyHost('0.679.3'), false);
+  assert.equal(isMediaOnlyHost(null), false);
+  assert.equal(isMediaOnlyHost(undefined), false);
   assert.deepEqual(buildStickerDeliveryDetails(staged, cardOptions, '0.679.3'), {
     media: { items: [mediaItem] },
   });
@@ -224,19 +262,21 @@ test('表情包按 Hana 宿主版本分流：新版 media、旧版和未知版�
   });
 });
 
-test('配图卡片按图片实际尺寸动态定宽高比（小图小卡、大图按宿主上限截顶）', () => {
-  // 微小图（短边 100）：保持原尺寸不放大，高度按比例+按钮预留（BTN_RESERVE=64），宽度恒 400（宿主槽位基线）
-  assert.equal(buildStickerCard({ id: 'a', description: '小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: true }).aspectRatio, '400:164');
+test('配图卡片按图片实际尺寸动态定宽高比（v0.33.72：智能开一律放大填满 400）', () => {
+  // 微小图（短边 100）：智能开 → 放大填满 400，高度按比例+按钮预留（BTN_RESERVE=64）
+  assert.equal(buildStickerCard({ id: 'a', description: '小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: true }).aspectRatio, '400:464');
   // 横向小图 100x60
-  assert.equal(buildStickerCard({ id: 'a', description: '横向小图', score: 1, emotion: '开心', size: { width: 100, height: 60 }, smart: true }).aspectRatio, '400:124');
-  // 中等图 200px（v0.33.1 二分：<400 一律贴原图，不再放大到 280）
-  assert.equal(buildStickerCard({ id: 'a', description: '200图', score: 1, emotion: '开心', size: { width: 200, height: 200 }, smart: true }).aspectRatio, '400:264');
+  assert.equal(buildStickerCard({ id: 'a', description: '横向小图', score: 1, emotion: '开心', size: { width: 100, height: 60 }, smart: true }).aspectRatio, '400:304');
+  // 中等图 200px：同样放大填满
+  assert.equal(buildStickerCard({ id: 'a', description: '200图', score: 1, emotion: '开心', size: { width: 200, height: 200 }, smart: true }).aspectRatio, '400:464');
   // 中图 600px（短边 ≥400 → 填满 400，正方形图高度按 400 算）
   assert.equal(buildStickerCard({ id: 'a', description: '600图', score: 1, emotion: '开心', size: { width: 600, height: 600 }, smart: true }).aspectRatio, '400:464');
   // 大图 2000px（≥400 → 填满 400）
   assert.equal(buildStickerCard({ id: 'a', description: '大图', score: 1, emotion: '开心', size: { width: 2000, height: 2000 }, smart: true }).aspectRatio, '400:464');
   // 关闭智能：回退旧行为（短边≥200 按 400 放大填满）
   assert.equal(buildStickerCard({ id: 'a', description: '关智能', score: 1, emotion: '开心', size: { width: 400, height: 200 }, smart: false }).aspectRatio, '400:264');
+  // 关闭智能：极小图（短边<200）保持原尺寸比例（防糊）
+  assert.equal(buildStickerCard({ id: 'a', description: '关智能小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: false }).aspectRatio, '400:164');
   // 尺寸缺失/非法回退默认
   assert.equal(buildStickerCard({ id: 'a', description: '缺尺寸', score: 1, emotion: '开心' }).aspectRatio, '400:430');
   assert.equal(buildStickerCard({ id: 'a', description: '非法尺寸', score: 1, emotion: '开心', size: { width: -1, height: 0 } }).aspectRatio, '400:430');
@@ -248,6 +288,24 @@ test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {
   assert.ok(source.includes("type: 'ui.resize'"), '卡片页面必须发送 ui.resize（宿主可识别的尺寸事件名）');
   assert.ok(!source.includes("type: 'hana.ui.resize'"), '旧错误事件名 hana.ui.resize 必须移除，宿主不识别');
   assert.doesNotMatch(source, /type:\s*['\"]resize-request['\"]/);
+});
+
+test('新宿主（0.686+ 纯 card iframe）也必须按图片尺寸算 aspectRatio（回归：size 被旧分支条件挡住 → 恒回退 400:430 大白卡）', () => {
+  const source = fs.readFileSync(new URL('../tools/express.js', import.meta.url), 'utf8');
+  // size 必须无条件读取，不能再次被 `if (!deferredOk && !useNativeMedia)` 包住
+  const sizeAssign = 'let size = imageSizeFromBuffer(buffer);';
+  assert.ok(source.includes(sizeAssign), 'express 主流程必须无条件读取图片尺寸');
+  // 条件块内不能再有 size = imageSizeFromBuffer（即 size 读取必须在外层）
+  const condBlock = source.split('let size = imageSizeFromBuffer(buffer);')[1] || '';
+  assert.ok(!condBlock.startsWith('\n    if (!deferredOk'), 'size 读取不得重新退回旧分支条件内');
+  // 新宿主分支的 details 构造必须透传 size/smart（cardOptions 带 size 字段）
+  assert.ok(condBlock.includes('size,'), 'cardOptions 必须携带 size 传给 buildStickerCard');
+});
+
+test('sticker iframe 兼容 devkit 1.0 裸消息（回归：0.686+ 宿主只保证裸 { type: ready } 兼容，ui.resize 双发幂等）', () => {
+  const source = fs.readFileSync(new URL('../routes/ui.js', import.meta.url), 'utf8');
+  assert.ok(source.includes("window.parent.postMessage({ type: 'ready' }, '*')"), '必须补发裸 ready 握手消息');
+  assert.ok(source.includes("window.parent.postMessage({ type: 'ui.resize', payload: payload }, '*')"), '必须补发裸 ui.resize 消息');
 });
 
 test('标签打分遵守偏好、否决和排除名单', () => {
@@ -283,6 +341,54 @@ test('标签打分遵守偏好、否决和排除名单', () => {
     dislikes: {},
   });
   assert.deepEqual(excluded.map(item => item.id), ['a']);
+});
+
+test('极老根级偏好在新助手桶出现后仍参与选图，不静默失效', () => {
+  const legacy = {
+    context: { emotion: '开心', keywords: [] },
+    preferred_ids: ['legacy'],
+    vetoed_ids: [],
+    dislike_counts: {},
+  };
+  const current = {
+    context: { emotion: '开心', keywords: [] },
+    preferred_ids: ['current'],
+    vetoed_ids: [],
+    dislike_counts: {},
+  };
+  const mappings = selectPreferenceMappings({ mappings: [legacy], users: { hanako: { mappings: [current] } } }, 'hanako');
+  assert.deepEqual(mappings.map((mapping) => mapping.preferred_ids[0]), ['current', 'legacy']);
+});
+
+test('已有标签但缺少 tagged_at 的图片按 added_at 回填，空标签不误标记', () => {
+  const entries = [
+    { id: 'tagged', added_at: '2026-08-24T00:00:00.000Z', tags: { emotion: ['开心'], scene: [], keywords: [] } },
+    { id: 'semantic', added_at: '2026-08-24T01:00:00.000Z', semantic_description: '一只开心的小狗', tags: {} },
+    { id: 'empty', added_at: '2026-08-24T02:00:00.000Z', tags: { emotion: [], scene: [], keywords: [] } },
+    { id: 'existing', tagged_at: '2026-08-23T00:00:00.000Z', tags: { emotion: ['开心'] } },
+  ];
+  const result = backfillTaggedAtEntries(entries, '2026-08-24T03:00:00.000Z');
+  assert.equal(result.updated, 2);
+  assert.equal(result.entries[0].tagged_at, result.entries[0].added_at);
+  assert.equal(result.entries[1].tagged_at, result.entries[1].added_at);
+  assert.equal(result.entries[2].tagged_at, undefined);
+  assert.equal(result.entries[3].tagged_at, '2026-08-23T00:00:00.000Z');
+});
+
+test('场景正反馈只给当前情绪轻量加分，不等同于全局喜欢', () => {
+  const stickers = [
+    { id: 'fit', description: '一只猫', tags: { emotion: ['开心'] } },
+    { id: 'plain', description: '一只狗', tags: { emotion: ['开心'] } },
+  ];
+  const ranked = scoreStickers(stickers, '开心', [], {
+    preferred: [],
+    vetoed: [],
+    dislikes: {},
+    contextFits: { fit: 2 },
+  });
+  assert.equal(ranked[0].id, 'fit');
+  assert.equal(ranked[0]._score, 10);
+  assert.equal(ranked[1]._score, 8);
 });
 
 test('重启恢复会回收中断图片，并去重、避开已完成和已失败图片', () => {

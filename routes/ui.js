@@ -12,6 +12,7 @@ import {
   escapeHtml,
 } from '../lib/shared.js';
 import { AUTO_FIT_MAX } from '../lib/smart-fit.js';
+import { readContextFeedback } from '../lib/context-feedback.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, '..', 'assets');
@@ -47,6 +48,8 @@ function renderPage() {
   try { prefsData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'preferences.json'), 'utf-8')); } catch {}
   let logData = { version: 1, entries: [] };
   try { logData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'decision-log.json'), 'utf-8')); } catch {}
+  // v0.33.63 - 应景账本注入管理页，偏好区展示“这次很应景”记录
+  const contextFeedbackData = readContextFeedback({ dataDir: DATA_DIR });
   // v0.24.0 - 配图卡片显示配置（小图自适应开关）
   // v0.28.0 - 新增 showFeedbackButtons：聊天卡片下方喜欢/不喜欢按钮显示开关
   let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true };
@@ -918,6 +921,7 @@ function renderPage() {
     + '<script>window.__PREFERENCES__=' + JSON.stringify(prefsData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__DISPLAY_CONFIG__=' + JSON.stringify(displayCfg).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__DECISION_LOG__=' + JSON.stringify(logData).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__CONTEXT_FEEDBACK__=' + JSON.stringify(contextFeedbackData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_CONFIG__=' + JSON.stringify(safeEmbeddingConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_MODELS__=' + JSON.stringify(embeddingModels).replace(/</g, '\\u003c') + ';</script>'
     + '<script>' + js + '</script></body></html>';
@@ -994,7 +998,9 @@ export default async function registerRoutes(app, ctx) {
       }
     } catch {}
 
-    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold, fb: showFb }).replace(/</g, '\\u003c');
+    const sessionPath = c.req.query('sessionPath') || '';
+
+    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold, fb: showFb, sessionPath }).replace(/</g, '\\u003c');
 
     return c.html(`<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1037,6 +1043,8 @@ export default async function registerRoutes(app, ctx) {
     .fb-btn:hover { background: #e6f3ed; }
     .fb-btn.on-love { background: #5dae8e; border-color: #5dae8e; color: #fff; }
     .fb-btn.on-love:hover { background: #5dae8e; }
+    .fb-btn.on-fit { background: #e8b87a; border-color: #e8b87a; color: #fff; }
+    .fb-btn.on-fit:hover { background: #e8b87a; }
     .fb-btn.on-hate { background: #e89bb0; border-color: #e89bb0; color: #fff; }
     .fb-btn.on-hate:hover { background: #e89bb0; }
     .fb-toast {
@@ -1134,6 +1142,7 @@ export default async function registerRoutes(app, ctx) {
   <div class="img-card" id="img-card"><img src="${imgBase64}" alt="表情包" /></div>
   <div class="fb-card" id="fb-card"${showFb ? '' : ' hidden'}>
     <button class="fb-btn" id="fb-pos" type="button">喜欢</button>
+    <button class="fb-btn" id="fb-fit" type="button">应景</button>
     <button class="fb-btn" id="fb-neg" type="button">不喜欢</button>
     <span class="fb-toast" id="fb-toast"></span>
   </div>
@@ -1171,19 +1180,19 @@ export default async function registerRoutes(app, ctx) {
         kind: 'event',
         type: 'hana.ready'
       }, '*');
+      // v0.33.70 - devkit 1.0 宿主（0.686+）兼容裸原始握手 { type: 'ready' }；双发幂等，老宿主忽略未知格式
+      window.parent.postMessage({ type: 'ready' }, '*');
       var cfg = window.__STICKER__;
       var posBtn = document.getElementById('fb-pos');
+      var fitBtn = document.getElementById('fb-fit');
       var negBtn = document.getElementById('fb-neg');
       var toast = document.getElementById('fb-toast');
       var invite = document.getElementById('chat-invite');
       var chatPanel = document.getElementById('chat-panel');
       var pending = false;
-      var state = cfg.init || '';
       var toastTimer = null;
       // v0.25.0 - 不喜欢累计次数（多轮不喜欢 → 频率衰减）
       var dislikeCount = cfg.dislikes || 0;
-      var negMarked = false; // 本卡片内点过不喜欢（防同一张卡片重复累计）
-      var posMarked = false;
       // 聊天状态
       var chatMode = false;
       var chatSessionId = null;
@@ -1223,65 +1232,100 @@ export default async function registerRoutes(app, ctx) {
       function showInvite() { if (invite) invite.hidden = false; }
       function hideInvite() { if (invite) invite.hidden = true; }
 
-      // v0.27.2 - 每次出图重新选择：历史态度只提示、不预置按钮亮灯
-      // 之前预置亮灯让「喜欢」方向点了没有视觉变化（按钮本来亮着），用户感受不到重新表达；
-      // 现在初始两个按钮都是未选择状态，点了才算数，喜欢/不喜欢行为对称。
-      if (state === 'positive') { showToast('这张之前记过喜欢，可重新选择'); }
-      if (state === 'negative') {
+      // ── 新版反馈系统（v0.33.68，对齐纸飞机悬浮球） ──
+      // 三键：〔喜欢〕〔应景〕〔不喜欢〕；喜欢/应景可独立点、叠加成 both，再点同维度取消；
+      // 不喜欢独立一键，再点取消；「聊一聊」只在点过不喜后出现。
+      // 状态：null | positive(image) | positive(context) | positive(both) | negative
+      var fbCurrent = null;   // 当前反馈：null | 'positive' | 'negative'
+      var fbKind = 'image';   // 正反馈细分：'image' | 'context' | 'both'
+      var likeActive = false;
+      var fitActive = false;
+      var negActive = false;
+
+      // 初始：历史态度只提示、不预置亮灯（v0.27.2 延续）
+      if (cfg.init === 'positive') showToast('这张之前记过喜欢，可重新选择');
+      if (cfg.init === 'negative') {
         showToast(dislikeCount > 0 ? '这张之前点过 ' + dislikeCount + ' 次不喜欢，可重新选择' : '这张之前记过不喜欢，可重新选择');
       }
-      // v0.25.3 - 每次出图独立计算：marked 仅在用户本卡片内主动点过后才置 true。
-      posMarked = false;
-      negMarked = false;
-      function setState(type) {
-        state = type;
-        // v0.25.2 - 方向切换后重置另一方向的标记：同方向防重复累计，变心（切方向）允许重新表达
-        if (type === 'positive') { posMarked = true; negMarked = false; }
-        else { negMarked = true; posMarked = false; }
-        posBtn.classList.toggle('on-love', type === 'positive');
-        negBtn.classList.toggle('on-hate', type === 'negative');
+
+      // 同维度再点 = 取消；不同维度 = 叠成 both；both 再点某维度 = 只剩另一维度（对齐球端 _next_positive_kind）
+      function nextPositiveKind(tapped) {
+        if (fbCurrent !== 'positive') return tapped;
+        if (fbKind === tapped) return null;
+        if (fbKind === 'both') return tapped === 'image' ? 'context' : 'image';
+        return 'both';
       }
-      // v0.25.0 - 不再一票锁定：每次出现都能表达；同一张卡片内同方向只算一次
-      async function sendFb(type) {
+
+      function reflectButtons() {
+        likeActive = fbCurrent === 'positive' && (fbKind === 'image' || fbKind === 'both');
+        fitActive = fbCurrent === 'positive' && (fbKind === 'context' || fbKind === 'both');
+        negActive = fbCurrent === 'negative';
+        posBtn.classList.toggle('on-love', likeActive);
+        posBtn.textContent = likeActive ? '已喜欢' : '喜欢';
+        fitBtn.classList.toggle('on-fit', fitActive);
+        fitBtn.textContent = fitActive ? '已应景' : '应景';
+        negBtn.classList.toggle('on-hate', negActive);
+        negBtn.textContent = negActive ? '已反馈' : '不喜欢';
+        if (negActive) showInvite(); else hideInvite();
+      }
+
+      function toastFor(feedback, kind) {
+        if (feedback === 'negative') return dislikeCount > 0
+          ? '已记下：不喜欢（累计 ' + dislikeCount + ' 次，会慢慢少发）'
+          : '已记下：不喜欢';
+        if (feedback === 'positive') {
+          if (kind === 'context') return '已记下：这次很应景';
+          if (kind === 'both') return '已记下：喜欢这张图，也很应景';
+          return '已记下：喜欢这张图';
+        }
+        return '已取消这次反馈';
+      }
+
+      async function sendFb(tappedKind) {
         if (pending) return;
-        // v0.25.2 - 同方向去重要看当前状态：状态已切换（变心）后，另一方向可以重新点
-        if (type === 'negative' && state === 'negative' && negMarked) { showToast('这张已经点过啦，下次它再出现再点，我会记得更牢'); return; }
-        if (type === 'positive' && state === 'positive' && posMarked) { showToast('这张已经点过喜欢啦'); return; }
+        var nextKind = nextPositiveKind(tappedKind);
+        var isNegTap = tappedKind === 'negative';
+        var nextFeedback;
+        var nextFbKind = null;
+        if (isNegTap) {
+          nextFeedback = fbCurrent === 'negative' ? 'clear' : 'negative';
+        } else {
+          nextFeedback = nextKind === null ? 'clear' : 'positive';
+          nextFbKind = nextKind;
+        }
+        // 当前无反馈时不可能走到 clear（无状态点喜欢/应景/不喜欢首击都是新增），此 guard 只是防御性兜底
+        if (nextFeedback === 'clear' && fbCurrent === null) return;
         pending = true;
-        // 乐观更新：先切按钮样式，请求失败再回滚（发布前审查修复）
-        var prevState = state;
-        var prevPosMarked = posMarked;
-        var prevNegMarked = negMarked;
-        setState(type);
+        var prev = { fbCurrent: fbCurrent, fbKind: fbKind };
+        var prevLike = likeActive, prevFit = fitActive, prevNeg = negActive;
+        if (nextFeedback === 'clear') { fbCurrent = null; fbKind = 'image'; }
+        else { fbCurrent = nextFeedback; fbKind = nextFbKind || fbKind; }
+        reflectButtons();
         function rollbackFb() {
-          state = prevState; posMarked = prevPosMarked; negMarked = prevNegMarked;
-          posBtn.classList.toggle('on-love', prevState === 'positive');
-          negBtn.classList.toggle('on-hate', prevState === 'negative');
+          fbCurrent = prev.fbCurrent; fbKind = prev.fbKind;
+          likeActive = prevLike; fitActive = prevFit; negActive = prevNeg;
+          reflectButtons();
         }
         try {
-          var res = await fetch(apiBase() + '/api/preferences/correct' + authQuery(), {
+          var body = {
+            stickerId: cfg.id,
+            feedback: nextFeedback,
+            agentId: cfg.agent,
+          };
+          if (cfg.sessionPath) body.sessionPath = cfg.sessionPath;
+          if (nextFeedback === 'positive') body.feedbackKind = nextFbKind;
+          // 应景账本需要 context_emotion；submitBallFeedback 从 recent-match 记录取 emotion，这里兜底传一下
+          var res = await fetch(apiBase() + '/api/ball/feedback' + authQuery(), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              agent: cfg.agent,
-              sticker_id: cfg.id,
-              context_emotion: cfg.emotion,
-              context_keywords: '',
-              feedback_type: type
-            })
+            body: JSON.stringify(body)
           });
           var data = await res.json();
           if (data.ok) {
-            if (type === 'positive') {
-              posMarked = true;
-              hideInvite();
-              showToast('已记下：喜欢');
-            } else {
-              negMarked = true;
+            if (nextFeedback === 'negative') {
               dislikeCount = data.dislike_count || dislikeCount + 1;
-              showInvite();
-              showToast('已记下：不喜欢（累计 ' + dislikeCount + ' 次，会慢慢少发）');
             }
+            showToast(toastFor(nextFeedback, nextFbKind));
           } else {
             rollbackFb();
             showToast('没记上：' + (data.error || '出错了'), true);
@@ -1459,20 +1503,26 @@ export default async function registerRoutes(app, ctx) {
         chatSuggestion = null;
         reportChatSize();
       }
-      function reportChatSize() {
-        if (!chatMode) return;
-        var h = chatPanel.offsetHeight + 26;
-        window.parent.postMessage({
+      function postResize(payload) {
+        var msg = {
           protocol: 'hana.plugin.ui',
           version: 1,
           kind: 'event',
-          // v0.33.0 - 协议修正：宿主在 hana.plugin.ui 命名空间下期望的事件名是 ui.resize（带 hana. 前缀被忽略，导致 size 上报一直无效）
           type: 'ui.resize',
-          payload: { height: clampH(Math.round(h)), width: clampW(window.innerWidth) }
-        }, '*');
+          payload: payload
+        };
+        window.parent.postMessage(msg, '*');
+        // v0.33.70 - devkit 1.0 宿主（0.686+）兼容裸原始事件；双发幂等，老宿主忽略未知格式
+        window.parent.postMessage({ type: 'ui.resize', payload: payload }, '*');
+      }
+      function reportChatSize() {
+        if (!chatMode) return;
+        var h = chatPanel.offsetHeight + 26;
+        postResize({ height: clampH(Math.round(h)), width: clampW(window.innerWidth) });
       }
 
-      posBtn.addEventListener('click', function () { sendFb('positive'); });
+      posBtn.addEventListener('click', function () { sendFb('image'); });
+      fitBtn.addEventListener('click', function () { sendFb('context'); });
       negBtn.addEventListener('click', function () { sendFb('negative'); });
       document.getElementById('chat-open-btn').addEventListener('click', openChat);
       document.getElementById('chat-close-btn').addEventListener('click', closeChat);
@@ -1509,9 +1559,11 @@ export default async function registerRoutes(app, ctx) {
       function clampW(v) { return Math.max(50, Math.min(400, Math.round(v))); }
       function clampH(v) { return Math.max(30, Math.min(600, Math.round(v))); }
       // v0.33.1 - 二分决策：fit=是否放大填满，cap=目标显示宽度（null=不放大/原尺寸）
+      // v0.33.72 - 智能开时一律放大填满（0.686+ 聊天流宽度锁死，ui.resize 不生效，
+      //   小图不再贴原尺寸；关智能才回退旧阈值行为（≥200 放大、<200 原尺寸防糊））
       function fitDecision(minSide) {
         if (!FIT) return { fit: minSide >= FIT_THRESHOLD, cap: null };  // 关：回退旧行为（阈值默认 200）
-        return minSide >= AUTO_FIT_MAX ? { fit: true, cap: AUTO_FIT_MAX } : { fit: false, cap: null };
+        return { fit: true, cap: AUTO_FIT_MAX };
       }
       function fitCard() {
         // v0.25.0 - 聊天模式：高度由聊天面板决定（脚本1 reportChatSize 负责），这里不覆盖
@@ -1550,13 +1602,7 @@ export default async function registerRoutes(app, ctx) {
           var targetW = clampW(contentW);
           if (targetW > 0) payload.width = targetW;
         }
-        window.parent.postMessage({
-          protocol: 'hana.plugin.ui',
-          version: 1,
-          kind: 'event',
-          type: 'ui.resize',
-          payload: payload
-        }, '*');
+        postResize(payload);
       }
       if (IMG) {
         // v0.33.2 - 加载完成后等两帧再量尺寸：让下方反馈按钮区完成布局（off-…Width/Height 就绪），

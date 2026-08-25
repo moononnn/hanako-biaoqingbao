@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 
 import { fitDecision, AUTO_FIT_MAX } from '../lib/smart-fit.js';
 
-test('自适应二分：短边 < 400 一律不放大（贴原图，防糊）', () => {
+test('v0.33.72：智能开一律放大填满（0.686+ 聊天流宽度锁死，ui.resize 不生效）', () => {
   assert.equal(AUTO_FIT_MAX, 400);
-  assert.deepEqual(fitDecision(30, true), { fit: false, cap: null });
-  assert.deepEqual(fitDecision(99, true), { fit: false, cap: null });
-  assert.deepEqual(fitDecision(159, true), { fit: false, cap: null });
-  assert.deepEqual(fitDecision(200, true), { fit: false, cap: null });
-  assert.deepEqual(fitDecision(399, true), { fit: false, cap: null });
+  assert.deepEqual(fitDecision(30, true), { fit: true, cap: 400 });
+  assert.deepEqual(fitDecision(99, true), { fit: true, cap: 400 });
+  assert.deepEqual(fitDecision(159, true), { fit: true, cap: 400 });
+  assert.deepEqual(fitDecision(200, true), { fit: true, cap: 400 });
+  assert.deepEqual(fitDecision(399, true), { fit: true, cap: 400 });
 });
 
 test('自适应二分：短边 ≥ 400 放大填满 400（宿主槽位上限）', () => {

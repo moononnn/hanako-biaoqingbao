@@ -1544,6 +1544,21 @@
     return null;
   }
 
+  // v0.33.63 - 查应景账本：这张图在该助手+情绪下是否被夸过“这次很应景”
+  function findContextFitFor(agent, stickerId, emotion) {
+    var byAgent = (window.__CONTEXT_FEEDBACK__ || {}).byAgent || {};
+    var contexts = byAgent[agent] || byAgent.default;
+    if (!contexts || typeof contexts !== 'object') return null;
+    for (var ctxKey in contexts) {
+      if (!(ctxKey && (emotion.includes(ctxKey) || ctxKey.includes(emotion)))) continue;
+      var entry = contexts[ctxKey][stickerId];
+      if (entry && Number(entry.count) > 0) {
+        return { contextEmotion: ctxKey, count: Number(entry.count) || 0 };
+      }
+    }
+    return null;
+  }
+
   async function renderPreferences() {
     var prefs = window.__PREFERENCES__ || { version: 1, users: {} };
     var logs = window.__DECISION_LOG__ || { version: 1, entries: [] };
@@ -1640,13 +1655,18 @@
         var fbState = findFeedbackFor(e.agent || '', stickerLabel, emotion, kws);
         var posActive = fbState && fbState.state === 'positive' ? ' active' : '';
         var negActive = fbState && fbState.state === 'negative' ? ' active' : '';
+        // v0.33.63 - 应景按钮：单独看应景账本，不被喜欢/不喜欢影响
+        var fitState = findContextFitFor(e.agent || '', stickerLabel, emotion);
+        var fitActive = fitState ? ' active' : '';
         var posTitle = fbState && fbState.state === 'positive' ? '已标记喜欢，点这里取消' : '喜欢这张，以后多发';
         var negTitle = fbState && fbState.state === 'negative' ? '已标记不喜欢，点这里取消' : '不喜欢这张，以后少发';
+        var fitTitle = fitState ? '已记过这次很应景，点这里取消' : '这张这次配得很应景';
         html += '<div class="pref-feedback-group">';
         // v0.22.0 - 删除入口（图还在时显示），放在反馈按钮最左边
         html += '<button class="pref-feedback-btn pref-del-btn" data-act="delete-sticker" data-sticker="' + escHtml(stickerLabel) + '" title="删除这张表情包（从库中彻底删除）">删除</button>';
         // v0.19.5 - 带上决策日志里的 agent，反馈才记到正确的助手名下（否则写入 default 桶永远读不到）
         html += '<button class="pref-feedback-btn' + posActive + '" data-act="quick-feedback" data-fb="positive" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + posTitle + '">喜欢</button>';
+        html += '<button class="pref-feedback-btn' + fitActive + '" data-act="quick-feedback" data-fb="context" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + fitTitle + '">应景</button>';
         html += '<button class="pref-feedback-btn' + negActive + '" data-act="quick-feedback" data-fb="negative" data-sticker="' + escHtml(stickerLabel) + '" data-emotion="' + escHtml(emotion) + '" data-keywords="' + escHtml(kws) + '" data-agent="' + escHtml(e.agent || '') + '" title="' + negTitle + '">不喜欢</button>';
         html += '<button class="pref-feedback-btn pref-chat-btn" data-act="open-chat" data-sticker="' + escHtml(stickerLabel) + '" title="和小花聊聊这张图哪里不对">和小花聊聊</button>';
         html += '</div>';
@@ -1728,6 +1748,38 @@
           }
           html += '</div>';
         }
+        // v0.33.63 - “这次很应景”独立账本：跟喜欢/不喜欢不冲突，单独一行显示
+        var fitEntries = [];
+        if (em) {
+          var cfByAgent = (window.__CONTEXT_FEEDBACK__ || {}).byAgent || {};
+          var fitAgentBuckets = cfByAgent[meta.agent] || cfByAgent.default;
+          if (fitAgentBuckets && typeof fitAgentBuckets === 'object') {
+            for (var fitCtx in fitAgentBuckets) {
+              if (!(fitCtx && (em.includes(fitCtx) || fitCtx.includes(em)))) continue;
+              var fitBucket = fitAgentBuckets[fitCtx] || {};
+              for (var fitId in fitBucket) {
+                var fitEntry = fitBucket[fitId];
+                if (fitEntry && Number(fitEntry.count) > 0) {
+                  fitEntries.push({ id: fitId, count: Number(fitEntry.count) || 0, context: fitCtx });
+                }
+              }
+            }
+          }
+        }
+        if (fitEntries.length > 0) {
+          html += '<div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">';
+          html += '<span style="color:var(--success);font-size:11px;font-weight:600;flex-shrink:0">很应景 ' + fitEntries.length + ' 张</span>';
+          for (var fi = 0; fi < fitEntries.length; fi++) {
+            var fe = fitEntries[fi];
+            html += '<span class="pref-chip">'
+              + '<img class="pref-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(fe.id)) + '" onerror="this.style.display=\'none\'" alt="">'
+              + '<span style="font-size:10px;color:var(--success);font-weight:600" title="在「' + escHtml(fe.context) + '」场景被夸过 ' + fe.count + ' 次很应景">×' + fe.count + '</span>'
+              + '<button class="pref-x" data-act="remove-context-fit" data-sticker="' + escHtml(fe.id) + '" data-emotion="' + escHtml(fe.context) + '" title="移除这次应景记录">×</button>'
+              + '<button class="pref-del" data-act="delete-sticker" data-sticker="' + escHtml(fe.id) + '" title="删除这张表情包（从库中彻底删除）">删</button>'
+              + '</span>';
+          }
+          html += '</div>';
+        }
         html += '</div>';
       }
       html += '</div>';
@@ -1800,6 +1852,20 @@
         var kws = btn.getAttribute('data-keywords') || '';
         // v0.19.5 - 透传决策日志的 agent，反馈落到正确助手名下（否则写入 default 桶永远读不到）
         var agent = btn.getAttribute('data-agent') || '';
+        // v0.33.63 - 应景单独一路：不跟喜欢/不喜欢互斥，已记过再点=取消
+        if (fb === 'context') {
+          var fitState = findContextFitFor(agent, stickerId, emotion);
+          var fitBtnCurrent = btn;
+          var fitHadActive = fitBtnCurrent.classList.contains('active');
+          fitBtnCurrent.classList.add('active');
+          fitBtnCurrent.disabled = true;
+          function rollbackFitBtn() {
+            fitBtnCurrent.classList.toggle('active', fitHadActive);
+            fitBtnCurrent.disabled = false;
+          }
+          callQuickFeedback({ sticker_id: stickerId, feedback_type: fitState ? 'context_clear' : 'context', context_emotion: emotion, context_keywords: kws, agent: agent || undefined }, rollbackFitBtn);
+          return;
+        }
         // v0.19.5 - 已选中的按钮再点 = 取消这条反馈
         var fbState = findFeedbackFor(agent, stickerId, emotion, kws);
         // v0.25.2 - 乐观更新：点击瞬间切样式 + 防重复点，请求失败回滚（发布前审查修复）
@@ -1856,6 +1922,12 @@
         var stickerId3 = btn.getAttribute('data-sticker');
         callPrefUpdate({ action: 'remove_from_list', agent: agent, mapping_index: li, list: list, sticker_id: stickerId3 });
       }
+
+      if (act === 'remove-context-fit') {
+        var fitStickerId = btn.getAttribute('data-sticker');
+        var fitEmotion = btn.getAttribute('data-emotion') || '';
+        callRemoveContextFit({ agentId: agent, contextEmotion: fitEmotion, stickerId: fitStickerId });
+      }
     });
   }
 
@@ -1868,6 +1940,7 @@
       });
       var data = await resp.json();
       if (data.ok) {
+        await refreshContextFeedback();
         await refreshPreferences();
         toast('已反馈');
       } else {
@@ -1877,6 +1950,36 @@
     } catch (err) {
       if (onFail) onFail();
       toast('反馈出错: ' + err.message, true);
+    }
+  }
+
+  // v0.33.63 - 应景账本单独刷新（服务端注入的 __CONTEXT_FEEDBACK__ 只在打开页面时新鲜）
+  async function refreshContextFeedback() {
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/context-feedback'));
+      var data = await resp.json();
+      if (data.ok) window.__CONTEXT_FEEDBACK__ = data.data;
+    } catch (e) {}
+  }
+
+  // v0.33.63 - 移除单条应景记录
+  async function callRemoveContextFit(body) {
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/context-feedback/remove'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        await refreshContextFeedback();
+        await refreshPreferences();
+        toast('已移除这次应景');
+      } else {
+        toast('移除失败: ' + (data.error || ''), true);
+      }
+    } catch (err) {
+      toast('移除出错: ' + err.message, true);
     }
   }
 

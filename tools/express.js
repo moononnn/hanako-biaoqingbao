@@ -21,6 +21,8 @@ import { getAgentExpressionBias } from '../lib/dialect.js';
 import { fitDecision } from '../lib/smart-fit.js';
 import { imageSizeFromBuffer } from '../lib/image-size.js';
 import { recordRecentMatch } from '../lib/recent-match.js';
+import { readContextFits } from '../lib/context-feedback.js';
+import { readExposureStats, recordSuccessfulExposure, rerankWithExploration } from '../lib/exposure.js';
 
 const OUTPUT_DIR_CFG = join(dataDir, 'output-dir.json');
 const NATIVE_MEDIA_MIN_VERSION = [0, 679, 0];
@@ -124,15 +126,15 @@ function reply(obj) {
 const BTN_RESERVE = 64; // 底部反馈按钮排预留：14(img-card 边框+padding) + 8(gap) + 30(按钮区) + 12(body padding)
 function calcCardAspectRatio(size, smart) {
   if (!size || !size.width || !size.height) return '400:430';
-  const minSide = Math.min(size.width, size.height);
   const ratio = size.height / size.width;
   let dispW;
   if (smart !== false) {
-    // 自适应二分（v0.33.1）：短边 <400 → 贴原图尺寸；≥400 → 放大填满 400（宿主可用宽上限）
-    const d = fitDecision(minSide, true, 200);
-    dispW = d.fit ? 400 : size.width;
+    // v0.33.72 - 智能开：一律按放大填满 400 算（0.686+ 聊天流宽度锁死，ui.resize 不生效，
+    // 小图不再贴原尺寸留白；卡片高 = 放大后的图高 + 按钮区预留）
+    dispW = 400;
   } else {
     // 关闭智能：回退旧行为（大图按 400 基准放大填满、小图原尺寸交给 iframe 内 fitCard）
+    const minSide = Math.min(size.width, size.height);
     dispW = minSide >= 200 ? 400 : size.width;
   }
   dispW = Math.max(50, Math.round(dispW));
@@ -141,11 +143,23 @@ function calcCardAspectRatio(size, smart) {
   return `400:${Math.round(totalH)}`;
 }
 
+function normalizeCardEmotionLabel(value) {
+  if (typeof value !== 'string') return '';
+  const label = value.replace(/[\r\n\t]+/g, ' ').trim();
+  return label.length > 6 ? '' : label;
+}
+
+export function primaryEmotionOf(sticker) {
+  const emotions = Array.isArray(sticker?.tags?.emotion) ? sticker.tags.emotion : [];
+  return emotions.find((tag) => normalizeCardEmotionLabel(tag)) || '';
+}
+
 export function buildStickerCard({
   id,
   description,
   score,
   emotion,
+  primaryEmotion,
   agentId,
   sessionId,
   sessionRef,
@@ -153,16 +167,16 @@ export function buildStickerCard({
   size,     // v0.32.3 - { width, height }，可选；缺省回退 '400:430'
   smart,    // v0.32.3 - 是否启用智能多档（默认 true）；false 回退旧行为
 }) {
+  const emotionLabel = normalizeCardEmotionLabel(primaryEmotion) || normalizeCardEmotionLabel(emotion);
   return {
     type: 'iframe',
     pluginId: 'biaoqingbao',
     sessionId,
     sessionRef,
     sessionPath,
-    route: `/sticker?id=${encodeURIComponent(id)}&label=${encodeURIComponent(description)}&score=${score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}`,
+    route: `/sticker?id=${encodeURIComponent(id)}&label=${encodeURIComponent(description)}&score=${score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}${sessionPath ? `&sessionPath=${encodeURIComponent(sessionPath)}` : ''}`,
     aspectRatio: calcCardAspectRatio(size, smart),
-    title: description,
-    description: '表情包配图 · biaoqingbao',
+    title: emotionLabel ? `${emotionLabel}小表情来啦` : '小表情来啦',
   };
 }
 
@@ -190,7 +204,15 @@ export function buildStickerMediaDetails(stagedFile, taskId = null) {
 // server 对 deferred:resolve 的 result.sessionFiles 会广播 content_block(file)（image-gen 同款链路），
 // 渲染端直接显示原图。这是 0.679 聊天流里助手消息显示图片的官方原生通道。
 // 返回 { ok, taskId } = 图片已以原生块提交；ok=false = 通道不可用，由调用方降级到 card/media 协议。
-export async function trySendDeferredImage(ctx, stagedFile) {
+// v0.33.64 - 时序修复（0.686.15 内测版复现）：宿主要在「工具结果返回并挂载 media_generation 占位块」
+// 之后收到 deferred:resolve 才能按 taskId 原地替换；立即 resolve 时占位块还没挂上，
+// 渲染端找不到可替换块，图片会漂到消息流末尾并随后续轮次反复出现（老 bug 复发）。
+// 现在对齐 Hana 原生生图语义：register 返回 placeholder → 宿主挂载 → 延迟 resolve 原地替换。
+// v0.33.65 - 0.686+ 宿主不再生成插件占位块（applyDeferredToolSurface 按工具名白名单，
+// 只认 media_generate-image/video），插件 deferred 广播始终找不到替换目标 → 必然漂移双图。
+// 0.686+ 由 isMediaOnlyHost 判走 media-only，本通道仅旧版宿主使用。
+const DEFERRED_RESOLVE_DELAY_MS = 1500;
+export async function trySendDeferredImage(ctx, stagedFile, options = {}) {
   const file = stagedFile?.file || stagedFile?.mediaItem || stagedFile;
   if (!file?.filePath) return { ok: false };
   const sessionPath = ctx?.sessionPath;
@@ -219,15 +241,26 @@ export async function trySendDeferredImage(ctx, stagedFile) {
       ctx?.log?.warn?.('[biaoqingbao] deferred:register 未获确认，降级:', registered ? JSON.stringify(registered) : '无返回');
       return { ok: false };
     }
-    const resolved = await ctx.bus.request('deferred:resolve', {
-      taskId,
-      result: { sessionFiles: [file] },
-    });
-    if (!resolved || resolved.ok === false) {
-      ctx?.log?.warn?.('[biaoqingbao] deferred:resolve 未获确认，降级:', resolved ? JSON.stringify(resolved) : '无返回');
-      return { ok: false };
+    // 延迟 resolve：让宿主先把 media_generation 占位块挂到当前助手消息，再广播 file block 原地替换。
+    const resolveDelayMs = Math.max(0, Number(options.resolveDelayMs) || DEFERRED_RESOLVE_DELAY_MS);
+    const schedule = () => {
+      ctx.bus.request('deferred:resolve', {
+        taskId,
+        result: { sessionFiles: [file] },
+      }).then((resolved) => {
+        if (!resolved || resolved.ok === false) {
+          ctx?.log?.warn?.('[biaoqingbao] deferred:resolve 未获确认:', resolved ? JSON.stringify(resolved) : '无返回');
+        }
+      }).catch((e) => {
+        ctx?.log?.warn?.('[biaoqingbao] deferred:resolve 失败:', e?.message || String(e));
+      });
+    };
+    if (resolveDelayMs > 0) {
+      setTimeout(schedule, resolveDelayMs);
+    } else {
+      schedule();
     }
-    ctx?.log?.debug?.(`[biaoqingbao] deferred 原生图片块已提交: ${taskId}`);
+    ctx?.log?.debug?.(`[biaoqingbao] deferred 原生图片块已注册，${resolveDelayMs}ms 后 resolve: ${taskId}`);
     return { ok: true, taskId };
   } catch (e) {
     ctx?.log?.warn?.('[biaoqingbao] deferred 发图失败，降级:', e?.message || String(e));
@@ -248,6 +281,16 @@ export function supportsNativeMediaDetails(version) {
     if (current[i] !== NATIVE_MEDIA_MIN_VERSION[i]) return current[i] > NATIVE_MEDIA_MIN_VERSION[i];
   }
   return true;
+}
+
+// v0.33.65 - 0.686+ 宿主把插件 details.media 直接渲染进聊天流（devkit 1.0 迁移，
+// 桌面端渲染文件/图片卡），同时不再为白名单外的插件工具生成 media_generation 占位块；
+// 此时走 deferred 广播必然找不到替换目标，图会漂到消息流末尾并跟随后续轮次反复出现。
+// 所以 0.686+ 一律 media-only（只返回 details.media），旧版（< 0.686）保持 deferred/卡片链路。
+export function isMediaOnlyHost(version) {
+  const current = parseAppVersion(version);
+  if (!current) return false;
+  return current[0] > 0 || (current[0] === 0 && (current[1] > 686 || (current[1] === 686 && (current[2] || 0) >= 0)));
 }
 
 async function readHanaAppVersion() {
@@ -274,54 +317,74 @@ async function getOutputDir() {
   }
 }
 
-// 偏好加载（v0.19.5 - 按 agentId 隔离：优先当前助手，旧格式兼容 users.default / 根级 mappings）
+// 偏好加载（v0.19.5 - 按 agentId 隔离：优先当前助手，兼容 default / 根级旧格式）
+export function selectPreferenceMappings(data, agentId) {
+  const raw = data && typeof data === 'object' ? data : {};
+  const users = raw.users && typeof raw.users === 'object' ? raw.users : {};
+  const current = agentId && users[agentId];
+  const fallback = users.default;
+  const legacy = Array.isArray(raw.mappings) ? raw.mappings : [];
+  const target = current || fallback;
+  const mappings = Array.isArray(target?.mappings) ? target.mappings.slice() : [];
+  // 根级 mappings 是极老版本的全局偏好；新桶出现后仍要保留它，不能静默失效。
+  if (legacy.length && (!target || target.mappings !== legacy)) mappings.push(...legacy);
+  return mappings;
+}
+
 async function loadPreferencesFor(emotion, agentId) {
   try {
     const raw = await readFile(PREFERENCES_FILE, 'utf-8');
     const data = JSON.parse(raw);
-    const users = data.users || {};
-    // 优先级：当前助手 > 旧格式 default > 更老的根级 mappings（都只取一个，不合并，避免串号）
-    const target = (agentId && users[agentId]) || users.default || (Array.isArray(data.mappings) ? { mappings: data.mappings } : null);
-    if (!target) return { preferred: [], vetoed: [], dislikes: {} };
-    return collectPrefsForEmotion(target.mappings, emotion);
+    return collectPrefsForEmotion(selectPreferenceMappings(data, agentId), emotion);
   } catch {
-    return { preferred: [], vetoed: [] };
+    return { preferred: [], vetoed: [], dislikes: {} };
   }
 }
 
-async function logDecision(emotion, stickerId, ctx) {
-  try {
-    let data = { version: 1, entries: [] };
-    try { data = JSON.parse(await readFile(DECISION_LOG_FILE, 'utf-8')); } catch {}
+let decisionLogWriteChain = Promise.resolve();
 
-    // v0.18.0 - 历史定位：存 session_id + 毫秒时间戳 + session 文件路径
-    // 让后续聊天调整标签时能定位到当时具体那轮对话
-    const sessionId = ctx?.sessionId || ctx?.sessionRef?.id || null;
-    const sessionPath = ctx?.sessionPath || null;
-    // 只记录 HANA_HOME 内的相对路径，避免把机器用户名和用户目录写进日志。
-    let safeSessionPath = null;
-    if (sessionPath) {
-      const rel = relative(HANA_HOME, sessionPath);
-      if (rel && !rel.startsWith('..') && !isAbsolute(rel)) safeSessionPath = rel;
-    }
-    const contextTs = Date.now(); // express 被调用的毫秒时间戳
+function enqueueDecisionLog(task) {
+  const next = decisionLogWriteChain.then(task, task);
+  decisionLogWriteChain = next.catch(() => {});
+  return next;
+}
 
-    const entry = {
-      ts: new Date(contextTs).toISOString(),
-      context_ts: contextTs,  // v0.18.0 新增：毫秒时间戳，供历史定位用
-      type: 'express',
-      decision: 'accepted',
-      emotion,
-      sticker_id: stickerId,
-      agent: resolveAgentId(null, ctx),  // v0.19.5 - 与选图/反馈统一口径，避免写 unknown 导致前端反馈落错桶
-    };
-    if (sessionId) entry.session_id = sessionId;           // v0.18.0 新增：session 指针
-    if (safeSessionPath) entry.session_path = safeSessionPath; // 相对 HANA_HOME 的可迁移路径
+async function logDecision(emotion, stickerId, ctx, metadata = {}) {
+  return enqueueDecisionLog(async () => {
+    try {
+      let data = { version: 1, entries: [] };
+      try { data = JSON.parse(await readFile(DECISION_LOG_FILE, 'utf-8')); } catch {}
 
-    data.entries.push(entry);
-    if (data.entries.length > 500) data.entries = data.entries.slice(-500);
-    atomicWriteJson(DECISION_LOG_FILE, data);
-  } catch {}
+      // v0.18.0 - 历史定位：存 session_id + 毫秒时间戳 + session 文件路径
+      // 让后续聊天调整标签时能定位到当时具体那轮对话
+      const sessionId = ctx?.sessionId || ctx?.sessionRef?.id || null;
+      const sessionPath = ctx?.sessionPath || null;
+      // 只记录 HANA_HOME 内的相对路径，避免把机器用户名和用户目录写进日志。
+      let safeSessionPath = null;
+      if (sessionPath) {
+        const rel = relative(HANA_HOME, sessionPath);
+        if (rel && !rel.startsWith('..') && !isAbsolute(rel)) safeSessionPath = rel;
+      }
+      const contextTs = Date.now(); // express 被调用的毫秒时间戳
+
+      const entry = {
+        ts: new Date(contextTs).toISOString(),
+        context_ts: contextTs,  // v0.18.0 新增：毫秒时间戳，供历史定位用
+        type: 'express',
+        decision: 'accepted',
+        emotion,
+        sticker_id: stickerId,
+        agent: resolveAgentId(null, ctx),  // v0.19.5 - 与选图/反馈统一口径，避免写 unknown 导致前端反馈落错桶
+        exploration: metadata.exploration || null,
+      };
+      if (sessionId) entry.session_id = sessionId;           // v0.18.0 新增：session 指针
+      if (safeSessionPath) entry.session_path = safeSessionPath; // 相对 HANA_HOME 的可迁移路径
+
+      data.entries.push(entry);
+      if (data.entries.length > 500) data.entries = data.entries.slice(-500);
+      atomicWriteJson(DECISION_LOG_FILE, data);
+    } catch {}
+  });
 }
 
 // 纯标签匹配打分（不调模型）
@@ -433,6 +496,11 @@ export async function execute(input, ctx) {
 
   // 加载偏好（v0.19.5 - 传入 agentId，偏好只属于当前助手）
   const prefs = await loadPreferencesFor(emotion, agentId);
+  // v0.33.53 - “这次很应景”单独记账，只给相同情绪/场景轻量加成，不进入全局 preferred。
+  const effectivePrefs = {
+    ...prefs,
+    contextFits: readContextFits({ dataDir, agentId, contextEmotion: emotion }),
+  };
 
   // v0.32.3 - stickerId 指定路径：跳过打分/向量匹配，直接用指定图
   // prefs.vetoed 仍生效（手动指定不是绕过偏好的后门），pushRecent/cooldown/logDecision 后面统一走
@@ -451,11 +519,11 @@ export async function execute(input, ctx) {
     const allExclude = [...new Set([...(exclude_ids || []), ...getRecent(agentId)])];
 
     // 打分匹配（v0.27.0：传入方言气质权重）
-    const scored = scoreStickers(stickers, emotion, allExclude, prefs, expressionBias);
+    let scored = scoreStickers(stickers, emotion, allExclude, effectivePrefs, expressionBias);
 
     if (scored.length === 0) {
       // 放宽限制：不排除最近用过的，再试一次
-      const relaxed = scoreStickers(stickers, emotion, [], prefs, expressionBias);
+      const relaxed = scoreStickers(stickers, emotion, [], effectivePrefs, expressionBias);
       scored.push(...relaxed);
     }
 
@@ -463,7 +531,7 @@ export async function execute(input, ctx) {
     // 若先 length=0 再 push(...vectorScored) 会把结果一起清空（vectorScored === scored），
     // 导致永远走到 no_match。恢复原地修改语义，不回填。
     // v0.25.0 - applyVectorScoring 传入 prefs：向量补充通道同样应用偏好惩罚
-    await applyVectorScoring(scored, stickers, emotion, allExclude, prefs);
+    await applyVectorScoring(scored, stickers, emotion, allExclude, effectivePrefs);
 
     if (scored.length === 0) {
       return reply({
@@ -475,9 +543,20 @@ export async function execute(input, ctx) {
       });
     }
 
+    // v0.33.53 - 固定小比例探索：新图优先于未曝光旧图，但只在语义合格候选里重排。
+    const reranked = rerankWithExploration(scored, stickers, {
+      stats: readExposureStats({ dataDir }),
+      agentId,
+      blockedIds: effectivePrefs.vetoed,
+    });
+    scored = reranked.scored;
+
     // 从 top 3 里随机选一张（避免每次都发同一张）
     const topN = scored.slice(0, Math.min(3, scored.length));
     best = topN[Math.floor(Math.random() * topN.length)];
+    if (!reranked.explored || !['fresh', 'unseen', 'underexposed'].includes(best._explorationKind)) {
+      best._explorationKind = null;
+    }
   }
 
   // 读取图片 -> 复制 -> stage
@@ -514,32 +593,33 @@ export async function execute(input, ctx) {
 
   // v0.19.5 - 记录移到发图确认之后：stage 成功或降级 base64 都算已发出
   pushRecent(agentId, best.id);
-  await logDecision(emotion, best.id, ctx);
+  await logDecision(emotion, best.id, ctx, { exploration: best._explorationKind || null });
   markAgentStickerCooldown(agentId);
 
   if (stageSuccess && mediaItem) {
     // 当前公开 ToolContext 没有宿主版本字段，只读取 Hana 本机 server-info。
     const hostVersion = await readHanaAppVersion();
-    // v0.33.2 - 0.679+ 优先走 deferred 原生图片块（聊天流直接显示原图）；
-    // 通道不可用（旧版 Hana / bus 无此方法）自动降级到 media / iframe 卡片协议。
-    const deferredResult = await trySendDeferredImage(ctx, mediaItem);
+    // v0.33.67 - B 方案真正落地：0.686+ 宿主（media-only 假设证伪后）强制走纯 details.card iframe，
+    // 完全不调 deferred（避免宿主把广播当追加媒体块 → 末尾重复图）。旧版宿主保持原逻辑。
+    const isNewHost = isMediaOnlyHost(hostVersion);
+    // 新宿主：不调 deferred，直接拿 card iframe；旧宿主：保持 deferred → media/card 兼容链
+    const deferredResult = isNewHost ? { ok: false } : await trySendDeferredImage(ctx, mediaItem);
     const deferredOk = deferredResult.ok === true;
     const useNativeMedia = supportsNativeMediaDetails(hostVersion);
-    let size;
+    // v0.33.70 - size/smart 不再限定旧分支：新宿主（0.686+ 纯 card iframe）同样需要
+    // 图片尺寸算初始 aspectRatio，否则恒回退 400:430 大白卡，小图撑不满卡片。
+    let size = imageSizeFromBuffer(buffer);
     let smart = true;
-    if (!deferredOk && !useNativeMedia) {
-      // 旧版卡片继续使用原有尺寸协议，避免向下兼容时退回大白卡。
-      size = imageSizeFromBuffer(buffer);
-      try {
-        const cfg = JSON.parse(await readFile(join(dataDir, 'display-config.json'), 'utf8'));
-        smart = cfg.smallImageFit !== false;
-      } catch {}
-    }
+    try {
+      const cfg = JSON.parse(await readFile(join(dataDir, 'display-config.json'), 'utf8'));
+      smart = cfg.smallImageFit !== false;
+    } catch {}
     const cardOptions = {
       id: best.id,
       description: best.description,
       score: best._score,
       emotion,
+      primaryEmotion: primaryEmotionOf(best),
       agentId,
       sessionId: ctx.sessionId,
       sessionRef: ctx.sessionRef,
@@ -547,10 +627,16 @@ export async function execute(input, ctx) {
       size,
       smart,
     };
-    const details = deferredOk
-      ? buildStickerMediaDetails(mediaItem, deferredResult.taskId)
+    // v0.33.67 - 新宿主强制纯 card iframe（不附加 media，避免任何重复）；旧宿主走原 details 协议。
+    const details = isNewHost
+      ? { card: buildStickerCard(cardOptions) }
       : buildStickerDeliveryDetails(mediaItem, cardOptions, hostVersion);
-    const delivery = deferredOk ? 'deferred' : (useNativeMedia ? 'media' : 'card');
+    const delivery = deferredOk ? 'deferred' : (isNewHost ? 'card' : (useNativeMedia ? 'media' : 'card'));
+    await recordSuccessfulExposure({
+      dataDir,
+      agentId,
+      stickerId: best.id,
+    }).catch((error) => ctx?.log?.warn?.('[biaoqingbao] 曝光记账失败:', error?.message || error));
     await recordRecentMatch({
       dataDir,
       ctx,
