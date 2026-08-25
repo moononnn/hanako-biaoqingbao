@@ -913,7 +913,7 @@
     if (note) {
       var vectorNote = embeddingReady
         ? '向量检索已接入，上传并完成识图后即可生成图库语义索引。'
-        : '向量检索需要配置 embedding 模型（建议 BAAI/bge-m3）；更换模型后需要重新生成图库语义索引。';
+        : '向量检索需要配置一个 embedding 模型；更换模型后需要重新生成图库语义索引。';
       note.textContent = '识图负责自动打标签，内容分析负责聊天时自动配图。' + vectorNote;
     }
   }
