@@ -646,6 +646,7 @@
       if (zipHint) zipHint.textContent = '选好后点「导入 ZIP」开始';
       loadStickers();
       var importedIds = (data.data && data.data.importedIds) || [];
+      var needsTagIds = data.data && Array.isArray(data.data.needsTagIds) ? data.data.needsTagIds : importedIds;
       var skippedItems = data.data && data.data.skippedItems ? data.data.skippedItems : [];
       if (skippedItems.length) {
         var details = skippedItems.map(function (item) { return item.file + '：' + item.reason; });
@@ -657,9 +658,9 @@
       }
       // v0.25.1 - 勾选「上传后自动识图」时，ZIP 导入的新图也自动进识图任务
       var autoTagEl = $('upload-auto-tag');
-      if (autoTagEl && autoTagEl.checked && importedIds.length > 0) {
+      if (autoTagEl && autoTagEl.checked && needsTagIds.length > 0) {
         closeModal('upload-modal');
-        await enqueueTagTask(importedIds, { message: '已创建识图任务，共 ' + importedIds.length + ' 张', openDetail: true });
+        await enqueueTagTask(needsTagIds, { message: '已创建识图任务，共 ' + needsTagIds.length + ' 张', openDetail: true });
       }
     } catch (error) {
       toast('ZIP 导入失败：' + error.message, true);
@@ -668,6 +669,192 @@
       uploadBusy = false;
       if (zipBtn) zipBtn.disabled = false;
       updateUploadBtnState();
+    }
+  }
+
+  // v0.33.77 - 数据与迁移页专用导入：不改变普通图库 ZIP 入口，直接展示全量恢复摘要。
+  function setMigrationStatus(text, isError) {
+    var el = $('data-migration-status');
+    if (!el) return;
+    el.textContent = text || '';
+    el.classList.toggle('is-error', !!isError);
+  }
+
+  function migrationResultText(data) {
+    var info = data && data.data ? data.data : {};
+    var lines = [data && data.message ? data.message : '一键搬家包导入完成'];
+    if (info.migration) {
+      var report = info.migrationReport || {};
+      var restored = report.restored || {};
+      var restoredParts = [];
+      Object.keys(restored).forEach(function (key) {
+        if (restored[key]) restoredParts.push(key + ' ' + restored[key]);
+      });
+      if (restoredParts.length) lines.push('已恢复：' + restoredParts.join('、'));
+      if (info.teachingVectorsQueued) lines.push('教学向量：已按当前模型后台重建 ' + info.teachingVectorsQueued + ' 条');
+      if (report.missingStickerReferences) lines.push('未接上的图片关联：' + report.missingStickerReferences + ' 条（对应图片缺失，已安全跳过）');
+      if (report.unmatchedAgents && report.unmatchedAgents.length) {
+        lines.push('未匹配助手：' + report.unmatchedAgents.slice(0, 5).map(function (item) {
+          return (item.name || item.source || '未知') + '（' + (item.reason || '未找到') + '）';
+        }).join('、') + (report.unmatchedAgents.length > 5 ? ' 等' : ''));
+      }
+    } else if (info.imported) {
+      lines.push('这是普通图库 ZIP，只恢复图片和图库元数据；完整设置请使用一键搬家包。');
+    }
+    return lines.join('\n');
+  }
+
+  async function handleMigrationImportZip(file) {
+    if (uploadBusy) { toast('有导入正在进行中，稍等一下', true); return; }
+    if (!file) return;
+    if (file.size > 50 * 1024 * 1024) {
+      setMigrationStatus('ZIP 文件不能超过 50MB', true);
+      toast('ZIP 文件不能超过 50MB', true);
+      return;
+    }
+    uploadBusy = true;
+    var button = $('data-migration-import-btn');
+    if (button) { button.disabled = true; button.textContent = '导入中…'; }
+    setMigrationStatus('正在检查并导入 ZIP，请稍等…');
+    showLoading('正在导入一键搬家包…');
+    try {
+      var zipBase64 = await readFileAsDataUrl(file);
+      var resp = await apiFetch(withAuth(API + '/api'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'import_zip', zipBase64: zipBase64, fileName: file.name, migrationMode: true }),
+        signal: AbortSignal.timeout(120000),
+      });
+      var data = await resp.json();
+      if (!data.ok) throw new Error(data.error || '一键搬家包导入失败');
+      loadStickers();
+      setMigrationStatus(migrationResultText(data), false);
+      toast(data.message || '一键搬家包导入完成');
+    } catch (error) {
+      setMigrationStatus('导入失败：' + (error.message || '未知错误'), true);
+      toast('一键搬家包导入失败：' + error.message, true);
+    } finally {
+      hideLoading();
+      uploadBusy = false;
+      var input = $('data-migration-import-file');
+      if (input) input.value = '';
+      if (button) { button.disabled = false; button.textContent = '导入一键搬家包'; }
+    }
+  }
+
+  function chooseMigrationZip(file) {
+    if (!file) return;
+    customConfirm('导入一键搬家包会合并同图，并覆盖对应助手的偏好/方言/频率等迁移设置。\nAPI Key 和模型配置不会被导入。确定继续吗？', function () {
+      handleMigrationImportZip(file);
+    });
+  }
+
+  // v0.33.77 - 图库迁移：导出完整搬家包；目录可原生选择
+  var exportBusy = false;
+  function getExportConfig() {
+    return window.__EXPORT_CONFIG__ || {};
+  }
+
+  function updateExportSummary() {
+    var summary = $('export-summary');
+    if (!summary) return;
+    summary.textContent = '会把图库里的全部表情包打成一个新的 ZIP 文件，不受当前筛选条件影响。';
+  }
+
+  function openExportModal() {
+    var input = $('export-dir');
+    var cfg = getExportConfig();
+    if (input && !input.value.trim()) input.value = cfg.lastExportDir || cfg.defaultExportDir || '';
+    updateExportSummary();
+    openModal('export-modal');
+    if (input) { input.focus(); input.select(); }
+  }
+
+  var exportPickerBusy = false;
+  async function pickExportFolder() {
+    if (uploadBusy || exportBusy || exportPickerBusy) {
+      toast('有导入或导出正在进行中，稍等一下', true);
+      return;
+    }
+    var input = $('export-dir');
+    var button = $('export-pick-folder');
+    exportPickerBusy = true;
+    if (button) { button.disabled = true; button.textContent = '选择中…'; }
+    toast('请在弹出的窗口里选择导出文件夹…');
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/export/pick-folder'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ initial: input ? input.value.trim() : '' }),
+        timeout: 305000,
+      });
+      var data = await resp.json();
+      if (!data.ok) {
+        if (data.error === '没有选择文件夹') {
+          toast('已取消选择文件夹');
+          return;
+        }
+        throw new Error(data.error || '选择文件夹失败');
+      }
+      var directory = data.data && data.data.directory;
+      if (!directory) throw new Error('没有拿到所选文件夹');
+      if (input) { input.value = directory; input.focus(); }
+      updateExportSummary();
+      toast('已选择导出文件夹');
+    } catch (error) {
+      toast('选择文件夹失败：' + error.message, true);
+    } finally {
+      exportPickerBusy = false;
+      if (button) { button.disabled = false; button.textContent = '选择文件夹…'; }
+    }
+  }
+
+  async function handleExportZip() {
+    if (uploadBusy || exportBusy) { toast('有导入或导出正在进行中，稍等一下', true); return; }
+    var input = $('export-dir');
+    var directory = input ? input.value.trim() : '';
+    if (!directory) { toast('先填写要保存到的文件夹路径', true); if (input) input.focus(); return; }
+
+    exportBusy = true;
+    var button = $('export-zip-btn');
+    if (button) { button.disabled = true; button.textContent = '正在打包…'; }
+    showLoading('正在打包当前图库…');
+    try {
+      var resp = await apiFetch(withAuth(API + '/api'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'export_zip', outputDir: directory }),
+        signal: AbortSignal.timeout(120000),
+      });
+      var data = await resp.json();
+      if (!data.ok) throw new Error(data.error || 'ZIP 导出失败');
+
+      var info = data.data || {};
+      var cfg = getExportConfig();
+      cfg.lastExportDir = info.directory || directory;
+      window.__EXPORT_CONFIG__ = cfg;
+      var summary = $('export-summary');
+      var skippedItems = Array.isArray(info.skippedItems) ? info.skippedItems : [];
+      if (summary) {
+        summary.textContent = (data.message || ('已导出 ' + (info.exported || 0) + ' 张表情包'))
+          + (info.fileName ? '\n文件名：' + info.fileName : '');
+        if (skippedItems.length) {
+          summary.textContent += '\n' + skippedItems.slice(0, 5).map(function (item) {
+            return item.file + '：' + item.reason;
+          }).join('\n');
+        }
+      }
+      var exportToast = (data.message || 'ZIP 导出完成') + (info.fileName ? '：' + info.fileName : '');
+      toast(exportToast, skippedItems.length > 0);
+      if (!skippedItems.length) {
+        setTimeout(function () { closeModal('export-modal'); }, 350);
+      }
+    } catch (error) {
+      toast('ZIP 导出失败：' + error.message, true);
+    } finally {
+      hideLoading();
+      exportBusy = false;
+      if (button) { button.disabled = false; button.textContent = '开始导出'; }
     }
   }
 
@@ -994,10 +1181,10 @@
     if (switchEl) switchEl.classList.toggle('on', running);
     if (running) {
       statusEl.textContent = data.connected ? '已开启' : '连接中…';
-      toggle.title = '关闭桌面纸飞机悬浮球；右键可刷新表情包或关闭';
+      toggle.title = '关闭桌面纸飞机悬浮球；右键可关闭';
     } else {
       statusEl.textContent = data && (data.error || data.dependencyError) ? (data.error || data.dependencyError) : '未开启';
-      toggle.title = '开启桌面纸飞机悬浮球；右键可刷新表情包或关闭';
+      toggle.title = '开启桌面纸飞机悬浮球；右键可关闭';
     }
   }
 
@@ -2866,16 +3053,133 @@
         renderUserstyleTemplate();
         renderUserstyleLevels();
         renderUserstyleAgents(); // v0.30.7：排除列表
+        loadUserstyleProfile(); // v2：数据画像（展柜版）
         // v0.30.9：保存提示里的方言名动态刷新
         var saveHint = $('userstyle-save-hint-name');
         if (saveHint) saveHint.textContent = userstyleName();
-        // 有运行中的任务就继续轮询
-        var running = (result.data.tasks || []).find(function (t) { return t.status === 'running'; });
-        if (running) startUserstylePoll(running.id);
+        // 后台任务可能在切页期间结束：按最新任务状态恢复草稿、失败提示或轮询。
+        var taskState = result.data.task_state || { status: 'idle' };
+        var startBtn = $('userstyle-start-btn');
+        if (taskState.status === 'running' && taskState.task_id) {
+          if (startBtn) startBtn.disabled = true;
+          renderUserstyleTaskState(taskState);
+          startUserstylePoll(taskState.task_id);
+        } else {
+          if (startBtn) startBtn.disabled = false;
+          stopUserstylePoll();
+          renderUserstyleTaskState(taskState);
+        }
       })
       .catch(function (e) {
         if (status) status.textContent = '加载失败：' + e.message;
       });
+  }
+
+  // v2：展柜版数据画像（读取 /api/style-profile，提炼过才显示）
+  var USERSTYLE_PROFILE_LOADED = false;
+  function pctShow(n) {
+    return Math.round((n || 0) * 100) + '%';
+  }
+  function userstyleMetricCell(label, value) {
+    return '<div style="min-width:86px;flex:1"><div style="font-size:11px;opacity:.75">' + escHtml(label) + '</div>'
+      + '<div style="font-size:15px;font-weight:600;color:var(--primary-dark);font-variant-numeric:tabular-nums">' + escHtml(String(value)) + '</div></div>';
+  }
+  function loadUserstyleProfile() {
+    var wrap = $('userstyle-profile-wrap');
+    if (!wrap) return;
+    // 每请求拉一次即可（数据变更靠重构/总结触发）
+    if (USERSTYLE_PROFILE_LOADED) return;
+    USERSTYLE_PROFILE_LOADED = true;
+    apiFetch(withAuth(API + '/api/style-profile'), { signal: AbortSignal.timeout(5000) })
+      .then(function (r) { return r.json(); })
+      .then(function (result) {
+        if (!result.ok || !result.data || !result.data.profile || !result.data.profile.baseline) {
+          wrap.hidden = true;
+          return;
+        }
+        var b = result.data.profile.baseline;
+        var fb = result.data.feedback || { counterexamples: [], locked: [] };
+        var box = $('userstyle-profile');
+        if (!box) return;
+        var html = '';
+        // metric 网格（4 个，偶数布局）
+        html += '<div style="display:flex;flex-wrap:wrap;gap:12px 16px;margin-bottom:8px">'
+          + userstyleMetricCell('采样消息', b.sampled)
+          + userstyleMetricCell('平均句长', (b.avg_sentence_len || 0) + ' 字')
+          + userstyleMetricCell('短消息占比', pctShow(b.short_ratio))
+          + userstyleMetricCell('波浪号使用', pctShow(b.punct && b.punct.wave))
+          + '</div>';
+        // 高频短语候选 TOP（标签式）
+        if (b.catchphrases && b.catchphrases.length) {
+          html += '<div style="margin-bottom:8px"><span style="opacity:.8">高频短语候选：</span>'
+            + b.catchphrases.map(function (c) {
+              return '<span style="display:inline-block;background:var(--primary-light);border-radius:999px;padding:1px 8px;margin:2px 4px 2px 0;font-size:11px">' + escHtml(c.phrase) + ' ×' + c.count + '</span>';
+            }).join('')
+            + '</div>';
+        }
+        // 句尾语气词排行
+        if (b.end_tone_top && b.end_tone_top.length) {
+          html += '<div style="margin-bottom:8px"><span style="opacity:.8">句尾语气词：</span>'
+            + b.end_tone_top.slice(0, 4).map(function (e) {
+              return '<span style="display:inline-block;margin-right:8px;font-size:11px">' + escHtml(e.word) + ' <b style="color:var(--primary-dark);font-weight:600">' + pctShow(e.ratio) + '</b></span>';
+            }).join('')
+            + '</div>';
+        }
+        // 标点习惯（细条）
+        var punct = b.punct || {};
+        var rows = [
+          ['波浪号', punct.wave], ['省略号', punct.ellipsis], ['感叹号', punct.exclaim],
+          ['问句', punct.question], ['光溜溜结束', punct.end_clean],
+        ];
+        html += '<div><span style="opacity:.8">标点习惯：</span>';
+        rows.forEach(function (r) {
+          var w = Math.min(100, Math.round((r[1] || 0) * 100));
+          html += '<div style="display:flex;align-items:center;gap:6px;margin-top:3px">'
+            + '<span style="width:70px;flex:none;font-size:11px">' + r[0] + '</span>'
+            + '<div style="flex:1;height:6px;background:var(--bg-soft,#f6f4ef);border-radius:3px;overflow:hidden"><div style="width:' + w + '%;height:100%;background:var(--primary);border-radius:3px"></div></div>'
+            + '<span style="width:38px;flex:none;text-align:right;font-size:11px">' + w + '%</span></div>';
+        });
+        html += '</div>';
+        // 修正回流：锁定 + 反例
+        if (fb.locked.length || fb.counterexamples.length) {
+          html += '<div style="margin-top:8px;font-size:11px;opacity:.85">';
+          if (fb.locked.length) html += '你手动加的保护句 <b style="color:var(--primary-dark);font-weight:600">' + fb.locked.length + '</b> 条；';
+          if (fb.counterexamples.length) html += '你删过的避让句 <b style="font-weight:600">' + fb.counterexamples.length + '</b> 条（下轮总结自动避开）';
+          html += '</div>';
+        }
+        box.innerHTML = html;
+        wrap.hidden = false;
+      })
+      .catch(function () { wrap.hidden = true; });
+  }
+
+  function formatUserstyleTaskError(error) {
+    var text = String(error || '').trim();
+    if (/模型未回复正文|仅思考|空正文/.test(text)) return '模型这次只返回了思考，没有生成正文';
+    return text || '未知原因';
+  }
+
+  function renderUserstyleTaskState(state) {
+    var status = $('userstyle-task-status');
+    var pText = $('userstyle-progress-text');
+    if (!state || state.status === 'idle') {
+      if (status) status.textContent = '';
+      if (pText) pText.textContent = '';
+      return;
+    }
+    if (state.status === 'running') {
+      if (status) status.textContent = '总结中，可以先去干别的，回来就好';
+      return;
+    }
+    if (state.status === 'draft') {
+      if (status) status.textContent = '新草稿已生成，往下看，确认后才会保存';
+      if (pText) pText.textContent = '';
+      return;
+    }
+    if (state.status === 'failed') {
+      if (status) status.textContent = '上次总结没有生成出来：' + formatUserstyleTaskError(state.error) + '。再点一次即可重试';
+      if (pText) pText.textContent = '';
+    }
   }
 
   function renderUserstyleTemplate() {
@@ -2900,12 +3204,16 @@
       }
     }
 
-    // 草稿区：任务完成后展示
-    var runningTask = (userstyleData.tasks || []).find(function (t) { return t.status === 'running'; });
-    var lastTask = (userstyleData.tasks || []).find(function (t) { return t.status === 'completed' && !t.confirmed; });
-    if (!runningTask && lastTask && lastTask.draft) {
-      showUserstyleDraft(lastTask.draft, lastTask.id);
-    }
+    // 草稿区只认最新任务，避免失败任务回来后把更早的旧草稿冒充新结果。
+    var latestTask = (userstyleData.tasks || [])[0];
+    var lastTask = latestTask
+      && latestTask.status === 'completed'
+      && latestTask.confirmed !== true
+      && latestTask.draft
+      ? latestTask
+      : null;
+    if (lastTask) showUserstyleDraft(lastTask.draft, lastTask.id);
+    else hideUserstyleDraft();
   }
 
   function showUserstyleDraft(draft, taskId) {
@@ -3053,7 +3361,9 @@
     var PHASE_TEXT = {
       reading: '正在读取会话记录…',
       sampling: '正在取样…',
-      distilling: '正在提炼风格（深度档可能要点时间）…',
+      baseline: '正在统计你的说话习惯…',
+      distilling: '正在分通道提炼你的风格…',
+      merging: '正在组织人格文案…',
       drafting: '草稿生成中…',
     };
 
@@ -3065,22 +3375,25 @@
           var t = result.data;
           var pText = $('userstyle-progress-text');
           if (t.status === 'running') {
-            var phase = PHASE_TEXT[t.phase] || '处理中…';
+            // v2：后端 note 带通道粒度提示（「正在分析你的词汇习惯…」），优先展示
+            var phase = t.note ? t.note : (PHASE_TEXT[t.phase] || '处理中…');
             var detail = t.total_messages ? '（共 ' + t.total_messages + ' 条发言' + (t.sampled_count ? '，已取样 ' + t.sampled_count + ' 条' : '') + '）' : '';
             if (pText) pText.textContent = phase + detail;
             if (status) status.textContent = '总结中，可以先去干别的，回来就好';
           } else if (t.status === 'completed') {
             stopUserstylePoll();
             if (pText) pText.textContent = '完成！共 ' + t.total_messages + ' 条发言，取样 ' + t.sampled_count + ' 条。';
-            if (status) status.textContent = '';
+            if (status) status.textContent = '总结完成，正在载入新草稿…';
             if (btn) btn.disabled = false;
+            // v2：画像随新快照刷新
+            USERSTYLE_PROFILE_LOADED = false;
+            loadUserstyleProfile();
             loadUserstyleData(); // 刷新拿草稿
           } else if (t.status === 'failed') {
             stopUserstylePoll();
-            if (pText) pText.textContent = '';
-            if (status) status.textContent = '';
             if (btn) btn.disabled = false;
-            toast('总结失败：' + (t.error || '未知错误'), true);
+            renderUserstyleTaskState({ status: 'failed', error: t.error });
+            toast('总结失败：' + formatUserstyleTaskError(t.error), true);
           }
         })
         .catch(function () { /* 轮询失败等下一轮 */ });
@@ -3856,6 +4169,10 @@
       });
     });
 
+    // v0.33.77 - 顶部「数据与迁移」按钮
+    var dataMigrationNav = $('btn-data-migration');
+    if (dataMigrationNav) dataMigrationNav.addEventListener('click', function () { showView('data-migration'); });
+
     // 导航：方言页 → 学我说话
     var gotoUserstyleBtn = document.getElementById('goto-userstyle-btn');
     if (gotoUserstyleBtn) {
@@ -3938,6 +4255,29 @@
     // 上传弹窗
     $('upload-btn').addEventListener('click', handleUpload);
     $('import-zip-btn').addEventListener('click', handleImportZip);
+
+    // v0.33.77 - 完整搬家包入口移到「数据与迁移」页；图库只保留普通图片/ZIP 导入。
+    var dataMigrationExportBtn = $('data-migration-export-btn');
+    if (dataMigrationExportBtn) dataMigrationExportBtn.addEventListener('click', openExportModal);
+    var dataMigrationImportBtn = $('data-migration-import-btn');
+    var dataMigrationImportFile = $('data-migration-import-file');
+    if (dataMigrationImportBtn && dataMigrationImportFile) {
+      dataMigrationImportBtn.addEventListener('click', function () { dataMigrationImportFile.click(); });
+      dataMigrationImportFile.addEventListener('change', function () {
+        var file = this.files && this.files[0];
+        if (file) chooseMigrationZip(file);
+      });
+    }
+    var exportZipBtn = $('export-zip-btn');
+    if (exportZipBtn) exportZipBtn.addEventListener('click', handleExportZip);
+    var exportPickBtn = $('export-pick-folder');
+    if (exportPickBtn) exportPickBtn.addEventListener('click', pickExportFolder);
+    var exportDefaultBtn = $('export-use-default');
+    if (exportDefaultBtn) exportDefaultBtn.addEventListener('click', function () {
+      var cfg = getExportConfig();
+      var input = $('export-dir');
+      if (input) { input.value = cfg.defaultExportDir || ''; input.focus(); }
+    });
 
     // v0.25.1 - 左右并排两个选择入口：图片文件 / 整个文件夹（互斥，后选为准）
     $('pick-files-btn').addEventListener('click', function () { $('upload-file').click(); });

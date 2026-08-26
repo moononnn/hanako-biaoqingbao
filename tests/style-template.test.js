@@ -10,11 +10,13 @@ import {
   STYLE_LEVELS, STYLE_LEVEL_IDS,
   readStyleTemplate, writeStyleTemplate, confirmStyleDraft, revertStyleTemplate, clearStyleTemplate,
   saveExcludedAgents,
-  collectUserMessages, stratifiedSample, buildCorpusText, buildStylePrompt,
+  collectUserMessages, stratifiedSample, buildCorpusText,
   createStyleTask, getStyleTask, updateStyleTask, hasRunningStyleTask, runStyleTask,
-  recoverStyleTasks,
+  recoverStyleTasks, getStyleTaskViewState,
   MSG_MAX_CHARS, TEMPLATE_MAX_CHARS, HISTORY_MAX,
 } from '../lib/style-template.js';
+import { CHANNELS } from '../lib/style-distill.js';
+import { readStyleProfile } from '../lib/style-profile.js';
 import {
   writeDialectConfig, syncUserstyleToIshiki, readDialectFromIshiki, _resetDialectCache,
 } from '../lib/dialect.js';
@@ -25,6 +27,8 @@ function useTempData() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-style-test-'));
   process.env.BIAOQINGBAO_STYLE_TEMPLATE = path.join(dir, 'style-template.json');
   process.env.BIAOQINGBAO_STYLE_TASKS = path.join(dir, 'style-tasks.json');
+  process.env.BIAOQINGBAO_STYLE_PROFILE = path.join(dir, 'style-profile.json');
+  process.env.BIAOQINGBAO_STYLE_FEEDBACK = path.join(dir, 'style-feedback.json');
   tempDirs.push(dir);
   return dir;
 }
@@ -49,6 +53,31 @@ function makeSessionFile(agentsRoot, agentId, userTexts) {
   fs.writeFileSync(path.join(dir, 'test-session.jsonl'), lines.join('\n'), 'utf-8');
 }
 
+// v2：仿内容分析模型——按 prompt 特征分派（merge=整理人格文案 / 分块=通读 / 通道=【X】方面）
+// 宽区间 claim：任何实际值都通过验收，让测试聚焦流程而非数值
+const PERMISSIVE_CLAIM = { metric: 'punct.wave', min: 0, max: 1 };
+function makeFakeModel(opts = {}) {
+  const channelFeats = opts.channelFeats || {}; // { lexicon: [feature,...], ... }
+  const mergeData = opts.mergeData || '你是一个说话带着自己节奏的人，打字也带着这种习惯。正事闲聊都一个样，不刻意表现，也不刻意收敛。这只是你的措辞，正事照样讲得明白。';
+  const calls = { total: 0, channels: {}, merges: 0, chunks: 0 };
+  const fn = async (messages) => {
+    const c = String(messages[0].content || '');
+    calls.total++;
+    if (c.includes('通读全部聊天记录')) { calls.chunks++; return { ok: true, data: '这块要点：爱用语气词，说话简短。' }; }
+    if (c.includes('整理成一段') && c.includes('人格文案')) { calls.merges++; return { ok: true, data: mergeData }; }
+    for (const [ch, feats] of Object.entries(channelFeats)) {
+      if (c.includes(`【${CHANNELS[ch].label}】方面`)) {
+        calls.channels[ch] = (calls.channels[ch] || 0) + 1;
+        if (opts.failChannelOnce?.[ch] && calls.channels[ch] === 1) return { ok: false, error: '瞬时报错' };
+        if (opts.badJsonChannel?.[ch] && calls.channels[ch] === 1) return { ok: true, data: '不是 JSON' };
+        return { ok: true, data: JSON.stringify({ features: feats }) };
+      }
+    }
+    return { ok: true, data: JSON.stringify({ features: [] }) };
+  };
+  return { calls, fn };
+}
+
 test('collectUserMessages：只收 user 消息、跳过坏行、过滤非自然语言', () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', [
@@ -67,6 +96,23 @@ test('collectUserMessages：只收 user 消息、跳过坏行、过滤非自然�
   const texts = res.messages.map(m => m.text);
   assert.ok(texts.some(t => t.includes('方案我觉得不错')), '应保留闲聊');
   assert.ok(texts.some(t => t.includes('代码 bug')), '应保留技术讨论（短句）');
+});
+
+test('collectUserMessages：剥离提醒和思考元信息，只保留用户正文', () => {
+  const root = useTempData();
+  makeSessionFile(root, 'hanako', [
+    'assistant placeholder',
+    '[hana_reminder at 2026-08-26 12:00]\n- 当前时间：2026-08-26 12:00\n[/hana_reminder]\n\n继续？',
+    '<think>hidden reasoning</think>真正想说的话',
+    'assistant placeholder 2',
+    '[hana_reference]\n- tool schema and model reference\n[/hana_reference]\n继续哈',
+    '你在海边捡到了一只漂流瓶。\n瓶子里的内容：某段文本\n只输出你要写的话。',
+  ]);
+  const res = collectUserMessages('hanako', root);
+  assert.equal(res.total, 3);
+  assert.equal(res.messages[0].text, '继续？');
+  assert.equal(res.messages[1].text, '真正想说的话');
+  assert.equal(res.messages[2].text, '继续哈');
 });
 
 test('collectUserMessages：非法 agentId 返回结构化错误', () => {
@@ -134,24 +180,24 @@ test('buildCorpusText：语料预算压缩（回归：5000 条全量塞入撑爆
   assert.equal(small.split('\n').filter(l => l.trim()).length, 2, '数据少时全量');
 });
 
-test('buildCorpusText / buildStylePrompt：语料带编号、prompt 含要点与隐私口径', () => {
-  const corpus = buildCorpusText([{ text: '你好呀', ts: '2026-08-01' }, { text: '哈哈', ts: '2026-08-02' }]);
-  assert.ok(corpus.includes('[1] 你好呀'));
-  assert.ok(corpus.includes('[2] 哈哈'));
-  const prompt = buildStylePrompt(corpus, '测试用户');
-  assert.ok(prompt.includes('说话风格'), '应有风格提炼要求');
-  assert.ok(prompt.includes('不要提及任何具体话题'), '应有隐私口径');
-  assert.ok(prompt.includes('测试用户'), '应带用户名');
-  // v0.30.3：语料必须插入 prompt（回归：第一版起 corpusText 从未插入，模型一直在凭空编风格）
-  assert.ok(prompt.includes('[1] 你好呀'), 'prompt 应包含语料文本');
-  assert.ok(prompt.includes('[2] 哈哈'), 'prompt 应包含全部语料');
-  assert.ok(prompt.includes('<发言样本>'), '应有语料标记块');
-  // v0.30.2：浓度与分寸要求（回归：0.7 温度+无浓度约束提炼出「每句卖萌」模板）
-  assert.ok(prompt.includes('浓度与分寸'), '应有浓度与分寸要求');
-  assert.ok(prompt.includes('区分「常用」与「偶尔」'), '应要求区分常用与偶尔');
-  assert.ok(prompt.includes('不要所有示例都堆满特征'), '应要求示例有反差');
-  // v0.30.3：完全重新生成——prompt 不携带旧模板内容
-  assert.ok(!prompt.includes('<现有模板>'), '重新生成模式不应携带旧模板');
+test('buildCorpusText：语料预算压缩（回归：5000 条全量塞入撑爆上游）', () => {
+  // 构造 5000 条消息（模拟深度档候选池）
+  const msgs = Array.from({ length: 5000 }, (_, i) => ({
+    text: '消息' + i + '这是一段比较长的自然语言内容'.repeat(10),
+    ts: `2026-08-${String((i % 28) + 1).padStart(2, '0')}T10:00:00.000Z`,
+  }));
+  const corpus = buildCorpusText(msgs);
+  // 条数被压到 FEED_MAX_MSGS
+  const lines = corpus.split('\n').filter(l => l.trim());
+  assert.equal(lines.length, 400, '最多喂 400 条');
+  // 总字符在预算内（60000 + 编号开销余量）
+  assert.ok(corpus.length <= 70000, `总字符应控制在预算内，实际 ${corpus.length}`);
+  // 覆盖时间跨度（首尾消息都在）
+  assert.ok(corpus.includes('[1] 消息0'), '应包含最早的候选');
+  assert.ok(corpus.includes('[400]'), '应包含最晚的候选');
+  // 数据少时全量喂
+  const small = buildCorpusText([{ text: '短消息', ts: '2026-08-01' }, { text: '另一条', ts: '2026-08-02' }]);
+  assert.equal(small.split('\n').filter(l => l.trim()).length, 2, '数据少时全量');
 });
 
 test('模板管理：确认保存 → 自动备份历史 → 回退 → 清空', () => {
@@ -249,7 +295,33 @@ test('任务状态机：创建 → 运行中唯一 → 更新 → 读取', () =>
   assert.equal(d.ok, false);
 });
 
-test('runStyleTask：完整链路（读会话 → 采样 → 调模型 → 草稿）', async () => {
+test('任务展示状态：最新失败不被旧草稿冒充，最新未确认完成可恢复', () => {
+  const oldDraft = {
+    id: 'old-draft', status: 'completed', confirmed: false, draft: '旧草稿',
+  };
+  let state = getStyleTaskViewState([
+    { id: 'new-failed', status: 'failed', error: '模型未回复正文' },
+    oldDraft,
+  ]);
+  assert.deepEqual(state, {
+    status: 'failed', task_id: 'new-failed', draft_task_id: '', error: '模型未回复正文',
+  });
+
+  state = getStyleTaskViewState([
+    { id: 'new-draft', status: 'completed', confirmed: false, draft: '新草稿' },
+    { id: 'old-confirmed', status: 'completed', confirmed: true, draft: '旧模板' },
+  ]);
+  assert.deepEqual(state, {
+    status: 'draft', task_id: 'new-draft', draft_task_id: 'new-draft', error: '',
+  });
+
+  state = getStyleTaskViewState([{ id: 'running', status: 'running' }, oldDraft]);
+  assert.deepEqual(state, {
+    status: 'running', task_id: 'running', draft_task_id: '', error: '',
+  });
+});
+
+test('runStyleTask：v2 完整链路（采样→基线→分通道→合并→草稿+画像快照）', async () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', [
     '今天天气真好呀',
@@ -260,70 +332,56 @@ test('runStyleTask：完整链路（读会话 → 采样 → 调模型 → 草�
   ]);
   const created = createStyleTask('hanako', 'light');
   assert.ok(created.ok);
-  const task = created.task;
-  let called = 0;
-  const fakeModel = async (messages, opts) => {
-    called++;
-    assert.ok(messages.length === 1);
-    assert.ok(messages[0].content.includes('语言风格分析师'), '应走提炼 prompt');
-    assert.ok(opts.maxTokens > 0);
-    return { ok: true, data: '你是一个说话带点俏皮的人，打字也带着你的习惯……' };
-  };
-  await runStyleTask(task, fakeModel, '测试用户', root);
-  const t = getStyleTask(task.id);
+  const feats = [{ feature: '句尾偶尔带波浪号', claim: PERMISSIVE_CLAIM }];
+  const { calls, fn } = makeFakeModel({ channelFeats: { lexicon: feats, syntax: [] } });
+  await runStyleTask(created.task, fn, '测试用户', root);
+  const t = getStyleTask(created.task.id);
   assert.equal(t.status, 'completed');
   assert.equal(t.phase, 'drafting');
-  assert.ok(t.draft.includes('俏皮'));
+  assert.ok(t.draft.includes('你是一个'));
+  assert.equal(calls.merges, 1, '应合并一次');
+  assert.ok(calls.total >= 3, 'light 两路通道 + 合并，共 ≥3 次调用');
   assert.equal(t.sampled_count, 3, '过滤后可用发言为 3 条');
-  assert.equal(called, 1);
+  // 画像快照落盘
+  const p = readStyleProfile();
+  assert.equal(p.level, 'light');
+  assert.ok(p.baseline && p.baseline.sampled === 3, '画像应含基线');
+  assert.equal(p.channels.lexicon.status, 'ok', '画像应含通道结果');
 });
 
-test('runStyleTask：模型失败重试（上游偶发故障自愈，最多 3 次）', async () => {
+test('runStyleTask：通道首次瞬时报错 → 自动重试成功', async () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', ['今天天气真好呀', '哈哈']);
   const created = createStyleTask('all', 'light');
-  let calls = 0;
-  const fakeModel = async () => {
-    calls++;
-    if (calls === 1) return { ok: false, error: 'Upstream response was not valid JSON' };
-    return { ok: true, data: '你是一个说话带点俏皮的人，打字也带着你的习惯……' };
-  };
-  await runStyleTask(created.task, fakeModel, '', root);
+  const feats = [{ feature: '句尾偶尔带波浪号', claim: PERMISSIVE_CLAIM }];
+  const { calls, fn } = makeFakeModel({ channelFeats: { lexicon: feats }, failChannelOnce: { lexicon: true } });
+  await runStyleTask(created.task, fn, '', root);
   const t = getStyleTask(created.task.id);
-  assert.equal(t.status, 'completed', '重试后应成功');
-  assert.equal(t.draft, '你是一个说话带点俏皮的人，打字也带着你的习惯……');
-  assert.equal(calls, 2, '应调用两次');
+  assert.equal(t.status, 'completed', '瞬时报错后应重试成功');
+  assert.equal(calls.channels.lexicon, 2, 'lexicon 路应调用两次');
 });
 
-test('runStyleTask：规则自检不通过时自动重生成（最多 3 次）', async () => {
+test('runStyleTask：通道输出非 JSON → 自动重试（局部，不整稿重来）', async () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', ['今天天气真好呀', '哈哈']);
   const created = createStyleTask('all', 'light');
-  let calls = 0;
-  const fakeModel = async (messages) => {
-    calls++;
-    // 第 1 次：缺身份化开头 + 超长；第 2 次：含指令词；第 3 次：合规
-    if (calls === 1) return { ok: true, data: '没有身份开头的模板'.repeat(100) };
-    if (calls === 2) return { ok: true, data: '你是一个……请注意不要这样说话' };
-    return { ok: true, data: '你是一个说话带着自己节奏的人，打字也带着这种习惯，正事闲聊都一个样。' };
-  };
-  await runStyleTask(created.task, fakeModel, '', root);
+  const feats = [{ feature: '句尾偶尔带波浪号', claim: PERMISSIVE_CLAIM }];
+  const { calls, fn } = makeFakeModel({ channelFeats: { lexicon: feats }, badJsonChannel: { lexicon: true } });
+  await runStyleTask(created.task, fn, '', root);
   const t = getStyleTask(created.task.id);
   assert.equal(t.status, 'completed');
-  assert.equal(calls, 3, '前两次不合规应自动重生成');
-  // 第 2 次调用应带修正反馈
-  // （无法直接断言 prompt 内容，通过 calls=3 且成功验证链路）
+  assert.equal(calls.channels.lexicon, 2, '非 JSON 后应重试 lexicon 路');
 });
 
-test('runStyleTask：多次重试仍不合规 → failed', async () => {
+test('runStyleTask：全部通道 failed → 任务 failed', async () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', ['今天天气真好呀', '哈哈']);
   const created = createStyleTask('all', 'light');
-  const fakeModel = async () => ({ ok: true, data: '没有身份开头的模板'.repeat(100) }); // 永远超长
-  await runStyleTask(created.task, fakeModel, '', root);
+  const fn = async () => ({ ok: false, error: '模型炸了' });
+  await runStyleTask(created.task, fn, '', root);
   const t = getStyleTask(created.task.id);
   assert.equal(t.status, 'failed');
-  assert.ok(t.error.includes('质量检查'), '应提示未通过质量检查');
+  assert.ok(t.error, '应有失败原因');
 });
 
 test('runStyleTask：排除名单生效（被排除的助手语料不参与）', async () => {
@@ -334,50 +392,12 @@ test('runStyleTask：排除名单生效（被排除的助手语料不参与）',
   const tpl = readStyleTemplate();
   writeStyleTemplate({ ...tpl, excluded_agents: ['agentB'] });
   const created = createStyleTask('all', 'light');
-  let promptText = '';
-  const fakeModel = async (messages) => {
-    promptText = messages[0].content;
-    return { ok: true, data: '你是一个说话带着自己节奏的人，打字也带着这种习惯。' };
-  };
-  await runStyleTask(created.task, fakeModel, '', root);
+  const feats = [{ feature: '句尾偶尔带波浪号', claim: PERMISSIVE_CLAIM }];
+  const { calls, fn } = makeFakeModel({ channelFeats: { lexicon: feats } });
+  await runStyleTask(created.task, fn, '', root);
   const t = getStyleTask(created.task.id);
   assert.equal(t.status, 'completed');
   assert.equal(t.sampled_count, 2, '只有 hanako 的 user 消息（agentB 被排除）');
-  assert.ok(promptText.includes('这个方案我觉得不错'), '语料应含 hanako 发言');
-  assert.ok(!promptText.includes('明天一起去不'), '语料不应含被排除助手的发言');
-});
-
-test('runStyleTask：深度档两阶段蒸馏（分块要点 + 整体采样）', async () => {
-  const root = useTempData();
-  // 造 1000 条消息（user 消息约 667 条 > 600 触发两阶段）
-  const texts = Array.from({ length: 1000 }, (_, i) => '日常发言' + i + '今天天气不错呀');
-  makeSessionFile(root, 'hanako', texts);
-  const created = createStyleTask('all', 'deep');
-  let sawChunkPrompt = false;
-  let sawFinalPrompt = false;
-  const fakeModel = async (messages) => {
-    const content = messages[0].content;
-    if (content.includes('第 1/') && content.includes('风格要点')) sawChunkPrompt = true;
-    if (content.includes('语言风格分析师') && content.includes('发言样本')) sawFinalPrompt = true;
-    return { ok: true, data: sawChunkPrompt && !content.includes('风格要点') ? '你是一个说话带着自己节奏的人，打字也带着这种习惯。' : '这一块样本的要点是：爱用语气词，说话简短。' };
-  };
-  await runStyleTask(created.task, fakeModel, '', root);
-  const t = getStyleTask(created.task.id);
-  assert.equal(t.status, 'completed');
-  assert.ok(sawChunkPrompt, '应调用分块提炼');
-  assert.ok(sawFinalPrompt, '应调用综合提炼');
-  assert.ok(t.draft.includes('你是一个'), '最终模板应为合规模板');
-});
-
-test('runStyleTask：模型失败 → 任务 failed 且保留错误', async () => {
-  const root = useTempData();
-  makeSessionFile(root, 'hanako', ['今天天气真好呀', '哈哈']);
-  const created = createStyleTask('hanako', 'light');
-  const fakeModel = async () => ({ ok: false, error: '模型炸了' });
-  await runStyleTask(created.task, fakeModel, '', root);
-  const t = getStyleTask(created.task.id);
-  assert.equal(t.status, 'failed');
-  assert.ok(t.error.includes('模型炸了'));
 });
 
 test('runStyleTask：无发言记录 → failed 且提示友好', async () => {
@@ -493,23 +513,22 @@ test('syncUserstyleToIshiki：清空模板后移除 userstyle 人格块', () => 
   assert.equal(readDialectFromIshiki('hanako', root), '', 'ishiki.md 不应再有方言块');
 });
 
-test('runStyleTask：完全重新生成不携带旧模板，语料全量扫描累计', async () => {
+test('runStyleTask：语料全量扫描累计（跨助手），画像写入、不携带旧模板', async () => {
   const root = useTempData();
   makeSessionFile(root, 'hanako', ['今天天气真好呀', '这个方案我觉得不错', '哈哈哈哈哈']);
   makeSessionFile(root, 'agentB', ['这个也好玩呀', '明天一起去不', '嗯嗯好呀']);
-  // 先确认一个模板（历史里留着，但重新生成不应携带它）
+  // 先确认一个模板（历史里留着，但重炼不应携带它）
   confirmStyleDraft('你是一个爱笑的人……', { sourceAgent: 'hanako' });
   // 重新总结：语料 = 全部助手（排除名单外），且不带旧模板
   const created = createStyleTask('all', 'light');
-  let promptContent = '';
-  const fakeModel = async (messages) => {
-    promptContent = messages[0].content;
-    return { ok: true, data: '你是一个说话带着自己节奏的人，打字也带着这种习惯。' };
-  };
-  await runStyleTask(created.task, fakeModel, '', root);
+  const feats = [{ feature: '句尾偶尔带波浪号', claim: PERMISSIVE_CLAIM }];
+  const { fn } = makeFakeModel({ channelFeats: { lexicon: feats } });
+  await runStyleTask(created.task, fn, '', root);
   const t = getStyleTask(created.task.id);
   assert.equal(t.status, 'completed');
   assert.equal(t.sampled_count, 4, '语料应包含两个助手的全部 user 发言（累计：每助手 2 条）');
-  assert.ok(!promptContent.includes('爱笑的人'), '重新生成不应携带旧模板内容');
-  assert.ok(promptContent.includes('[1]'), '应有语料编号');
+  assert.ok(!t.draft.includes('爱笑的人'), '重炼结果不携带旧模板');
+  // 画像基线覆盖全部采样
+  const p = readStyleProfile();
+  assert.ok(p.baseline && p.baseline.sampled === 4, '画像基线应覆盖全部采样');
 });

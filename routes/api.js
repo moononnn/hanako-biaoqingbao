@@ -3,10 +3,9 @@
 // v0.17.4-share: 公共函数统一从 lib/shared.js 导入，消除代码重复
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import {
   STICKERS_DIR, DATA_DIR, PREFERENCES_FILE, BLOCKED_FILE,
   HANA_HOME, MIME_MAP,
@@ -29,7 +28,22 @@ import {
   removeDialectFromIshiki, syncUserstyleToIshiki,
   appendDialectLog, readDialectLog,
 } from '../lib/dialect.js';
-import { extractImagesFromZip, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
+import { extractStickerArchive, hasImageSignature, detectImageFormat } from '../lib/zip-images.js';
+import {
+  exportStickerArchive,
+  buildMigrationPayload,
+  normalizeTransferMetadata,
+  normalizeMigrationPayload,
+  buildAgentMapping,
+  remapMigrationData,
+  findTransferMetadata,
+  planStickerIdMapping,
+  readAgentCatalog,
+  hashBuffer,
+  validateTransferManifest,
+  EXPORT_CONFIG_FILE_NAME,
+  writeLastExportDir,
+} from '../lib/sticker-transfer.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
 import { applyPreferenceFeedback, mutatePreferences } from '../lib/feedback.js';
 import { removeStickerExposure } from '../lib/exposure.js';
@@ -45,7 +59,15 @@ import {
   readStyleTemplate, writeStyleTemplate, confirmStyleDraft, revertStyleTemplate, clearStyleTemplate,
   saveExcludedAgents,
   readStyleTasks, getStyleTask, createStyleTask, updateStyleTask, runStyleTask,
+  getStyleTaskViewState,
 } from '../lib/style-template.js';
+// v2：数据画像 + 修正回流 + 修订 diff（分通道提炼的产物存储与沉淀）
+import { readStyleProfile, readStyleFeedback, mergeDiffIntoFeedback } from '../lib/style-profile.js';
+import { diffTemplateFeedback } from '../lib/style-distill.js';
+import { callConfiguredTextModel, extractTextResponse } from '../lib/text-model.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const EXPORT_CONFIG_FILE = path.join(DATA_DIR, EXPORT_CONFIG_FILE_NAME);
 
 // v0.30.1 - readUserName 已移到 lib/shared.js 共用；v0.30.10 移除 userstyleDisplayName（展示名固定「学我说话」）
 function nextStickerId(meta) {
@@ -61,19 +83,227 @@ function splitTags(value) {
   return value ? String(value).split(',').map(item => item.trim()).filter(Boolean) : [];
 }
 
-function buildStickerEntry(id, destFile, sourceName, fields) {
+function normalizeEntryTags(fields) {
+  const source = fields?.tags && typeof fields.tags === 'object' && !Array.isArray(fields.tags)
+    ? fields.tags
+    : fields || {};
+  const values = (value) => Array.isArray(value)
+    ? value.map((item) => String(item || '').trim()).filter(Boolean)
+    : splitTags(value);
+  const tags = {
+    emotion: values(source.emotion),
+    scene: values(source.scene),
+    keywords: values(source.keywords),
+  };
+  const atmosphere = values(source.atmosphere);
+  if (atmosphere.length > 0) tags.atmosphere = atmosphere;
+  return tags;
+}
+
+function buildStickerEntry(id, destFile, sourceName, fields = {}) {
   const ext = sourceName.split('.').pop();
-  return {
+  const description = fields.description || fields.name || sourceName.slice(0, -(ext.length + 1));
+  const entry = {
     id,
     file: destFile,
-    description: fields.description || sourceName.slice(0, -(ext.length + 1)),
-    tags: {
-      emotion: splitTags(fields.emotion),
-      scene: splitTags(fields.scene),
-      keywords: splitTags(fields.keywords),
-    },
+    description,
+    tags: normalizeEntryTags(fields),
     added_at: new Date().toISOString(),
   };
+  if (fields.name) entry.name = String(fields.name);
+  if (fields.semantic_description) entry.semantic_description = String(fields.semantic_description);
+  if (fields.added_at && Number.isFinite(Date.parse(String(fields.added_at)))) entry.added_at = String(fields.added_at);
+  if (fields.tagged_at && Number.isFinite(Date.parse(String(fields.tagged_at)))) entry.tagged_at = String(fields.tagged_at);
+  return entry;
+}
+
+function writeImportedStickerFile(destPath, data, writtenFiles) {
+  if (fs.existsSync(destPath)) throw new Error('目标图片文件已存在，已停止导入以避免覆盖');
+  const tempPath = `${destPath}.${process.pid}.${Date.now()}.part`;
+  writtenFiles.push(destPath);
+  try {
+    fs.writeFileSync(tempPath, data, { flag: 'wx' });
+    fs.renameSync(tempPath, destPath);
+  } finally {
+    try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+  }
+}
+
+function normalizeOutputDir(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw || raw.includes(String.fromCharCode(0))) return null;
+  if (!path.isAbsolute(raw) && !path.win32.isAbsolute(raw)) return null;
+  return path.resolve(raw);
+}
+
+function exportStamp(date = new Date()) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+}
+
+function chooseExportPath(directory, date = new Date()) {
+  const base = `表情包_${exportStamp(date)}`;
+  let candidate = path.join(directory, `${base}.zip`);
+  let index = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(directory, `${base}_${index}.zip`);
+    index += 1;
+  }
+  return candidate;
+}
+
+function readJsonFile(filePath, fallback) {
+  try { return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch { return fallback; }
+}
+
+function mergeAgentScopedData(current, incoming, field) {
+  const base = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  const next = incoming && typeof incoming === 'object' && !Array.isArray(incoming) ? incoming : {};
+  return {
+    ...base,
+    ...next,
+    [field]: {
+      ...(base[field] && typeof base[field] === 'object' && !Array.isArray(base[field]) ? base[field] : {}),
+      ...(next[field] && typeof next[field] === 'object' && !Array.isArray(next[field]) ? next[field] : {}),
+    },
+  };
+}
+
+function mergeMigrationData(key, incoming) {
+  const fileMap = {
+    preferences: 'preferences.json',
+    teaching: 'teaching-samples.json',
+    contextFeedback: 'context-feedback.json',
+    exposure: 'exposure-stats.json',
+    styleTemplate: 'style-template.json',
+    styleProfile: 'style-profile.json',
+    styleFeedback: 'style-feedback.json',
+    dialectConfig: 'dialect-config.json',
+    agentFreq: 'agent-freq.json',
+    displayConfig: 'display-config.json',
+    ballConfig: 'ball-config.json',
+  };
+  const fileName = fileMap[key];
+  if (!fileName) return null;
+  const filePath = path.join(DATA_DIR, fileName);
+  const current = readJsonFile(filePath, null);
+  if (key === 'preferences') {
+    return mergeAgentScopedData(current, incoming, 'users');
+  }
+  if (key === 'contextFeedback' || key === 'exposure') {
+    return mergeAgentScopedData(current, incoming, 'byAgent');
+  }
+  if (key === 'teaching') {
+    return {
+      ...(current && typeof current === 'object' ? current : {}),
+      ...(incoming && typeof incoming === 'object' ? incoming : {}),
+      version: 1,
+      // imported teaching samples intentionally have no vector; target model rebuilds them.
+      samples: {
+        ...(current?.samples && typeof current.samples === 'object' ? current.samples : {}),
+        ...(incoming?.samples && typeof incoming.samples === 'object' ? incoming.samples : {}),
+      },
+    };
+  }
+  if (key === 'dialectConfig' || key === 'agentFreq') {
+    return mergeAgentScopedData(current, incoming, 'agents');
+  }
+  // 模板、画像、修正反馈和显示/悬浮球配置是全局资产，迁移包作为来源机的完整快照覆盖当前值。
+  return incoming;
+}
+
+function commitJsonTransaction(updates) {
+  const originals = new Map();
+  for (const update of updates) {
+    if (!update?.filePath || originals.has(update.filePath)) continue;
+    try { originals.set(update.filePath, fs.readFileSync(update.filePath)); }
+    catch { originals.set(update.filePath, null); }
+  }
+  try {
+    for (const update of updates) {
+      if (!update?.filePath) continue;
+      atomicWriteJson(update.filePath, update.value);
+    }
+    return { ok: true };
+  } catch (error) {
+    // 失败时尽力恢复本轮涉及的每个文件；恢复失败也不能吞掉原始错误。
+    for (const [filePath, original] of originals) {
+      try {
+        if (original === null) fs.unlinkSync(filePath);
+        else {
+          fs.mkdirSync(path.dirname(filePath), { recursive: true });
+          fs.writeFileSync(filePath, original);
+        }
+      } catch {}
+    }
+    return { ok: false, error };
+  }
+}
+
+function dedupeReportItems(items) {
+  const seen = new Set();
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const key = JSON.stringify(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function queueTeachingVectorRebuild(samples) {
+  const list = Object.entries(samples || {});
+  if (!list.length) return 0;
+  const cfg = readEmbeddingConfig();
+  const api = resolveEmbeddingApi(cfg);
+  if (!api?.baseUrl || !api?.model) return 0;
+  // 迁移响应不等待模型请求；目标环境用当前 embedding 配置逐条重建，失败不影响已迁移的文字资料。
+  setImmediate(async () => {
+    for (const [stickerId, sample] of list) {
+      try {
+        await upsertTeachingSample(stickerId, {
+          description: sample.description || '',
+          keywords: sample.keywords || [],
+          semanticDescription: sample.semanticDescription || '',
+        });
+      } catch {}
+    }
+  });
+  return list.length;
+}
+
+function runFolderPicker(ps1, initialDir) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    let output = '';
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(String(value || '').trim());
+    };
+
+    let child;
+    try {
+      child = spawn(
+        'powershell',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', ps1, '-InitialDir', initialDir],
+        { windowsHide: true },
+      );
+    } catch {
+      finish('');
+      return;
+    }
+    child.stdout.on('data', (data) => { output += String(data); });
+    child.on('error', () => finish(''));
+    child.on('close', () => finish(output));
+    // 用户可能暂时不操作；5 分钟后结束子进程，避免请求永久挂起。
+    timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish('');
+    }, 300000);
+    timer.unref?.();
+  });
 }
 
 export default async function registerRoutes(app, ctx) {
@@ -88,6 +318,33 @@ export default async function registerRoutes(app, ctx) {
     uploadWriteChain = p.catch(() => {});
     return p;
   }
+
+  // ── 导出目录选择：由后端弹 Windows 原生 FolderBrowserDialog ──
+  // 页面本身只能回显路径；选择成功后不立即写配置，真正导出时才记住最近目录。
+  app.post('/api/export/pick-folder', async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const initial = String(body.initial ?? '').trim();
+    if (initial.length > 1024 || initial.includes(String.fromCharCode(0))) {
+      return json({ ok: false, error: '初始路径无效' }, 400);
+    }
+
+    const ps1 = path.join(__dirname, '..', 'lib', 'pick-folder.ps1');
+    if (!fs.existsSync(ps1)) {
+      return json({ ok: false, error: '缺少文件夹选择脚本' }, 500);
+    }
+
+    const picked = await runFolderPicker(ps1, initial);
+    if (!picked) return json({ ok: false, error: '没有选择文件夹' });
+
+    const outputDir = normalizeOutputDir(picked);
+    if (!outputDir) return json({ ok: false, error: '选择的路径无效' }, 400);
+    let stat = null;
+    try { stat = fs.statSync(outputDir); } catch {}
+    if (!stat || !stat.isDirectory()) {
+      return json({ ok: false, error: '选择的路径无效' }, 400);
+    }
+    return json({ ok: true, data: { directory: outputDir } });
+  });
 
   // ═══ GET /api/list — 列表（可按情绪筛选） ═══
   app.get('/api/list', (c) => {
@@ -161,9 +418,60 @@ export default async function registerRoutes(app, ctx) {
       });
     }
 
-    // ── ZIP 批量导入 ──
+    // ── ZIP 导出：图片 + 名称/标签元数据 ──
+    if (action === 'export_zip') {
+      const outputDir = normalizeOutputDir(body.outputDir);
+      if (!outputDir) return json({ ok: false, error: '请输入有效的本机文件夹路径' }, 400);
+
+      let outputPath = '';
+      let tempPath = '';
+      try {
+        if (fs.existsSync(outputDir) && !fs.statSync(outputDir).isDirectory()) {
+          return json({ ok: false, error: '保存位置不是文件夹' }, 400);
+        }
+        fs.mkdirSync(outputDir, { recursive: true });
+        outputPath = chooseExportPath(outputDir);
+        tempPath = `${outputPath}.${process.pid}.${Date.now()}.part`;
+        const result = await exportStickerArchive({
+          meta: readMeta(),
+          stickersDir: STICKERS_DIR,
+          outputPath: tempPath,
+          dataDir: DATA_DIR,
+          agentCatalog: readAgentCatalog(path.join(HANA_HOME, 'agents')),
+          pluginVersion: readJsonFile(path.join(__dirname, '..', 'manifest.json'), {}).version || '',
+        });
+        if (!result.ok) return json(result, 400);
+
+        fs.renameSync(tempPath, outputPath);
+        tempPath = '';
+        try { writeLastExportDir(EXPORT_CONFIG_FILE, outputDir); } catch {}
+        const skippedItems = result.skipped.slice(0, 30);
+        const skippedText = result.skipped.length ? `，跳过 ${result.skipped.length} 个异常文件` : '';
+        return json({
+          ok: true,
+          data: {
+            fileName: path.basename(outputPath),
+            outputPath,
+            directory: outputDir,
+            exported: result.exported,
+            skipped: result.skipped.length,
+            skippedItems,
+          },
+          message: `已导出 ${result.exported} 张表情包${skippedText}`,
+        });
+      } catch (error) {
+        return json({ ok: false, error: error.message || 'ZIP 导出失败' }, 500);
+      } finally {
+        if (tempPath) {
+          try { fs.unlinkSync(tempPath); } catch {}
+        }
+      }
+    }
+
+    // ── ZIP 批量导入：普通图片 ZIP / v1 图库包 / v2 一键搬家包 ──
     if (action === 'import_zip') {
       const { zipBase64, fileName } = body;
+      const migrationMode = body.migrationMode === true;
       if (!zipBase64 || !fileName) return json({ ok: false, error: '缺少 ZIP 文件数据' });
       if (!fileName.toLowerCase().endsWith('.zip')) return json({ ok: false, error: '请选择 ZIP 文件' });
 
@@ -172,47 +480,200 @@ export default async function registerRoutes(app, ctx) {
         return json({ ok: false, error: 'ZIP 文件为空或超过 50MB' });
 
       const writtenFiles = [];
-      try {
-        const { images, skipped } = await extractImagesFromZip(zipData);
+      // 导入和单图/批量上传共用同一写入队列，避免 nextStickerId 与落盘互相踩踏。
+      return await enqueueUploadWrite(async () => {
+        try {
+          const archive = await extractStickerArchive(zipData);
+          const manifestCheck = validateTransferManifest(archive.manifest, { found: archive.manifestFound });
+          if (!manifestCheck.ok) return json({ ok: false, error: manifestCheck.error }, 400);
+          const { images, skipped } = archive;
+          const transferIndex = archive.metadataFound ? normalizeTransferMetadata(archive.metadata) : null;
+        if (archive.metadataFound && archive.metadata !== null && !transferIndex.ok) {
+          skipped.push({ file: 'stickers.json', reason: transferIndex.error });
+        }
+
+        let migrationPayload = null;
+        if (migrationMode && archive.migrationFound) {
+          const normalized = archive.migration !== null
+            ? normalizeMigrationPayload(archive.migration)
+            : { ok: false, error: archive.migrationError || '迁移数据为空' };
+          if (normalized.ok) migrationPayload = normalized;
+          else skipped.push({ file: 'migration.json', reason: normalized.error });
+        } else if (archive.migrationFound && !migrationMode) {
+          skipped.push({ file: 'migration.json', reason: '这是完整搬家数据，请从「数据与迁移」页导入' });
+        } else if (migrationMode && Number(archive.manifest?.formatVersion) >= 2) {
+          skipped.push({ file: 'migration.json', reason: '迁移包缺少数据文件，按普通图库包导入图片' });
+        }
+
         const meta = readMeta();
-        const knownHashes = new Set();
+        const knownHashes = new Map();
         for (const sticker of meta) {
           try {
             const existing = fs.readFileSync(path.join(STICKERS_DIR, sticker.file));
-            knownHashes.add(createHash('sha256').update(existing).digest('hex'));
+            const hash = hashBuffer(existing);
+            if (!knownHashes.has(hash)) knownHashes.set(hash, sticker.id);
           } catch {}
         }
 
-        const imported = [];
-        fs.mkdirSync(STICKERS_DIR, { recursive: true });
-        for (const image of images) {
-          const hash = createHash('sha256').update(image.data).digest('hex');
-          if (knownHashes.has(hash)) {
-            skipped.push({ file: image.fileName, reason: '图片内容重复' });
-            continue;
+        const allocationMeta = meta.slice();
+        const occupiedStickerIds = new Set();
+        try {
+          for (const file of fs.readdirSync(STICKERS_DIR)) {
+            const match = String(file).match(/^(.+)\.[^.]+$/);
+            if (match?.[1]) occupiedStickerIds.add(match[1]);
           }
-          knownHashes.add(hash);
-          const id = nextStickerId(meta);
-          const destFile = id + '.' + image.ext;
+        } catch {}
+        const idPlan = planStickerIdMapping({
+          images,
+          migrationPayload,
+          existingMeta: meta,
+          existingHashes: knownHashes,
+          nextId: () => {
+            let id = '';
+            do {
+              id = nextStickerId(allocationMeta);
+              allocationMeta.push({ id });
+            } while (occupiedStickerIds.has(id));
+            occupiedStickerIds.add(id);
+            return id;
+          },
+        });
+        skipped.push(...idPlan.skipped);
+
+        const imported = [];
+        const needsTagIds = [];
+        let metadataRestored = 0;
+        const restoredAt = new Date().toISOString();
+        const exportedAt = migrationPayload?.exportedAt || archive.manifest?.exportedAt;
+        const metadataRestoreAt = Number.isFinite(Date.parse(String(exportedAt || '')))
+          ? String(exportedAt)
+          : restoredAt;
+        fs.mkdirSync(STICKERS_DIR, { recursive: true });
+        for (const item of idPlan.items) {
+          const image = item.image;
+          const destFile = item.targetId + '.' + image.ext;
           const destPath = path.join(STICKERS_DIR, destFile);
-          fs.writeFileSync(destPath, image.data);
-          writtenFiles.push(destPath);
-          const entry = buildStickerEntry(id, destFile, image.fileName, {});
+          writeImportedStickerFile(destPath, image.data, writtenFiles);
+
+          const legacyTransfer = transferIndex?.ok ? findTransferMetadata(transferIndex, image) : null;
+          const transfer = item.transfer || legacyTransfer;
+          const fields = transfer ? {
+            name: transfer.name,
+            description: transfer.description,
+            tags: transfer.tags,
+            semantic_description: transfer.semantic_description,
+            added_at: transfer.added_at,
+            tagged_at: transfer.tagged_at || (transfer.hasMetadata ? metadataRestoreAt : undefined),
+          } : {};
+          const entry = buildStickerEntry(item.targetId, destFile, image.fileName, fields);
+          if (transfer?.hasMetadata) metadataRestored += 1;
+          else needsTagIds.push(item.targetId);
           meta.push(entry);
           imported.push(entry);
         }
-        writeMeta(meta);
+
+        let migrationReport = null;
+        let migrationData = null;
+        if (migrationPayload) {
+          const targetAgents = readAgentCatalog(path.join(HANA_HOME, 'agents'));
+          const sourceAgents = migrationPayload.agents || [];
+          const agentMapping = buildAgentMapping(sourceAgents, targetAgents);
+          const remapped = remapMigrationData(migrationPayload.data, {
+            stickerIdMap: idPlan.stickerIdMap,
+            agentIdMap: agentMapping.map,
+          });
+          migrationReport = {
+            ...remapped.report,
+            unmatchedAgents: dedupeReportItems([
+              ...agentMapping.unmatched.map((item) => ({ ...item, reason: '目标环境找不到对应助手' })),
+              ...agentMapping.ambiguous.map((item) => ({ ...item, reason: '目标环境存在同名助手，未自动匹配' })),
+              ...remapped.report.unmatchedAgents,
+            ]),
+            unmatchedReferences: dedupeReportItems(remapped.report.unmatchedReferences),
+          };
+          migrationData = remapped.data;
+        }
+
+        const updates = [{ filePath: path.join(DATA_DIR, 'stickers.json'), value: meta }];
+        const migratedKeys = [];
+        if (migrationData) {
+          for (const key of Object.keys(migrationData)) {
+            const merged = mergeMigrationData(key, migrationData[key]);
+            if (merged == null) continue;
+            updates.push({
+              filePath: path.join(DATA_DIR, {
+                preferences: 'preferences.json',
+                teaching: 'teaching-samples.json',
+                contextFeedback: 'context-feedback.json',
+                exposure: 'exposure-stats.json',
+                styleTemplate: 'style-template.json',
+                styleProfile: 'style-profile.json',
+                styleFeedback: 'style-feedback.json',
+                dialectConfig: 'dialect-config.json',
+                agentFreq: 'agent-freq.json',
+                displayConfig: 'display-config.json',
+                ballConfig: 'ball-config.json',
+              }[key]),
+              value: merged,
+            });
+            migratedKeys.push(key);
+          }
+        }
+        const committed = commitJsonTransaction(updates);
+        if (!committed.ok) throw committed.error;
+
+        // 两个模块有进程内配置缓存，提交成功后刷新缓存；失败不影响已经完成的原子写。
+        if (migrationData?.agentFreq) {
+          try { writeAgentFreqConfig(readJsonFile(path.join(DATA_DIR, 'agent-freq.json'), migrationData.agentFreq)); } catch {}
+        }
+        let syncSummary = null;
+        if (migrationData?.dialectConfig) {
+          try {
+            const savedDialect = writeDialectConfig(readJsonFile(path.join(DATA_DIR, 'dialect-config.json'), migrationData.dialectConfig));
+            const synced = syncDialectToIshiki(savedDialect);
+            const repaired = reconcileDialectToIshiki(savedDialect);
+            syncSummary = { dialect: synced, repaired };
+          } catch (error) {
+            syncSummary = { dialectError: error.message || '方言人格同步失败' };
+          }
+        }
+        if (migrationData?.styleTemplate) {
+          try { syncSummary = { ...(syncSummary || {}), userstyle: syncUserstyleToIshiki() }; } catch (error) {
+            syncSummary = { ...(syncSummary || {}), userstyleError: error.message || '学我说话人格同步失败' };
+          }
+        }
+        if (migrationReport && syncSummary) migrationReport.sync = syncSummary;
+        const teachingVectorsQueued = migrationData?.teaching
+          ? queueTeachingVectorRebuild(migrationData.teaching.samples)
+          : 0;
+
+        const skippedItems = skipped.slice(0, 30);
+        const restoredText = metadataRestored ? `，恢复 ${metadataRestored} 张名称/标签` : '';
+        const migrationText = migratedKeys.length ? `，同步 ${migratedKeys.length} 类设置` : '';
         return json({
           ok: true,
-          data: { imported: imported.length, skipped: skipped.length, skippedItems: skipped.slice(0, 30), importedIds: imported.map(e => e.id) },
-          message: `成功导入 ${imported.length} 张，跳过 ${skipped.length} 个文件`,
+          data: {
+            imported: imported.length,
+            metadataRestored,
+            needsTagging: needsTagIds.length,
+            needsTagIds,
+            skipped: skipped.length,
+            skippedItems,
+            importedIds: imported.map(e => e.id),
+            migration: Boolean(migrationPayload),
+            migratedKeys,
+            migrationReport,
+            teachingVectorsQueued,
+          },
+          message: `成功导入 ${imported.length} 张${restoredText}${migrationText}，跳过 ${skipped.length} 个文件`,
         });
-      } catch (error) {
-        for (const file of writtenFiles) {
-          try { fs.unlinkSync(file); } catch {}
+        } catch (error) {
+          for (const file of writtenFiles) {
+            try { fs.unlinkSync(file); } catch {}
+          }
+          return json({ ok: false, error: error.message || 'ZIP 导入失败' }, 500);
         }
-        return json({ ok: false, error: error.message || 'ZIP 导入失败' }, 500);
-      }
+      });
     }
 
     // ── 修改 ──
@@ -621,18 +1082,15 @@ export default async function registerRoutes(app, ctx) {
         if (!cfg.providerId || !cfg.modelId) {
           return json({ ok: false, error: '请先选择供应商和模型' }, 400);
         }
-        // 走 utility:call-text（参考坑 14）
-        const result = await ctx.bus.request('utility:call-text', {
-          messages: [{ role: 'user', content: testPrompt }],
-          providerId: cfg.providerId,
-          modelId: cfg.modelId,
+        // 直接调用表单当前选定的 Hana 模型；utility:call-text 只认全局 utility，
+        // 会把插件选择静默丢掉，测试按钮因此可能测到另一台模型。
+        const result = await callConfiguredTextModel(ctx, cfg, [{ role: 'user', content: testPrompt }], {
           maxTokens: 100,
           temperature: 0.5,
-          operation: 'biaoqingbao-text-test'
-        }, { timeoutMs: 20000 });
-
-        const text = typeof result === 'string' ? result : (result.text || result.content || JSON.stringify(result));
-        return json({ ok: true, data: { reply: String(text).substring(0, 200), provider: cfg.providerId, model: cfg.modelId } });
+          timeoutMs: 20000,
+        });
+        if (!result.ok) return json({ ok: false, error: result.error }, 200);
+        return json({ ok: true, data: { reply: String(result.data || '').substring(0, 200), provider: cfg.providerId, model: cfg.modelId } });
       }
 
       if (cfg.source === 'custom') {
@@ -660,8 +1118,9 @@ export default async function registerRoutes(app, ctx) {
         }
 
         const data = await resp.json();
-        const reply = data.choices?.[0]?.message?.content || '';
-        return json({ ok: true, data: { reply: String(reply).substring(0, 200), provider: 'custom', model: cfg.customModel } });
+        const reply = extractTextResponse(data, 'openai-completions');
+        if (!reply) return json({ ok: false, error: '模型返回空正文（仅思考）' }, 200);
+        return json({ ok: true, data: { reply: reply.substring(0, 200), provider: 'custom', model: cfg.customModel } });
       }
 
       return json({ ok: false, error: '未知来源类型' }, 400);
@@ -796,37 +1255,26 @@ export default async function registerRoutes(app, ctx) {
         if (!cfg.providerId || !cfg.modelId) {
           return json({ ok: false, error: '未配置 Hana 模型', fallback: true }, 200);
         }
-        // v0.33.73 - 兜底重试：思考型模型（如 MiniMax-M3）可能只吐思考不吐正文，
-        // 宿主抛「模型未回复正文」（EMPTY_AFTER_THINKING，输出契约）；
-        // 或长上下文 15s 超时。这类概率性失败重试一次，第二次大概率拿到正文。
+        // v0.33.73 / v0.33.84 - 只对空正文、思考耗尽和超时重试一次。
+        // 这里必须走插件配置的选定模型；utility:call-text 只认全局 utility，
+        // 且无法把 DeepSeek 的 thinking 开关传给当前请求。
         let analysisErr = null;
         for (let attempt = 1; attempt <= 2; attempt++) {
-          try {
-            const result = await ctx.bus.request('utility:call-text', {
-              messages: [
-                { role: 'system', content: usePrompt },
-                { role: 'user', content: `最近的对话：\n${toAnalyze}` }
-              ],
-              providerId: cfg.providerId,
-              modelId: cfg.modelId,
-              // v0.33.73 - 250→800：思考型模型会把输出配额花在思考上，250 上限下正文只剩 1 token，
-              // 宿主剥掉思考后报「模型未回复正文」（实测 outputTokens=1）；800 与聊标签一致，思考+正文都住得下
-              maxTokens: 800,
-              temperature: 0.3,
-              operation: 'biaoqingbao-text-analysis'
-            }, { timeoutMs: 15000 });
-
-            // result 无 text/content（如只剩思考字段或空对象）按空正文处理，也算可重试
-            analysisText = typeof result === 'string' ? result : (result.text || result.content || '');
-            if (analysisText && analysisText.trim()) {
-              analysisErr = null;
-              break;
-            }
-            analysisErr = new Error('模型返回空正文（仅思考）');
-          } catch (e) {
-            analysisErr = e;
-            if (!isRetriableTextCallError(e)) break;
+          const result = await callConfiguredTextModel(ctx, cfg, [
+            { role: 'system', content: usePrompt },
+            { role: 'user', content: `最近的对话：\n${toAnalyze}` }
+          ], {
+            maxTokens: 800,
+            temperature: 0.3,
+            timeoutMs: 15000,
+          });
+          if (result.ok && String(result.data || '').trim()) {
+            analysisText = String(result.data);
+            analysisErr = null;
+            break;
           }
+          analysisErr = new Error(result.error || '模型返回空正文（仅思考）');
+          if (!isRetriableTextCallError(analysisErr)) break;
         }
         if (analysisErr) {
           return json({ ok: false, error: analysisErr.message || '模型调用失败', fallback: true }, 200);
@@ -1136,29 +1584,26 @@ export default async function registerRoutes(app, ctx) {
     }
   }
 
-  // 调用 content analysis 模型（优先 Hana utility:call-text，fallback 自定义 API）
+  // 调用 content analysis 模型（Hana 选定模型直连，fallback 自定义 API）
   async function callTextModel(messages, opts = {}) {
-    const cfg = readTextConfig();
+    const cfg = opts.config && typeof opts.config === 'object'
+      ? { ...readTextConfig(), ...opts.config }
+      : readTextConfig();
     if (!cfg.enabled) return { ok: false, error: '内容分析模型未启用，请在设置中启用' };
 
     if (cfg.source === 'hana') {
       if (!cfg.providerId || !cfg.modelId) {
         return { ok: false, error: '请先在设置中选择内容分析模型' };
       }
-      try {
-        const result = await ctx.bus.request('utility:call-text', {
-          messages,
-          providerId: cfg.providerId,
-          modelId: cfg.modelId,
-          maxTokens: opts.maxTokens || 800,
-          temperature: opts.temperature || 0.5,
-          operation: 'biaoqingbao-sticker-chat',
-        }, { timeoutMs: opts.timeoutMs || 30000 });
-        const text = typeof result === 'string' ? result : (result.text || result.content || JSON.stringify(result));
-        return { ok: true, data: text };
-      } catch (e) {
-        return { ok: false, error: '模型调用失败: ' + (e.message || e) };
-      }
+      // utility:call-text 只解析全局 utility 角色，会静默忽略 providerId/modelId。
+      // 学我说话和标签聊天必须实际调用插件配置的模型，并对思考型模型关闭思考，
+      // 否则低 maxTokens 时宿主剥掉思考后会得到“无正文”。
+      return callConfiguredTextModel(ctx, cfg, messages, {
+        maxTokens: opts.maxTokens ?? 800,
+        temperature: opts.temperature ?? 0.5,
+        timeoutMs: opts.timeoutMs ?? 30000,
+        signal: opts.signal,
+      });
     }
 
     if (cfg.source === 'custom') {
@@ -1175,8 +1620,8 @@ export default async function registerRoutes(app, ctx) {
           body: JSON.stringify({
             model: cfg.customModel,
             messages,
-            max_tokens: opts.maxTokens || 800,
-            temperature: opts.temperature || 0.5,
+            max_tokens: opts.maxTokens ?? 800,
+            temperature: opts.temperature ?? 0.5,
           }),
           signal: AbortSignal.timeout(opts.timeoutMs || 30000),
         });
@@ -1185,7 +1630,8 @@ export default async function registerRoutes(app, ctx) {
           return { ok: false, error: `模型 HTTP ${resp.status}: ${t.substring(0, 200)}` };
         }
         const data = await resp.json();
-        const text = data.choices?.[0]?.message?.content || '';
+        const text = extractTextResponse(data, 'openai-completions');
+        if (!text) return { ok: false, error: '模型返回空正文（仅思考）' };
         return { ok: true, data: text };
       } catch (e) {
         return { ok: false, error: e.message };
@@ -2101,10 +2547,11 @@ export default async function registerRoutes(app, ctx) {
         agents,
         userName: readUserName(),
         levels: STYLE_LEVELS,
+        task_state: getStyleTaskViewState(tasks),
         tasks: tasks.map(t => ({
           id: t.id, status: t.status, level: t.level, agent_id: t.agent_id,
           phase: t.phase, total_messages: t.total_messages, sampled_count: t.sampled_count,
-          draft: t.draft, // v0.30.1：必须带 draft，前端靠它展示草稿（实机发现漏字段导致「总结完没反应」）
+          draft: t.draft, confirmed: t.confirmed, // 草稿恢复必须区分已确认历史与待保存新稿
           created_at: t.created_at, updated_at: t.updated_at, error: t.error,
         })),
       },
@@ -2153,8 +2600,12 @@ export default async function registerRoutes(app, ctx) {
       setImmediate(async () => {
         try {
           await runStyleTask(task, async (messages, opts) => {
-            // 复用内容分析模型的调用链路（utility:call-text / 自定义 API）
-            return callTextModel(messages, { maxTokens: opts.maxTokens || 1200, temperature: opts.temperature || 0.5, timeoutMs: opts.timeoutMs || 120000 });
+            // 复用内容分析模型的统一调用链路（选定 Hana 模型直连 / 自定义 API）。
+            return callTextModel(messages, {
+              maxTokens: opts.maxTokens ?? 1200,
+              temperature: opts.temperature ?? 0.5,
+              timeoutMs: opts.timeoutMs ?? 120000,
+            });
           }, userName, HANA_HOME);
         } catch (e) {
           ctx?.log?.error?.('[biaoqingbao] 风格总结任务异常:', e.message || e);
@@ -2168,7 +2619,13 @@ export default async function registerRoutes(app, ctx) {
     }
   });
 
-  // ── GET /api/style-task/:id - 查任务详情（轮询进度用）──
+  // ── GET /api/style-profile - v2 数据画像 + 修正回流（展柜版前端拉取）──
+  app.get('/api/style-profile', (c) => {
+    // v2：profile 快照（统计基线 + 通道结果）与 feedback（反例库 + 锁定特征）
+    return json({ ok: true, data: { profile: readStyleProfile(), feedback: readStyleFeedback() } });
+  });
+
+  //  ── GET /api/style-task/:id - 查任务详情（轮询进度用）──
   app.get('/api/style-task/:id', (c) => {
     const t = getStyleTask(c.req.param('id'));
     if (!t) return json({ ok: false, error: '任务不存在' }, 404);
@@ -2177,6 +2634,7 @@ export default async function registerRoutes(app, ctx) {
 
   // ── POST /api/style-template/confirm - 保存草稿为当前模板（保存前自动备份旧版，可回退）──
   // v0.30.9：纯编辑器职责——只保存模板，配方言是方言页的事（移除一键套用逻辑）
+  // v2：保存时 diff 新旧模板 → 删掉的句子进反例库、新增的进锁定特征（修正回流）
   app.post('/api/style-template/confirm', async (c) => {
     try {
       const body = await c.req.json().catch(() => ({}));
@@ -2184,8 +2642,15 @@ export default async function registerRoutes(app, ctx) {
       const taskId = String(body.task_id || '');
       const sourceAgent = String(body.agent_id || '');
       const level = String(body.level || '');
+      const before = readStyleTemplate().current;
       const res = confirmStyleDraft(draft, { sourceAgent, level });
       if (!res.ok) return json({ ok: false, error: res.error }, 400);
+      // v2 修正回流：只在「旧模板非空且真的有改动」时沉淀，避免首版确认整篇被当锁定
+      let feedback = null;
+      if (before && before !== draft) {
+        const d = diffTemplateFeedback(before, draft);
+        if (d.removed.length || d.added.length) feedback = mergeDiffIntoFeedback(d, 'user-edit');
+      }
       // v0.31.0：模板更新后自动同步到已开启「学我说话」的助手 ishiki.md，
       // 否则重启后 Hana 组装系统提示词读到的还是旧模板（回归：保存不生效）
       const sync = syncUserstyleToIshiki();
@@ -2194,7 +2659,7 @@ export default async function registerRoutes(app, ctx) {
         const t = getStyleTask(taskId);
         if (t) updateStyleTask(taskId, { confirmed: true });
       }
-      return json({ ok: true, data: res.data, sync });
+      return json({ ok: true, data: res.data, sync, feedback });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }

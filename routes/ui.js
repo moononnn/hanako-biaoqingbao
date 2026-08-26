@@ -3,6 +3,7 @@
 // v0.17.4-share: 公共函数从 lib/shared.js 导入
 import fs from 'node:fs';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
   DATA_DIR, VISION_CFG_FILE, TEXT_CFG_FILE, EMBEDDING_CFG_FILE,
@@ -13,6 +14,7 @@ import {
 } from '../lib/shared.js';
 import { AUTO_FIT_MAX } from '../lib/smart-fit.js';
 import { readContextFeedback } from '../lib/context-feedback.js';
+import { EXPORT_CONFIG_FILE_NAME, readLastExportDir } from '../lib/sticker-transfer.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, '..', 'assets');
@@ -43,6 +45,8 @@ function renderPage() {
   const safeVisionConfig = { ...visionConfig, customApiKey: visionConfig.customApiKey ? '********' : '' };
   const safeTextConfig = { ...textConfig, customApiKey: textConfig.customApiKey ? '********' : '' };
   const safeEmbeddingConfig = { ...embeddingConfig, customApiKey: embeddingConfig.customApiKey ? '********' : '' };
+  const exportConfigPath = path.join(DATA_DIR, EXPORT_CONFIG_FILE_NAME);
+  const defaultExportDir = readLastExportDir(exportConfigPath, path.join(homedir(), 'Downloads'));
 
   let prefsData = { version: 1, users: {} };
   try { prefsData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'preferences.json'), 'utf-8')); } catch {}
@@ -109,6 +113,17 @@ function renderPage() {
     // v0.17.5 - 右上角「模型设置」胶囊按钮，参考「任务 (X)」的细线胶囊样式
     + '.home-text-btn{font-size:13px;padding:5px 14px;border:1px solid var(--border);border-radius:14px;background:var(--surface);cursor:pointer;color:var(--text-muted);font-family:inherit;display:inline-flex;align-items:center;white-space:nowrap;transition:all .15s}'
     + '.home-text-btn:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
+    // v0.33.77 - 数据与迁移页：整包搬家入口与导入反馈
+    + '.migration-panel{max-width:760px;margin:0 auto}'
+    + '.migration-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:22px;box-shadow:var(--shadow);margin-bottom:14px}'
+    + '.migration-card h3{font-size:16px;font-weight:600;margin-bottom:8px;color:var(--text)}'
+    + '.migration-card p{font-size:13px;line-height:1.7;color:var(--text-muted);margin-bottom:14px}'
+    + '.migration-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}'
+    + '.migration-actions .btn{width:auto}'
+    + '.migration-status{margin-top:14px;padding:10px 12px;background:var(--surface-alt);border:1px solid var(--border-light);border-radius:var(--radius-sm);font-size:12px;line-height:1.7;color:var(--text-muted);white-space:pre-wrap;word-break:break-word}'
+    + '.migration-status.is-error{color:var(--danger);border-color:#e6b8b0;background:var(--danger-light)}'
+    + '.migration-security{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 18px;margin-top:12px;font-size:12px;color:var(--text-muted);line-height:1.6}'
+    + '@media(max-width:560px){.migration-security{grid-template-columns:1fr}}'
     // v0.31.0 - 悬浮球开关放在插件主页，图库只负责加入/移出表情包
     + '.ball-toggle-wrap{display:inline-flex;align-items:center;gap:8px;padding:5px 10px 5px 12px;border:1px solid var(--border);border-radius:16px;background:var(--surface);color:var(--text-muted);font-size:12px;font-family:inherit;cursor:pointer;transition:all .15s;white-space:nowrap}'
     + '.ball-toggle-wrap:hover{border-color:var(--primary);color:var(--primary);background:var(--primary-light)}'
@@ -326,6 +341,10 @@ function renderPage() {
     + '.form-group input[type=file]{width:100%;padding:6px 0;font-size:13px;color:var(--text-muted)}'
     + '.form-hint{font-size:11px;line-height:1.6;color:var(--text-muted);margin-top:4px}'
     + '.import-result{margin-top:14px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-alt);font-size:12px;line-height:1.65;color:var(--text);white-space:pre-wrap;max-height:180px;overflow:auto}'
+    + '.export-dir-row{display:flex;align-items:center;gap:8px}'
+    + '.export-dir-row input{flex:1;min-width:0}'
+    + '.export-dir-row .btn{white-space:nowrap}'
+    + '.export-dir-note{font-size:11px;line-height:1.65;color:var(--text-muted);margin-top:8px;padding:8px 10px;background:var(--primary-light);border-radius:var(--radius-sm)}'
     + '.modal-box.fixed-modal-box{max-height:84vh;display:flex;flex-direction:column;overflow:hidden;padding:0}'
     + '.modal-head{position:relative;flex-shrink:0;padding:22px 24px 14px;border-bottom:1px solid var(--border-light)}'
     + '.modal-head h2{margin:0;padding-right:40px}'
@@ -334,6 +353,8 @@ function renderPage() {
     + '.modal-foot .modal-actions{margin-top:0}'
     + '.import-section{padding:16px;border:1px dashed var(--border);border-radius:var(--radius);background:var(--surface-alt);margin-bottom:14px}'
     + '.import-section:last-of-type{margin-bottom:0}'
+    + '.export-section{padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface-alt);margin-bottom:14px}'
+    + '.export-section-title{font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px}'
     + '.import-section-title{font-size:14px;font-weight:600;color:var(--text);margin-bottom:4px}'
     + '.import-section-desc{font-size:11px;line-height:1.6;color:var(--text-muted);margin-bottom:10px}'
     + '.upload-pick-row{display:flex;flex-wrap:wrap;gap:8px}'
@@ -509,10 +530,11 @@ function renderPage() {
     + '<span class="spacer"></span>'
     + '<button class="home-text-btn" id="btn-check-update" title="检查 GitHub 上的新版本">检查更新</button>'
     + '<button class="home-text-btn" id="btn-feedback" title="遇到 bug 或有建议，来 GitHub 提 issue">反馈</button>'
-    + '<button class="ball-toggle-wrap" id="ball-toggle-top" type="button" title="开关桌面纸飞机悬浮球；右键可刷新表情包或关闭" aria-label="纸飞机悬浮球开关" aria-pressed="false">'
+    + '<button class="ball-toggle-wrap" id="ball-toggle-top" type="button" title="开关桌面纸飞机悬浮球；右键可关闭" aria-label="纸飞机悬浮球开关" aria-pressed="false">'
     + '<span class="ball-toggle-label">悬浮球</span><span class="ball-toggle-switch"><span class="ball-toggle-thumb"></span></span></button>'
     + '<span class="ball-status-top" id="ball-status-top" role="status">未开启</span>'
     + '<button class="home-text-btn" id="btn-settings" title="模型设置">模型设置</button>'
+    + '<button class="home-text-btn" id="btn-data-migration" title="导出或导入整个表情包插件的数据">数据与迁移</button>'
     + '</div>'
     + '<div class="home-main">'
     + '<div class="model-guide" id="model-guide">'
@@ -568,7 +590,35 @@ function renderPage() {
     + '</div>' // end view-home
 
     // ═══════════════════════════════════
-    //  视图 2：表情包库
+    //  视图 2：数据与迁移（v0.33.77 一键搬家）
+    // ═══════════════════════════════════
+    + '<div class="view hidden" id="view-data-migration">'
+    + '<div class="sub-header">'
+    + '<button class="back-btn" data-goto="home">← 返回</button>'
+    + '<h2>数据与迁移</h2>'
+    + '</div>'
+    + '<div class="migration-panel">'
+    + '<div class="migration-card">'
+    + '<h3>📦 一键搬家包</h3>'
+    + '<p>把这个插件带到另一台电脑或另一套 Hana：图片、名称、描述、标签、偏好、教学记录、应景记录、学我说话资料，以及方言/频率/悬浮球等可迁移设置会一起打包。导入时会按图片哈希重新建立新 ID，已有同图也会正确接上原来的关联。</p>'
+    + '<div class="migration-actions">'
+    + '<button type="button" class="btn btn-primary" id="data-migration-export-btn">导出一键搬家包</button>'
+    + '<input type="file" id="data-migration-import-file" accept=".zip,application/zip" style="display:none">'
+    + '<button type="button" class="btn btn-secondary" id="data-migration-import-btn">导入一键搬家包</button>'
+    + '</div>'
+    + '<div class="migration-status" id="data-migration-status" role="status">导出会打开保存位置设置；导入前会先检查 ZIP，普通旧 ZIP 也仍然可以从「添加入库」导入。</div>'
+    + '<div class="migration-security">'
+    + '<div>✓ 会带走：图片与用户自己调过的内容</div>'
+    + '<div>✓ 会重建：图片 ID、教学向量（按当前模型）</div>'
+    + '<div>× 不会带走：API Key、模型配置、聊天会话</div>'
+    + '<div>× 不会带走：日志、批量任务、机器路径和运行状态</div>'
+    + '</div>'
+    + '</div>'
+    + '</div>'
+    + '</div>'
+
+    // ═══════════════════════════════════
+    //  视图 3：表情包库
     // ═══════════════════════════════════
     + '<div class="view hidden" id="view-library">'
     + '<div class="library-controls">'
@@ -678,7 +728,7 @@ function renderPage() {
     + '<h2 id="userstyle-title">' + userstyleName + '</h2>'
     + '</div>'
     + '<div class="pref-section">'
-    + '<div class="dialect-desc" id="userstyle-desc">让助手学你的说话方式打字：点一下按钮，插件会读取你与所选助手的聊天记录，提炼你的说话习惯（用词、句式、标点、口头禅），生成一段可自己修改的方言模板。聊得越多，总结越准。\n模板确认后，到「方言口音」里给助手选上「' + userstyleName + '」就生效了。</div>'
+    + '<div class="dialect-desc" id="userstyle-desc">让助手学你的说话方式打字：点一下按钮，插件会读取你与所选助手的聊天记录，提炼你的说话习惯（用词、短语、句式、标点），生成一段可自己修改的方言模板。聊得越多，总结越准。\n模板确认后，到「方言口音」里给助手选上「' + userstyleName + '」就生效了。</div>'
     // v0.31.0：内容分析模型未配置时的前置引导（避免点总结才被拒绝）
     + (textReady ? '' : '<div class="form-group" style="background:var(--bg-soft,#f6f4ef);border:1px solid var(--border);border-radius:10px;padding:10px 12px;font-size:13px;color:var(--text-muted)">'
       + '总结需要先配置「内容分析模型」（提炼风格时用来分析你的聊天记录）。'
@@ -725,6 +775,11 @@ function renderPage() {
     + '<button type="button" class="btn" id="userstyle-clear-btn">清空模板</button>'
     + '</div>'
     + '</div>'
+    // v2：展柜版数据画像（统计基线 + 反例/锁定，提炼后展示）
+    + '<div class="form-group" id="userstyle-profile-wrap" hidden>'
+    + '<label style="display:block;margin-bottom:6px">你的说话画像（总结后自动生成）</label>'
+    + '<div id="userstyle-profile" style="font-size:12px;line-height:1.6;color:var(--text-muted)"></div>'
+    + '</div>'
     + '<div class="form-group" style="margin-top:10px">'
     + '<div class="form-hint">隐私说明：总结时只读取你与所选助手（以及之前总结过的其他助手）在本机的聊天记录，仅提炼说话风格（不提炼也不存储对话内容），数据不出本机。</div>'
     + '</div>'
@@ -740,7 +795,7 @@ function renderPage() {
     + '<div class="modal-body">'
     + '<div class="import-section">'
     + '<div class="import-section-title">导入图片</div>'
-    + '<div class="import-section-desc">可以一次选择多张、选整个文件夹、导入 ZIP 包，或直接 Ctrl+V 粘贴图片。导入后可批量 AI 识图自动打标签。ZIP 最多 50MB、500 个文件，重复或异常文件自动跳过。</div>'
+    + '<div class="import-section-desc">可以一次选择多张、选整个文件夹、导入 ZIP 包，或直接 Ctrl+V 粘贴图片。导入后可批量 AI 识图自动打标签。ZIP 最多 50MB、2000 个文件，重复或异常文件自动跳过。</div>'
     + '<div class="form-group">'
     + '<div class="paste-zone" id="paste-zone" tabindex="0" title="先从聊天软件复制表情包，点一下这里，再按 Ctrl+V 即可粘贴">'
     + '<div class="paste-zone-title">点击这里，然后按 Ctrl+V 粘贴</div>'
@@ -766,6 +821,27 @@ function renderPage() {
     + '</div>'
     + '<div class="import-result" id="upload-result" hidden></div>'
     + '</div></div></div>'
+
+    // ═══════════════════════════════════
+    //  弹窗：导出迁移包
+    // ═══════════════════════════════════
+    + '<div class="modal-overlay" id="export-modal" hidden>'
+    + '<div class="modal-box fixed-modal-box" style="position:relative;width:520px">'
+    + '<div class="modal-head"><h2>导出一键搬家包</h2><button class="modal-close" data-close="export-modal">✕</button></div>'
+    + '<div class="modal-body">'
+    + '<div class="export-section">'
+    + '<div class="export-section-title">把整个表情包插件带走</div>'
+    + '<div class="import-section-desc">图片、名称、描述、标签、偏好、教学记录、应景记录、学我说话资料，以及方言/频率/悬浮球等可迁移设置会一起放进 ZIP。API Key、模型配置、聊天会话、日志、批量任务和机器路径不会带出。</div>'
+    + '<div class="form-group">'
+    + '<label for="export-dir">保存到文件夹</label>'
+    + '<div class="export-dir-row"><input type="text" id="export-dir" spellcheck="false" placeholder="填写或选择本机文件夹路径"><button type="button" class="btn btn-secondary" id="export-pick-folder">选择文件夹…</button><button type="button" class="btn btn-secondary" id="export-use-default">默认目录</button></div>'
+    + '<div class="form-hint">可以手动填写，也可以点「选择文件夹…」；第一次导出后会记住上次的位置，目录不存在时会自动创建。</div>'
+    + '</div>'
+    + '<div class="export-dir-note" id="export-summary">当前图库会导出为一个新的 ZIP 文件。</div>'
+    + '</div>'
+    + '</div>'
+    + '<div class="modal-foot"><div class="modal-actions"><button class="btn btn-secondary" data-close="export-modal">先不导出</button><button class="btn btn-primary" id="export-zip-btn">开始导出</button></div></div>'
+    + '</div></div>'
 
     // ═══════════════════════════════════
     //  弹窗：设置（识图模型 + 分析模型）
@@ -924,6 +1000,7 @@ function renderPage() {
     + '<script>window.__CONTEXT_FEEDBACK__=' + JSON.stringify(contextFeedbackData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_CONFIG__=' + JSON.stringify(safeEmbeddingConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_MODELS__=' + JSON.stringify(embeddingModels).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__EXPORT_CONFIG__=' + JSON.stringify({ lastExportDir: defaultExportDir, defaultExportDir: path.join(homedir(), 'Downloads') }).replace(/</g, '\\u003c') + ';</script>'
     + '<script>' + js + '</script></body></html>';
 }
 
