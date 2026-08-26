@@ -61,6 +61,9 @@ EDGE_INSET = 16
 RECENT_POLL_MS = 1500
 RECENT_EXTRA_HEIGHT = 112
 CHAT_EXTRA_HEIGHT = 292
+PANEL_FADE_DELAY_MS = 1200
+PANEL_FADE_OPACITY = 0.78
+PANEL_FADE_POLL_MS = 80
 
 
 def sticker_columns_for_width(width):
@@ -514,16 +517,6 @@ class BallContextMenu(QFrame):
         title = QLabel("纸飞机悬浮球")
         title.setObjectName("menuTitle")
         root.addWidget(title)
-        hint = QLabel("纸飞机样式已定案，右键只保留常用操作")
-        hint.setObjectName("menuHint")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-
-        refresh = QPushButton("刷新表情包")
-        refresh.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh.clicked.connect(self.refresh_panel)
-        root.addWidget(refresh)
-
         close = QPushButton("关闭悬浮球")
         close.setCursor(Qt.CursorShape.PointingHandCursor)
         close.clicked.connect(self.close_ball)
@@ -537,10 +530,6 @@ class BallContextMenu(QFrame):
             "border:1px solid #d7e5dc; border-radius:10px; font-family:'Microsoft YaHei UI'; font-size:12px; }"
             "QPushButton:hover { color:#437a65; border-color:#5dae8e; background:#eef8f2; }"
         )
-
-    def refresh_panel(self):
-        self.ball.panel.refresh()
-        self.close()
 
     def close_ball(self):
         self.close()
@@ -1129,6 +1118,7 @@ class RecognizePanel(QFrame):
 
     def wait_paste(self):
         """打开等待粘贴态：用户自己按 Ctrl+V 后才读取剪贴板图片。"""
+        self.ball.close_auxiliary_menus()
         self.request_seq += 1
         self.busy = False
         self.sticker_id = None
@@ -1222,6 +1212,7 @@ class RecognizePanel(QFrame):
         self.start(b64, ext, source_name)
 
     def start(self, image_b64, ext='png', source_name=None):
+        self.ball.close_auxiliary_menus()
         self._paste_shortcut.setEnabled(False)
         self._set_tag_editors_visible(True)
         # 拖入/粘贴的大图先压缩，避免 IPC body 超限（413 body 太大）；GIF 动图未超限时原样保留
@@ -1467,6 +1458,10 @@ class BallPanel(QFrame):
         self.recent_timer = QTimer(self)
         self.recent_timer.setInterval(RECENT_POLL_MS)
         self.recent_timer.timeout.connect(self.refresh_recent_async)
+        self._panel_outside_since = None
+        self._fade_poll_timer = QTimer(self)
+        self._fade_poll_timer.setInterval(PANEL_FADE_POLL_MS)
+        self._fade_poll_timer.timeout.connect(self._refresh_panel_opacity)
         self.chat_sticker_id = None
         self.chat_session_id = None
         self.chat_suggestion = None
@@ -2135,6 +2130,7 @@ class BallPanel(QFrame):
         self.chat_send_button.setText("思考中…" if self.chat_busy else "发送")
 
     def prepare_for_show(self):
+        self.restore_panel_opacity()
         self.move_to_ball()
         self.refresh()
         self.refresh_recent_async()
@@ -2169,6 +2165,38 @@ class BallPanel(QFrame):
             self.apply_items({"ok": True, "items": self.items})
         rect = (self.ball.x(), self.ball.y(), self.ball.width(), self.ball.height())
         self.move(*position_popup_beside(rect, (self.width(), self.height()), bounds))
+
+    def _panel_pointer_inside(self):
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _panel_fade_blocked(self):
+        if self._panel_dragging:
+            return True
+        if getattr(getattr(self, "recog_panel", None), "isVisible", lambda: False)():
+            return True
+        sticker_menu = getattr(self, "_sticker_menu", None)
+        if sticker_menu is not None and sticker_menu.isVisible():
+            return True
+        context_menu = getattr(self.ball, "context_menu", None)
+        return context_menu is not None and context_menu.isVisible()
+
+    def restore_panel_opacity(self):
+        self._panel_outside_since = None
+        if self.windowOpacity() < 0.999:
+            self.setWindowOpacity(1.0)
+
+    def _refresh_panel_opacity(self):
+        if not self.isVisible():
+            return
+        if self._panel_fade_blocked() or self._panel_pointer_inside():
+            self.restore_panel_opacity()
+            return
+        now = time.monotonic()
+        if self._panel_outside_since is None:
+            self._panel_outside_since = now
+            return
+        if now - self._panel_outside_since >= PANEL_FADE_DELAY_MS / 1000.0:
+            self.setWindowOpacity(PANEL_FADE_OPACITY)
 
     def clear_grid(self):
         while self.grid.count():
@@ -2608,9 +2636,13 @@ class BallPanel(QFrame):
     # v0.33.38 - 面板显示时播动图、隐藏时全部暂停（省 CPU）
     def showEvent(self, event):
         super().showEvent(event)
+        self.restore_panel_opacity()
+        self._fade_poll_timer.start()
         self._set_all_movies(True)
 
     def hideEvent(self, event):
+        self._fade_poll_timer.stop()
+        self.restore_panel_opacity()
         super().hideEvent(event)
         self._set_all_movies(False)
 
@@ -2904,6 +2936,8 @@ class BallPanel(QFrame):
 
     def shutdown(self):
         self.recent_timer.stop()
+        self._fade_poll_timer.stop()
+        self.restore_panel_opacity()
         self.recent_request_seq += 1
         self.recent_feedback_seq += 1
         self.chat_request_seq += 1
@@ -3024,7 +3058,7 @@ class Ball(QWidget):
         self.visual_state = "hover" if self.hovered else "normal"
         label = VARIANT_LABELS[self.variant]
         self.setAccessibleName(label + "悬浮球")
-        self.setAccessibleDescription("点击打开表情包面板，拖动可以移动，右键刷新表情包或关闭悬浮球")
+        self.setAccessibleDescription("点击打开表情包面板，拖动可以移动，右键关闭悬浮球")
         self.update()
 
     def set_visual_state(self, state):
@@ -3159,7 +3193,19 @@ class Ball(QWidget):
         self.panel.raise_()
         self.panel.activateWindow()
 
+    def close_auxiliary_menus(self):
+        menu = self.context_menu
+        if menu is not None:
+            menu.close()
+        sticker_menu = getattr(self.panel, "_sticker_menu", None)
+        if sticker_menu is not None:
+            sticker_menu.close()
+            self.panel._sticker_menu = None
+
     def toggle_context_menu(self):
+        # 识图确认是独立流程，期间不再打开纸飞机右键菜单，避免覆盖编辑面板。
+        if self.panel.recog_panel.isVisible():
+            return
         # 左右键不互斥：开右键菜单不收起左键面板，两个弹窗可并存
         if self.context_menu is not None and self.context_menu.isVisible():
             self.context_menu.close()
@@ -3293,6 +3339,9 @@ class Ball(QWidget):
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseButtonPress:
             pos = event.globalPosition().toPoint()
+            if self.panel.recog_panel.isVisible():
+                # 识图流程独占纸飞机，外部点击与右键菜单均不介入。
+                return super().eventFilter(obj, event)
             # 表情包右键菜单：点菜单外（空白/别处）收起
             sticker_menu = getattr(self.panel, '_sticker_menu', None)
             if sticker_menu is not None and sticker_menu.isVisible():
@@ -3310,6 +3359,21 @@ class Ball(QWidget):
                 if event.button() == Qt.MouseButton.RightButton and self.geometry().contains(pos):
                     return super().eventFilter(obj, event)
                 menu.close()
+            if event.button() == Qt.MouseButton.LeftButton and self.panel.isVisible():
+                # 识图确认是独立流程：保持可见、可编辑，不受普通面板的外部点击规则影响。
+                if self.panel.recog_panel.isVisible():
+                    return super().eventFilter(obj, event)
+                in_ball = self.rect().contains(self.mapFromGlobal(pos))
+                in_panel = self.panel.rect().contains(self.panel.mapFromGlobal(pos))
+                in_popup = False
+                for popup in (sticker_menu, menu):
+                    if popup is not None and popup.isVisible() and popup.rect().contains(popup.mapFromGlobal(pos)):
+                        in_popup = True
+                        break
+                if in_ball or in_panel or in_popup:
+                    self.panel.restore_panel_opacity()
+                else:
+                    self.panel.close()
         return super().eventFilter(obj, event)
 
     def paintEvent(self, event):

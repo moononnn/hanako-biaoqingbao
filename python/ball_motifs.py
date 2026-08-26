@@ -29,8 +29,8 @@ INK = "#52635a"
 MINT_DEEP = "#65a98d"
 PINK_DEEP = "#b86f84"
 TRAIL_APRICOT = "#e3b36c"
-# 纸飞机主体和尾流共用一套缩放，视觉上比旧版收小一档，但仍保留 72px 点击热区。
-PLANE_MOTIF_SCALE = 0.80
+# 纸飞机主体和尾流共用一套缩放，再收小一点，但仍保留 72px 点击热区。
+PLANE_MOTIF_SCALE = 0.74
 # 以下是整体缩放前的局部坐标：首道波纹收低到尾巴尖尖附近，仍留出独立间距。
 TRAIL_BAND_ORIGIN_Y = 23.5
 TRAIL_PARTICLE_ORIGIN_Y = 25.0
@@ -360,8 +360,9 @@ def _draw_plane(animator, painter, bounds):
     pose_hover = 0.0 if click > 0.0 else hover
 
     idle_x = 0.0 if active_pose else math.sin(phase * 1.15) * (2.1 + pose_hover * 1.4)
-    idle_y = 0.0 if active_pose else math.sin(phase * 2.05 + 0.75) * (1.25 + pose_hover * 0.65) - pose_hover * 2.2
-    idle_angle = 0.0 if active_pose else math.sin(phase * 0.92) * 2.1 + pose_hover * math.sin(phase * 2.4) * 3.5
+    idle_y = 0.0 if active_pose else math.sin(phase * 2.05 + 0.75) * (1.55 + pose_hover * 0.65) - pose_hover * 2.2
+    # 待机时让机头随慢气流轻轻俯仰；进入悬停、拖拽或冲刺后由对应姿态接管。
+    idle_angle = 0.0 if active_pose else math.sin(phase * 1.18 + 0.22) * 3.4 + pose_hover * math.sin(phase * 2.4) * 3.5
     angle = PLANE_BASE_ANGLE + idle_angle + pose_hover * pointer_y * 2.0
     if drag_strength > 0.0:
         angle += drag_x * 14.0 + drag_y * 4.0

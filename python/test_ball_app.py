@@ -100,6 +100,28 @@ class BallLayoutTests(unittest.TestCase):
         self.assertNotEqual(hover, click, "点击必须有独立的冲刺尾流和流星反馈")
         self.assertGreater(sum(1 for value in idle[3::4] if value), 150)
 
+    def test_paper_plane_idle_has_visible_pitch_bob(self):
+        animator = ball_motifs.MotifAnimator("plane", animations_enabled=True)
+
+        def alpha_bbox(frame):
+            visible = [index for index, value in enumerate(frame[3::4]) if value]
+            return (
+                min(index % ball_app.BALL_SIZE for index in visible),
+                min(index // ball_app.BALL_SIZE for index in visible),
+                max(index % ball_app.BALL_SIZE for index in visible),
+                max(index // ball_app.BALL_SIZE for index in visible),
+            )
+
+        with patch.object(ball_motifs, "_draw_meteors", lambda *args: None), patch.object(
+            ball_motifs, "_draw_gas_trail", lambda *args: None
+        ):
+            centers_y = []
+            for phase in (0.4, 1.6, 2.8, 4.8):
+                animator.elapsed = phase
+                bbox = alpha_bbox(rendered_bytes(animator))
+                centers_y.append((bbox[1] + bbox[3]) / 2.0)
+        self.assertGreater(max(centers_y) - min(centers_y), 3.0, "待机时机头应有可见的轻微俯仰起伏")
+
     def test_paper_plane_hover_and_click_bursts_are_triggered_and_decay(self):
         animator = ball_motifs.MotifAnimator("plane", animations_enabled=True)
         animator.set_hovered(True)
@@ -288,8 +310,8 @@ class BallLayoutTests(unittest.TestCase):
             max(index % ball_app.BALL_SIZE for index in visible),
             max(index // ball_app.BALL_SIZE for index in visible),
         )
-        self.assertGreaterEqual(bbox[2] - bbox[0], 45)
-        self.assertLessEqual(bbox[2] - bbox[0], 51)
+        self.assertGreaterEqual(bbox[2] - bbox[0], 39)
+        self.assertLessEqual(bbox[2] - bbox[0], 43)
         self.assertEqual(ball_app.BALL_SIZE, 72)
 
     def test_paper_plane_shape_does_not_add_lines_or_decorations(self):
@@ -814,7 +836,7 @@ class BallLayoutTests(unittest.TestCase):
             child.text()
             for child in ball.context_menu.findChildren(ball_app.QPushButton)
         ]
-        self.assertEqual(labels, ["刷新表情包", "关闭悬浮球"])
+        self.assertEqual(labels, ["关闭悬浮球"])
         self.assertFalse(hasattr(ball.context_menu, "variant_buttons"))
         self.assertIn("纸飞机", ball.context_menu.findChild(ball_app.QLabel).text())
         ball.close()
@@ -833,6 +855,73 @@ class BallLayoutTests(unittest.TestCase):
             Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
         )
         ball.eventFilter(None, outside)
+        self.assertFalse(ball.context_menu.isVisible())
+        ball.close()
+        self.app.processEvents()
+
+    def test_outside_click_closes_normal_panel_but_not_recognition_panel(self):
+        ball = ball_app.Ball()
+        ball.move(200, 200)
+        ball.panel.move(40, 40)
+        ball.panel.show()
+        self.app.processEvents()
+        self.assertTrue(ball.panel.isVisible())
+        outside = mouse_event(
+            QEvent.Type.MouseButtonPress, 700, 500,
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+        )
+        ball.eventFilter(None, outside)
+        self.app.processEvents()
+        self.assertFalse(ball.panel.isVisible())
+
+        ball.panel.show()
+        ball.panel.recog_panel.wait_paste()
+        self.app.processEvents()
+        self.assertTrue(ball.panel.recog_panel.isVisible())
+        ball.eventFilter(None, outside)
+        self.app.processEvents()
+        self.assertTrue(ball.panel.isVisible())
+        self.assertTrue(ball.panel.recog_panel.isVisible())
+        ball.close()
+        self.app.processEvents()
+
+    def test_normal_panel_fades_after_delay_and_recognition_panel_stays_opaque(self):
+        ball = ball_app.Ball()
+        panel = ball.panel
+        panel._panel_pointer_inside = lambda: False
+        panel.show()
+        self.app.processEvents()
+        self.assertTrue(panel._fade_poll_timer.isActive())
+        QTest.qWait(ball_app.PANEL_FADE_DELAY_MS + ball_app.PANEL_FADE_POLL_MS + 100)
+        self.app.processEvents()
+        self.assertAlmostEqual(panel.windowOpacity(), ball_app.PANEL_FADE_OPACITY, places=2)
+
+        panel._panel_pointer_inside = lambda: True
+        QTest.qWait(ball_app.PANEL_FADE_POLL_MS + 40)
+        self.app.processEvents()
+        self.assertAlmostEqual(panel.windowOpacity(), 1.0, places=2)
+
+        panel.recog_panel.wait_paste()
+        self.app.processEvents()
+        panel.setWindowOpacity(ball_app.PANEL_FADE_OPACITY)
+        panel._panel_pointer_inside = lambda: False
+        QTest.qWait(ball_app.PANEL_FADE_POLL_MS + 40)
+        self.app.processEvents()
+        self.assertAlmostEqual(panel.windowOpacity(), 1.0, places=2)
+        ball.close()
+        self.app.processEvents()
+
+    def test_recognition_panel_blocks_context_menu(self):
+        ball = ball_app.Ball()
+        ball.panel.show()
+        ball.toggle_context_menu()
+        self.app.processEvents()
+        self.assertTrue(ball.context_menu.isVisible())
+        ball.panel.recog_panel.wait_paste()
+        self.app.processEvents()
+        self.assertFalse(ball.context_menu.isVisible())
+        ball.toggle_context_menu()
+        self.app.processEvents()
         self.assertFalse(ball.context_menu.isVisible())
         ball.close()
         self.app.processEvents()

@@ -499,13 +499,25 @@ test('纸飞机使用连续 QPainter 动画，并带尾流与流星层', () => {
   assert.doesNotMatch(motifSrc, /猫爪|挑灯|便签纸/);
 });
 
-test('右键菜单不再提供其他悬浮球样式切换', () => {
+test('右键菜单只保留关闭入口', () => {
   const src = fs.readFileSync(path.join(process.cwd(), 'python', 'ball_app.py'), 'utf8');
   const menu = src.match(/class BallContextMenu[\s\S]*?(?=\n\nclass TargetMenu)/)?.[0] || '';
   assert.match(menu, /纸飞机悬浮球/);
-  assert.match(menu, /刷新表情包/);
+  assert.doesNotMatch(menu, /右键只保留关闭入口/);
+  assert.doesNotMatch(menu, /刷新表情包|refresh_panel/);
   assert.match(menu, /关闭悬浮球/);
   assert.doesNotMatch(menu, /variant_buttons|switch_variant|\/variant|猫爪|挑灯|便签纸/);
+});
+
+test('普通面板支持点击空白关闭与延迟淡出，识图弹窗单独排除', () => {
+  const src = fs.readFileSync(path.join(process.cwd(), 'python', 'ball_app.py'), 'utf8');
+  assert.match(src, /PANEL_FADE_DELAY_MS = 1200/);
+  assert.match(src, /PANEL_FADE_OPACITY = 0\.78/);
+  assert.match(src, /def _refresh_panel_opacity\(/);
+  assert.match(src, /self\.panel\.recog_panel\.isVisible\(\)/);
+  assert.match(src, /self\.panel\.close\(\)/);
+  assert.match(src, /def close_auxiliary_menus\(/);
+  assert.match(src, /def toggle_context_menu\([\s\S]*?recog_panel\.isVisible\(\)[\s\S]*?return/);
 });
 
 test('持续自运动主体用全局光标、滞回热区和离开宽限判断 hover', () => {
