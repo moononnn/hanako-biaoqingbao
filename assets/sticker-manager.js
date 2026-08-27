@@ -110,19 +110,18 @@
     document.querySelectorAll('.view').forEach(function (v) { v.classList.add('hidden'); });
     var view = $('view-' + name);
     if (view) view.classList.remove('hidden');
-    if (name === 'library') syncFitToggle();
-    if (name === 'preferences') syncFbToggle();
+    if (name === 'preferences') { syncSizeMode(); syncFitToggle(); syncFbToggle(); }
     window.scrollTo(0, 0);
   }
 
   // v0.24.0 - 图库页：小图自适应拨动开关
-  function syncFitToggle() {
-    var t = $('sticker-fit-toggle');
-    if (!t) return;
+  // v0.33.77 - 升级为图片尺寸档位选择器（auto/small/medium/large）
+  function syncSizeMode() {
+    var s = $('size-mode-select');
+    if (!s) return;
     var cfg = window.__DISPLAY_CONFIG__ || {};
-    var on = cfg.smallImageFit !== false;
-    t.classList.toggle('on', on);
-    t.setAttribute('aria-checked', on ? 'true' : 'false');
+    var mode = ['auto', 'small', 'medium', 'large'].includes(cfg.sizeMode) ? cfg.sizeMode : 'auto';
+    s.value = mode;
   }
   // v0.28.0 - 偏好设置页：配图卡片反馈按钮显示开关
   function syncFbToggle() {
@@ -158,6 +157,15 @@
       toast('保存失败，网络开小差了', true);
     }
   }
+  // v0.24.0 - 小图自适应拨动开关（v0.33.78 恢复到偏好页，与档位选择器配合）
+  function syncFitToggle() {
+    var t = $('sticker-fit-toggle');
+    if (!t) return;
+    var cfg = window.__DISPLAY_CONFIG__ || {};
+    var on = cfg.smallImageFit !== false;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
   async function toggleStickerFit() {
     var t = $('sticker-fit-toggle');
     if (!t) return;
@@ -173,13 +181,37 @@
       if (data.ok) {
         window.__DISPLAY_CONFIG__ = data.data;
         t.setAttribute('aria-checked', next ? 'true' : 'false');
-        toast(next ? '自适应已开启：小图贴原图，大图自动填满' : '自适应已关闭：大图放大填满、小图保持原尺寸');
+        toast(next ? '小图自适应已开启：小于档位的图按原尺寸显示，不放大防糊' : '小图自适应已关闭：所有图一律按档位尺寸显示');
       } else {
         t.classList.toggle('on', !next);
         toast('保存失败: ' + (data.error || '出错了'), true);
       }
     } catch (e) {
       t.classList.toggle('on', !next);
+      toast('保存出错: ' + e.message, true);
+    }
+  }
+  async function changeSizeMode() {
+    var s = $('size-mode-select');
+    if (!s) return;
+    var mode = s.value;
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/display-config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sizeMode: mode }),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        window.__DISPLAY_CONFIG__ = data.data;
+        var labels = { auto: '自动：小图原尺寸、大图填满', small: '小图：固定小尺寸显示', medium: '中图：固定中尺寸显示', large: '大图：固定大尺寸显示' };
+        toast('图片尺寸已切换：' + (labels[mode] || mode));
+      } else {
+        syncSizeMode();
+        toast('保存失败: ' + (data.error || '出错了'), true);
+      }
+    } catch (e) {
+      syncSizeMode();
       toast('保存出错: ' + e.message, true);
     }
   }
@@ -4428,7 +4460,14 @@
     $('filter-emotion').addEventListener('change', loadStickers);
     $('filter-search').addEventListener('input', applyFilter);
 
-    // v0.24.0 - 图库页小图自适应开关
+    // v0.33.77 - 偏好设置页：图片尺寸档位选择器
+    var sizeModeEl = $('size-mode-select');
+    if (sizeModeEl) {
+      sizeModeEl.addEventListener('change', changeSizeMode);
+      syncSizeMode();
+    }
+
+    // v0.24.0 - 偏好设置页：小图自适应开关（v0.33.78 恢复）
     var fitToggleEl = $('sticker-fit-toggle');
     if (fitToggleEl) {
       fitToggleEl.addEventListener('click', toggleStickerFit);

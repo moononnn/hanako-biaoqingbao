@@ -1080,6 +1080,30 @@ class BallLayoutTests(unittest.TestCase):
             ball.close()
             self.app.processEvents()
 
+    def test_recognition_button_shows_in_progress_state_and_restores_on_error(self):
+        """识图请求进行时按钮直接显示状态，失败后恢复可重试。"""
+        ball = ball_app.Ball()
+        try:
+            ball.panel.open_drop_recognition("aGVsbG8=", "png", "test.png")
+            self.app.processEvents()
+            recog = ball.panel.recog_panel
+            with patch.object(ball_app.BackgroundRequest, "start", lambda _worker: None):
+                recog.run_recognition()
+                self.assertTrue(recog.busy)
+                self.assertFalse(recog.btn_go.isEnabled())
+                self.assertEqual(recog.btn_go.text(), "识图中")
+                self.assertEqual(recog.status.text(), "")
+
+                recog._on_recognition_done({"ok": False, "error": "测试失败"}, recog.request_seq)
+
+            self.assertFalse(recog.busy)
+            self.assertTrue(recog.btn_go.isEnabled())
+            self.assertEqual(recog.btn_go.text(), "识别")
+            self.assertEqual(recog.status.text(), "识别失败：测试失败")
+        finally:
+            ball.close()
+            self.app.processEvents()
+
     def test_recognition_panel_resets_button_after_first_save(self):
         """第一张入库成功后自动切回主面板，再拖入第二张图识别流程仍可用。"""
         ball = ball_app.Ball()
@@ -1105,6 +1129,7 @@ class BallLayoutTests(unittest.TestCase):
                 QTest.qWait(5)
                 self.app.processEvents()
             self.assertEqual(ball.panel.recog_panel.step, "editing")
+            self.assertEqual(ball.panel.recog_panel.btn_go.text(), "确认入库")
             ball.panel.recog_panel.confirm_save()
             for _ in range(6):
                 QTest.qWait(5)

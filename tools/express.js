@@ -118,26 +118,47 @@ function reply(obj) {
   return { content: [{ type: 'text', text: JSON.stringify(obj) }] };
 }
 
+// v0.33.4 - 踩坑修正：0.712.5 宿主两个渲染组件对 aspectRatio 格式要求相反——
+//   聊天流内嵌卡（SendButton chunk 的 wd）用 gd() 做 `e.split(":")` 拆分，**只认字符串 "W:H"**；
+//   数字会直接 TypeError 崩掉整张卡（实测 1.99 → 没卡）。Chalkboard 卡（CardShell Cce）才认数字。
+//   所以插件必须发字符串，这里保留原生 calcCardAspectRatio 的字符串产物，不再转数字。
 // v0.31.7 - 卡片必须显式提供宽高比；新宿主对缺失 aspectRatio 的插件卡片可能不创建可见 iframe。
 // v0.33.1 - 宿主槽位宽恒 400（只按比例算初始高度），且响应 ui.resize 宽度收窄（50~400 有效）。
 // 卡片初始尺寸直接用 400:<目标高度> 贴合图高，图片加载后 fitCard 再上报实际宽度：
 //   短边<400 的图贴原尺寸（小卡），≥400 的图填满 400（大卡），整卡随图收缩。
 // size 缺省或解析失败时回退 '400:430'（旧行为，保证异常不炸）。
-const BTN_RESERVE = 64; // 底部反馈按钮排预留：14(img-card 边框+padding) + 8(gap) + 30(按钮区) + 12(body padding)
-function calcCardAspectRatio(size, smart) {
+// v0.33.77 - 新增 sizeMode 档位：small=160 / medium=260 / large=400 / auto=原智能自适应。
+//   固定档时初始宽度直接用档位宽（宿主开窗即按档位），高度按图比例算，避免先弹 400 大白框再缩。
+// v0.33.78 - 固定档 + smart(小图自适应)开：原图小于档位宽时按原尺寸算初始高度，避免小图被拉伸；
+//   关时一律按档位宽（强行统一）。与前端 fitDecision 同口径。
+const BTN_RESERVE = 50; // 底部反馈按钮排预留：8(gap) + 30(按钮区) + 12(body padding)；v0.33.4 去掉 img-card 边框/内边距(14) 后同步调小
+const SIZE_MODE_WIDTH = { small: 160, medium: 260, large: 400 };
+function calcCardAspectRatio(size, smart, sizeMode) {
   if (!size || !size.width || !size.height) return '400:430';
   const ratio = size.height / size.width;
   let dispW;
-  if (smart !== false) {
+  if (sizeMode && SIZE_MODE_WIDTH[sizeMode]) {
+    const capW = SIZE_MODE_WIDTH[sizeMode];
+    const minSide = Math.min(size.width, size.height);
+    // 固定档 + 小图自适应开 + 原图小于档位宽 → 按原尺寸，不放大防糊
+    if (smart !== false && minSide < capW) {
+      dispW = size.width;
+    } else {
+      dispW = capW;
+    }
+  } else if (smart !== false) {
     // v0.33.72 - 智能开：一律按放大填满 400 算（0.686+ 聊天流宽度锁死，ui.resize 不生效，
-    // 小图不再贴原尺寸留白；卡片高 = 放大后的图高 + 按钮区预留）
+    //   小图不再贴原尺寸留白；卡片高 = 放大后的图高 + 按钮区预留）
     dispW = 400;
   } else {
     // 关闭智能：回退旧行为（大图按 400 基准放大填满、小图原尺寸交给 iframe 内 fitCard）
     const minSide = Math.min(size.width, size.height);
     dispW = minSide >= 200 ? 400 : size.width;
   }
-  dispW = Math.max(50, Math.round(dispW));
+  // v0.33.102 - dispW 收敛到宿主槽位 [50, 400]：原尺寸分支（横图宽度 > 400、或超宽扁图）
+  //   若直接按原宽算高度，aspectRatio 与前端 fitCard 实际显示口径不一致 → 卡片下方多出留白。
+  //   前端 displayW = min(iframe宽≤400, naturalWidth) 天然不会超 400，这里补上同一上限。
+  dispW = Math.max(50, Math.min(400, Math.round(dispW)));
   const imgH = Math.round(dispW * ratio);
   const totalH = Math.min(600, imgH + BTN_RESERVE);
   return `400:${Math.round(totalH)}`;
@@ -166,6 +187,7 @@ export function buildStickerCard({
   sessionPath,
   size,     // v0.32.3 - { width, height }，可选；缺省回退 '400:430'
   smart,    // v0.32.3 - 是否启用智能多档（默认 true）；false 回退旧行为
+  sizeMode, // v0.33.77 - 图片尺寸档位 auto/small/medium/large（auto = 智能自适应）
 }) {
   const emotionLabel = normalizeCardEmotionLabel(primaryEmotion) || normalizeCardEmotionLabel(emotion);
   return {
@@ -175,7 +197,7 @@ export function buildStickerCard({
     sessionRef,
     sessionPath,
     route: `/sticker?id=${encodeURIComponent(id)}&label=${encodeURIComponent(description)}&score=${score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}${sessionPath ? `&sessionPath=${encodeURIComponent(sessionPath)}` : ''}`,
-    aspectRatio: calcCardAspectRatio(size, smart),
+    aspectRatio: calcCardAspectRatio(size, smart, sizeMode),
     title: emotionLabel ? `${emotionLabel}小表情来啦` : '小表情来啦',
   };
 }
@@ -610,9 +632,11 @@ export async function execute(input, ctx) {
     // 图片尺寸算初始 aspectRatio，否则恒回退 400:430 大白卡，小图撑不满卡片。
     let size = imageSizeFromBuffer(buffer);
     let smart = true;
+    let sizeMode = 'auto';
     try {
       const cfg = JSON.parse(await readFile(join(dataDir, 'display-config.json'), 'utf8'));
       smart = cfg.smallImageFit !== false;
+      sizeMode = ['auto', 'small', 'medium', 'large'].includes(cfg.sizeMode) ? cfg.sizeMode : 'auto';
     } catch {}
     const cardOptions = {
       id: best.id,
@@ -626,6 +650,7 @@ export async function execute(input, ctx) {
       sessionPath: ctx.sessionPath,
       size,
       smart,
+      sizeMode,
     };
     // v0.33.67 - 新宿主强制纯 card iframe（不附加 media，避免任何重复）；旧宿主走原 details 协议。
     const details = isNewHost

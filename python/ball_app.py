@@ -1342,7 +1342,8 @@ class RecognizePanel(QFrame):
         if self.busy:
             return
         self.busy = True
-        self.status.setText('识别中...')
+        self.status.setText('')
+        self.btn_go.setText('识图中')
         self.btn_go.setEnabled(False)
         seq = self.request_seq
         payload = {'imageBase64': self.image_b64, 'fileName': self.source_name or f'ball_{int(time.time())}.{self.image_ext}'}
@@ -1356,8 +1357,9 @@ class RecognizePanel(QFrame):
         if seq != self.request_seq:
             return
         self.busy = False
-        self.btn_go.setEnabled(True)
         if not result or not result.get('ok'):
+            self.btn_go.setText('识别')
+            self.btn_go.setEnabled(True)
             self.status.setText('识别失败：' + ((result or {}).get('error') or '未知错误'))
             return
         d = result.get('data') or {}
@@ -1527,6 +1529,15 @@ class BallPanel(QFrame):
             "QFrame#chatPreview { background:#fff7f9; border:1px solid #e8b7c8; border-radius:9px; }"
             "QLabel#chatPreviewTitle { color:#a05e72; font-family:'Microsoft YaHei UI'; font-size:11px; font-weight:700; }"
             "QLabel#chatPreviewText { color:#46574f; font-family:'Microsoft YaHei UI'; font-size:10px; line-height:1.5; }"
+            # 滚动条统一：细薄荷圆条（与网页端同规范，2026-08-26）
+            "QScrollBar:vertical { background:transparent; width:8px; margin:0; }"
+            "QScrollBar::handle:vertical { background:#c9dfd3; border-radius:4px; min-height:28px; }"
+            "QScrollBar::handle:vertical:hover { background:#5dae8e; }"
+            "QScrollBar:horizontal { background:transparent; height:8px; margin:0; }"
+            "QScrollBar::handle:horizontal { background:#c9dfd3; border-radius:4px; min-width:28px; }"
+            "QScrollBar::handle:horizontal:hover { background:#5dae8e; }"
+            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical, QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { height:0; width:0; }"
+            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical, QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background:transparent; }"
         )
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)

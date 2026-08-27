@@ -1335,7 +1335,7 @@ export default async function registerRoutes(app, ctx) {
 
   // ═══ GET /api/display-config — 读取配图卡片显示配置 ═══
   app.get('/api/display-config', (c) => {
-    let cfg = { smallImageFit: true };
+    let cfg = { smallImageFit: true, sizeMode: 'auto' };
     try {
       cfg = { ...cfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) };
     } catch {}
@@ -1344,16 +1344,19 @@ export default async function registerRoutes(app, ctx) {
 
   // ═══ POST /api/display-config — 保存配图卡片显示配置 ═══
   // v0.28.0 - 合并式写入：前端只传改动的字段时保留其他配置，避免整体覆盖丢字段（坑 28）
+  // v0.33.77 - 新增 sizeMode 图片尺寸档位（auto/small/medium/large），auto = 原智能自适应行为
   app.post('/api/display-config', async (c) => {
     try {
       const body = await c.req.json();
       let old = {};
       try { old = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')); } catch {}
       const threshold = Math.max(50, Math.min(500, Number(body.smallImageThreshold) || old.smallImageThreshold || 200));
+      const validModes = ['auto', 'small', 'medium', 'large'];
       const cfg = {
         smallImageFit: typeof body.smallImageFit === 'boolean' ? body.smallImageFit : (typeof old.smallImageFit === 'boolean' ? old.smallImageFit : true),
         smallImageThreshold: threshold,
         showFeedbackButtons: typeof body.showFeedbackButtons === 'boolean' ? body.showFeedbackButtons : (typeof old.showFeedbackButtons === 'boolean' ? old.showFeedbackButtons : true),
+        sizeMode: validModes.includes(body.sizeMode) ? body.sizeMode : (validModes.includes(old.sizeMode) ? old.sizeMode : 'auto'),
       };
       atomicWriteJson(path.join(DATA_DIR, 'display-config.json'), cfg);
       return json({ ok: true, data: cfg });

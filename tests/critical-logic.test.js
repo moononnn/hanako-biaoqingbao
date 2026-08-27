@@ -262,21 +262,21 @@ test('表情包按 Hana 宿主版本分流：新版 media、旧版和未知版�
   });
 });
 
-test('配图卡片按图片实际尺寸动态定宽高比（v0.33.72：智能开一律放大填满 400）', () => {
-  // 微小图（短边 100）：智能开 → 放大填满 400，高度按比例+按钮预留（BTN_RESERVE=64）
-  assert.equal(buildStickerCard({ id: 'a', description: '小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: true }).aspectRatio, '400:464');
+test('配图卡片按图片实际尺寸动态定宽高比（v0.33.72：智能开一律放大填满 400；v0.33.4 去掉边框后 BTN_RESERVE=50）', () => {
+  // 微小图（短边 100）：智能开 → 放大填满 400，高度按比例+按钮预留（BTN_RESERVE=50）
+  assert.equal(buildStickerCard({ id: 'a', description: '小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: true }).aspectRatio, '400:450');
   // 横向小图 100x60
-  assert.equal(buildStickerCard({ id: 'a', description: '横向小图', score: 1, emotion: '开心', size: { width: 100, height: 60 }, smart: true }).aspectRatio, '400:304');
+  assert.equal(buildStickerCard({ id: 'a', description: '横向小图', score: 1, emotion: '开心', size: { width: 100, height: 60 }, smart: true }).aspectRatio, '400:290');
   // 中等图 200px：同样放大填满
-  assert.equal(buildStickerCard({ id: 'a', description: '200图', score: 1, emotion: '开心', size: { width: 200, height: 200 }, smart: true }).aspectRatio, '400:464');
+  assert.equal(buildStickerCard({ id: 'a', description: '200图', score: 1, emotion: '开心', size: { width: 200, height: 200 }, smart: true }).aspectRatio, '400:450');
   // 中图 600px（短边 ≥400 → 填满 400，正方形图高度按 400 算）
-  assert.equal(buildStickerCard({ id: 'a', description: '600图', score: 1, emotion: '开心', size: { width: 600, height: 600 }, smart: true }).aspectRatio, '400:464');
+  assert.equal(buildStickerCard({ id: 'a', description: '600图', score: 1, emotion: '开心', size: { width: 600, height: 600 }, smart: true }).aspectRatio, '400:450');
   // 大图 2000px（≥400 → 填满 400）
-  assert.equal(buildStickerCard({ id: 'a', description: '大图', score: 1, emotion: '开心', size: { width: 2000, height: 2000 }, smart: true }).aspectRatio, '400:464');
+  assert.equal(buildStickerCard({ id: 'a', description: '大图', score: 1, emotion: '开心', size: { width: 2000, height: 2000 }, smart: true }).aspectRatio, '400:450');
   // 关闭智能：回退旧行为（短边≥200 按 400 放大填满）
-  assert.equal(buildStickerCard({ id: 'a', description: '关智能', score: 1, emotion: '开心', size: { width: 400, height: 200 }, smart: false }).aspectRatio, '400:264');
+  assert.equal(buildStickerCard({ id: 'a', description: '关智能', score: 1, emotion: '开心', size: { width: 400, height: 200 }, smart: false }).aspectRatio, '400:250');
   // 关闭智能：极小图（短边<200）保持原尺寸比例（防糊）
-  assert.equal(buildStickerCard({ id: 'a', description: '关智能小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: false }).aspectRatio, '400:164');
+  assert.equal(buildStickerCard({ id: 'a', description: '关智能小图', score: 1, emotion: '开心', size: { width: 100, height: 100 }, smart: false }).aspectRatio, '400:150');
   // 尺寸缺失/非法回退默认
   assert.equal(buildStickerCard({ id: 'a', description: '缺尺寸', score: 1, emotion: '开心' }).aspectRatio, '400:430');
   assert.equal(buildStickerCard({ id: 'a', description: '非法尺寸', score: 1, emotion: '开心', size: { width: -1, height: 0 } }).aspectRatio, '400:430');
@@ -287,7 +287,8 @@ test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {
   assert.ok(source.includes("type: 'hana.ready'"), '卡片页面必须发送 hana.ready');
   assert.ok(source.includes("type: 'ui.resize'"), '卡片页面必须发送 ui.resize（宿主可识别的尺寸事件名）');
   assert.ok(!source.includes("type: 'hana.ui.resize'"), '旧错误事件名 hana.ui.resize 必须移除，宿主不识别');
-  assert.doesNotMatch(source, /type:\s*['\"]resize-request['\"]/);
+  // v0.33.4 - 0.712.5 宿主聊天流内嵌卡裸分支只认 resize-request，必须补发（老宿主忽略未知 type）
+  assert.ok(source.includes("type: 'resize-request'"), '必须补发 resize-request 裸消息（0.712.5 宿主唯一认的裸尺寸事件）');
 });
 
 test('新宿主（0.686+ 纯 card iframe）也必须按图片尺寸算 aspectRatio（回归：size 被旧分支条件挡住 → 恒回退 400:430 大白卡）', () => {

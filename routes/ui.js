@@ -56,7 +56,7 @@ function renderPage() {
   const contextFeedbackData = readContextFeedback({ dataDir: DATA_DIR });
   // v0.24.0 - 配图卡片显示配置（小图自适应开关）
   // v0.28.0 - 新增 showFeedbackButtons：聊天卡片下方喜欢/不喜欢按钮显示开关
-  let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true };
+  let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true, sizeMode: 'auto' };
   try { displayCfg = { ...displayCfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) }; } catch {}
 
   return '<!DOCTYPE html>'
@@ -87,6 +87,12 @@ function renderPage() {
     + '}'
     + '*{margin:0;padding:0;box-sizing:border-box}'
     + '[hidden]{display:none!important}'
+    // 滚动条统一：细薄荷圆条（横竖同规范，2026-08-26）
+    + '*::-webkit-scrollbar{width:8px;height:8px}'
+    + '*::-webkit-scrollbar-track{background:transparent}'
+    + '*::-webkit-scrollbar-thumb{background:#c9dfd3;border-radius:99px;border:2px solid var(--bg)}'
+    + '*::-webkit-scrollbar-thumb:hover{background:var(--primary)}'
+    + '*{scrollbar-width:thin;scrollbar-color:#c9dfd3 transparent}'
     + 'body{font-family:-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);padding:0}'
     // ═══ 视图容器 ═══
     + '.view{padding:24px;max-width:1100px;margin:0 auto}'
@@ -190,6 +196,10 @@ function renderPage() {
     + '.fit-toggle.on .fit-knob{left:18px}'
     + '.fit-label{font-size:12px;color:var(--text-muted);white-space:nowrap;transition:color .15s}'
     + '.fit-toggle.on .fit-label{color:var(--primary-dark);font-weight:600}'
+    + '/* v0.33.77 - 图片尺寸档位选择器（自动/小/中/大） */'
+    + '.size-mode-select{padding:6px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px;background:var(--surface);color:var(--text-muted);font-family:inherit;cursor:pointer;flex-shrink:0;transition:border-color .15s,color .15s}'
+    + '.size-mode-select:hover,.size-mode-select:focus{border-color:var(--primary);color:var(--primary-dark);outline:none}'
+    + '.size-mode-select option{color:var(--text)}'
     // ═══ 批量工具栏 ═══
     + '.batch-toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;background:var(--primary-light);border:1px solid var(--primary);border-radius:var(--radius-sm);padding:8px 14px;margin-bottom:14px;font-size:13px;position:sticky;bottom:0;z-index:15;box-shadow:0 -2px 12px rgba(45,58,53,.08);backdrop-filter:blur(8px)}'
     + '.batch-toolbar .batch-info{color:var(--primary-dark);font-weight:500}'
@@ -228,6 +238,8 @@ function renderPage() {
     + '.pref-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:16px}'
     + '.pref-section h3{font-size:14px;font-weight:600;color:var(--primary-dark);margin-bottom:12px;display:flex;align-items:center;gap:6px}'
     + '.pref-section .section-desc{font-size:12px;color:var(--text-muted);margin-bottom:14px;line-height:1.6}'
+    + '/* v0.33.77 - 偏好设置行（图片尺寸档位） */'
+    + '.pref-row{display:flex;align-items:center}'
     + '.pref-stats{display:flex;gap:16px;margin-bottom:14px}'
     + '.pref-stats .stat-box{min-width:60px}'
     + '.pref-stats .stat-label{font-size:10px;color:var(--text-muted)}'
@@ -632,10 +644,6 @@ function renderPage() {
     + '<button class="back-btn" id="btnToggleMulti">多选图片识图</button>'
     + '</div>'
     + '<div class="filter-bar">'
-    + '<div class="fit-toggle" id="sticker-fit-toggle" role="switch" aria-checked="true" title="智能多档自适应：小图不放大防糊、中大图自动缩放不撑满（默认开启）。关 = 回到旧行为：大图放大填满、小图保持原尺寸。">'
-    + '<span class="fit-track"><span class="fit-knob"></span></span>'
-    + '<span class="fit-label">智能自适应</span>'
-    + '</div>'
     + '<select id="filter-emotion"><option value="">全部情绪</option><option value="开心">开心</option><option value="搞笑">搞笑</option><option value="鼓励">鼓励</option><option value="感谢">感谢</option><option value="难过">难过</option><option value="无语">无语</option><option value="可爱">可爱</option><option value="嘲讽">嘲讽</option><option value="治愈">治愈</option></select>'
     + '<input type="text" id="filter-search" placeholder="搜索描述 / 关键词...">'
     + '</div>'
@@ -664,8 +672,24 @@ function renderPage() {
     // v0.28.0 - 配图卡片反馈按钮显示开关（聊天里表情包卡片下方喜欢/不喜欢）
     + '<div class="pref-section">'
     + '<h3>🃏 配图卡片</h3>'
-    + '<div class="section-desc">聊天里每次配图时，表情包卡片下方会有一排「喜欢 / 不喜欢」按钮，用来调教配图偏好。只想看表情包图片、不想要按钮的话，关掉这个开关即可。</div>'
-    + '<div class="fit-toggle" id="sticker-fb-toggle" role="switch" aria-checked="true" title="开 = 卡片下方显示喜欢/不喜欢按钮；关 = 卡片只显示表情包图片">'
+    + '<div class="section-desc">聊天里每次配图时，表情包卡片会显示一张图片。这里控制图片的显示尺寸，以及卡片下方那排「喜欢 / 不喜欢」按钮。</div>'
+    // v0.33.77 - 图片尺寸档位选择器（自动/小/中/大），全局生效
+    + '<div class="pref-row" style="margin-bottom:10px">'
+    + '<span class="fit-label" style="margin-right:10px">图片尺寸</span>'
+    + '<select class="size-mode-select" id="size-mode-select" title="配图卡片尺寸：自动=小图原尺寸/大图填满（默认）；小/中/大=固定宽度显示">'
+    + '<option value="auto">自动</option>'
+    + '<option value="small">小（160）</option>'
+    + '<option value="medium">中（260）</option>'
+    + '<option value="large">大（400）</option>'
+    + '</select>'
+    + '<span class="section-hint" style="margin-left:8px;font-size:11px;color:var(--text-light)">自动：小图按原尺寸、大图自动填满</span>'
+    + '</div>'
+    // v0.33.78 - 小图自适应开关：固定档下小于档位的图按原尺寸显示，不拉伸防糊
+    + '<div class="fit-toggle" id="sticker-fit-toggle" role="switch" aria-checked="true" title="开 = 小于档位尺寸的图按原图大小显示，不拉伸（防小图糊掉）；关 = 所有图一律按档位尺寸显示">'
+    + '<span class="fit-track"><span class="fit-knob"></span></span>'
+    + '<span class="fit-label">小图自适应（小于档位不放大）</span>'
+    + '</div>'
+    + '<div class="fit-toggle" id="sticker-fb-toggle" role="switch" aria-checked="true" title="开 = 卡片下方显示喜欢/不喜欢按钮；关 = 卡片只显示表情包图片" style="margin-top:8px">'
     + '<span class="fit-track"><span class="fit-knob"></span></span>'
     + '<span class="fit-label">显示反馈按钮</span>'
     + '</div>'
@@ -1047,10 +1071,12 @@ export default async function registerRoutes(app, ctx) {
     const emotion = c.req.query('emotion') || '';
 
     // v0.24.0 - 配图卡片显示配置（小图自适应开关，仅对小于阈值的图生效）
-    let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true };
+    let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true, sizeMode: 'auto' };
     try { displayCfg = { ...displayCfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) }; } catch {}
     const fitEnabled = displayCfg.smallImageFit !== false;
     const fitThreshold = Math.max(50, Math.min(500, Number(displayCfg.smallImageThreshold) || 200));
+    // v0.33.77 - 图片尺寸档位：auto=智能自适应（默认，即原行为）；small/medium/large=固定宽 160/260/400
+    const sizeMode = ['auto', 'small', 'medium', 'large'].includes(displayCfg.sizeMode) ? displayCfg.sizeMode : 'auto';
     // v0.28.0 - 反馈按钮显示开关（关掉后卡片只显示表情包图片）
     const showFb = displayCfg.showFeedbackButtons !== false;
 
@@ -1089,7 +1115,9 @@ export default async function registerRoutes(app, ctx) {
     html, body { height: 100%; }
     /* v0.33.3 - 根绝滚动条：iframe 内容必须完全贴合上报尺寸，任何超宽（toast 长提示等）只裁不滚 */
     html, body { overflow: hidden; }
-    body { width: fit-content; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 6px; background: transparent; }
+    /* v0.33.74 - body 受宿主 iframe 宽度约束：旧版 fit-content 会按内容撑宽（按钮行 190px），
+       宿主把 iframe 开窄时内容溢出被裁（“不喜欢”变“不喜”）。改 width:100% 后内容在窄容器里折行/压缩。 */
+    body { width: 100%; max-width: 100%; display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 6px; background: transparent; box-sizing: border-box; }
     /* v0.32.3 - align-items:center 兜底：宿主槽位比内容宽时（如微小图小于宿主 50px 下限）内容居中，不再挤左上角 */
     /* v0.25.1 - hidden 必须真生效：display:flex 等显式样式会覆盖 hidden 属性（经典坑） */
     [hidden] { display: none !important; }
@@ -1097,7 +1125,7 @@ export default async function registerRoutes(app, ctx) {
       width: fit-content; max-width: 100%; /* v0.32.3 - 卡片跟图片走：小图不再被 flex:1 撑满 400px 留大白边 */
       min-height: 0;
       display: flex; align-items: center; justify-content: center;
-      background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px; padding: 6px;
+      /* v0.33.4 - 去掉外边装饰：图片直接展示，不再套薄荷绿描边+内边距+浅底（用户嫌多余） */
     }
     .img-card img { max-width: 100%; max-height: 100%; display: block; object-fit: contain; border-radius: 6px; }
     /* v0.24.0 - 小图自适应开启时：强制占满卡片尺寸，按比例缩放不裁切 */
@@ -1108,6 +1136,15 @@ export default async function registerRoutes(app, ctx) {
       align-self: center; /* v0.32.3 - 跟随 body 居中对齐（原 flex-start 在收窄后会让按钮偏离图片中轴） */
       display: flex; align-items: center; gap: 8px;
       padding: 2px 0;
+      /* v0.33.74 - body 受宿主 iframe 宽度约束：旧版 fit-content 会按内容撑宽（按钮行 190px），
+         宿主把 iframe 开窄时内容溢出被裁（“不喜欢”变“不喜”）。改 width:100% 后内容跟随容器。
+         v0.33.75 - 按钮行保持横排一排（用户明确要求），宽度由 fitCard 上报 max(图宽, 按钮行需求宽)
+         保证，宿主按上报宽度开窗即可完整放下；不折行。
+         v0.33.76 - 按钮行两侧留白 + 缩小按钮间距：padding 10px 左右、gap 6px，视觉不贴边。 */
+      width: 100%; justify-content: center;
+      padding: 2px 10px;
+      gap: 6px;
+      box-sizing: border-box;
     }
     .fb-btn {
       border: 1px solid #d5e5dd; border-radius: 999px;
@@ -1591,7 +1628,15 @@ export default async function registerRoutes(app, ctx) {
         window.parent.postMessage(msg, '*');
         // v0.33.70 - devkit 1.0 宿主（0.686+）兼容裸原始事件；双发幂等，老宿主忽略未知格式
         window.parent.postMessage({ type: 'ui.resize', payload: payload }, '*');
+        // v0.33.4 - 0.712.5 宿主聊天流内嵌卡（wd 组件）消息归一化 ru() 的裸分支**只认 resize-request**：
+        //   e.type==="resize-request" 且 payload 带 width/height 才返回 {kind:'resize',size}；
+        //   裸 ui.resize 在裸分支直接 return null，协议消息又要过 Oo 校验，两条老通道都会静默丢失。
+        //   补发宿主真正认的裸格式；老宿主（<0.686）忽略未知 type，无副作用。
+        window.parent.postMessage({ type: 'resize-request', payload: payload }, '*');
       }
+      // v0.33.4 - 挂到 window：fitCard 在第二个独立 IIFE 里调用 postResize，
+      //   不挂 window 的话每次执行都 ReferenceError，尺寸上报从未发出（宿主永远拿不到真实宽高）
+      window.postResize = postResize;
       function reportChatSize() {
         if (!chatMode) return;
         var h = chatPanel.offsetHeight + 26;
@@ -1630,6 +1675,9 @@ export default async function registerRoutes(app, ctx) {
       var AUTO_FIT_MAX = ${AUTO_FIT_MAX}; // 宿主槽位宽上限（前后端同源）
       // v0.28.0 - 反馈按钮开关：关闭时宽度不再给按钮区留空间
       var FBN = ${showFb ? 'true' : 'false'};
+      // v0.33.77 - 图片尺寸档位：auto=智能自适应（原行为），small/medium/large=固定宽
+      var SIZE_MODE = '${sizeMode}';
+      var SIZE_MODE_WIDTH = { small: 160, medium: 260, large: 400 };
       var IMG = document.querySelector('.img-card img');
       var FB_CARD = document.querySelector('.fb-card');
       // v0.33.0 - 与宿主槽位口径一致：宽度生效区间 [50,400]，高度 [30,600]（宿主对 card 槽位的 clamp）
@@ -1638,7 +1686,15 @@ export default async function registerRoutes(app, ctx) {
       // v0.33.1 - 二分决策：fit=是否放大填满，cap=目标显示宽度（null=不放大/原尺寸）
       // v0.33.72 - 智能开时一律放大填满（0.686+ 聊天流宽度锁死，ui.resize 不生效，
       //   小图不再贴原尺寸；关智能才回退旧阈值行为（≥200 放大、<200 原尺寸防糊））
+      // v0.33.77 - 固定档：默认按档位宽显示
+      // v0.33.78 - 固定档 + 小图自适应开：原图小于档位宽时不放大（按原尺寸），避免小图被拉伸糊掉；
+      //   关时所有图一律按档位宽（强行统一尺寸）。auto 档保持原行为。
       function fitDecision(minSide) {
+        if (SIZE_MODE !== 'auto') {
+          var capW = SIZE_MODE_WIDTH[SIZE_MODE];
+          if (FIT && minSide < capW) return { fit: false, cap: null };  // 小图自适应开 + 图比档位小 → 原尺寸
+          return { fit: true, cap: capW };
+        }
         if (!FIT) return { fit: minSide >= FIT_THRESHOLD, cap: null };  // 关：回退旧行为（阈值默认 200）
         return { fit: true, cap: AUTO_FIT_MAX };
       }
@@ -1652,29 +1708,45 @@ export default async function registerRoutes(app, ctx) {
         var ratio = IMG.naturalHeight / IMG.naturalWidth;
         var w = window.innerWidth;
         var displayW = d.fit ? (d.cap ? Math.min(w, d.cap) : w) : Math.min(w, IMG.naturalWidth);
-        // v0.32.3 - 改回仓库版「卡片包着图」机制：给 .img-card 容器设内联宽度（displayW + 14 含 padding+border）
-        document.getElementById('img-card').style.width = (displayW + 14) + 'px';
+        // v0.33.4 - 去掉 img-card 边框后，宽度直接贴图宽（原 +14 是边框+内边距补偿）
+        document.getElementById('img-card').style.width = (displayW) + 'px';
         // v0.28.0 - 高度自适应：按钮显示时按按钮区实际高度放大卡片；隐藏时只留图片卡片自身留白，底部不再有白边
         var imgH = Math.round(displayW * ratio);
+  // v0.33.102 - 前端 displayW 上限对齐后端 aspectRatio：fit 时 cap 恒 ≤400、原尺寸分支受宿主 iframe 宽约束
+  //   （window.innerWidth ≤ 400，min(宽, naturalWidth) 天然封顶），横图/超宽扁图不再撑出比后端高的卡。
+  displayW = Math.min(displayW, 400);
+  imgH = Math.round(displayW * ratio);
         // v0.33.2 - 按钮「真实可见」统一判定（配置显示且未 hidden）
         var fbBtnVisible = FBN && FB_CARD && !FB_CARD.hidden;
         var fbH = fbBtnVisible ? FB_CARD.offsetHeight : 0;
         if (fbBtnVisible && fbH < 30) fbH = 30;  // 高度兜底：按钮区至少 30px，防止首帧太低冒出滚动条把宽度吃掉
         var extra = 12;                 // body 上下 padding 6*2
         if (fbH > 0) extra += 8 + fbH;  // 图片卡片与按钮区的 gap 8 + 按钮区实际高度
-        var target = imgH + 14 + extra; // img-card 自身 padding 6*2 + 边框 1*2 = 14
+        var target = imgH + extra;      // v0.33.4 - img-card 无边框无内边距，不再 +14
         target = clampH(target);
         var payload = { height: target };
-        // v0.33.2 - 按钮显示时「喜欢/不喜欢」横排最小宽兜底：
-        //   图片刚加载时按钮区可能还没布局（offsetWidth=0），若只按图宽上报，宿主把 iframe 开太窄会把按钮挤变形，
-        //   所以只要按钮可见，宽度至少能横排放下两枚按钮（~130px）。隐藏按钮时纯贴图。
-        var BTN_MIN_W = 132;
-        // v0.33.1 - 宽度上报贴内容真实宽（去掉旧 +26 冗余，解决左右间距不匀）：
-        //   内容宽 = 图卡外宽(displayW+14) 与 按钮区实际宽 的最大值；隐藏按钮时只剩图卡本身
+        // v0.33.73 - 宽度兜底改为「按钮行固有需求宽」：
+        //   旧逻辑用 FB_CARD.offsetWidth 当基准，但 iframe 被宿主开窄时 offsetWidth 已被压缩失真，
+        //   拿到的是“被挤扁后的宽度”，越窄越不准，最右的「不喜欢」依然会被裁掉。
+        //   现在用按钮固有宽（每枚按钮 offsetWidth 在窄容器里可能也失真，取滚动内容宽 scrollWidth 兜底）
+        //   + 间距合成需求宽，上报 max(图宽, 按钮需求宽)，按钮行永远完整显示。
+        // v0.33.76 - 按钮行两侧留白：fb-card 带 padding 10px 左右，scrollWidth 已含 padding，
+        //   宿主按需求宽开窗后按钮不贴边；gap 改为 6px 缩小按钮间距。
+        var BTN_EST_W = 210; // 首帧未布局时的保守估算（三枚按钮+gap+padding 实测约 210px）
         if (displayW < w) {
           var fbBtnW = fbBtnVisible ? FB_CARD.offsetWidth : 0;
-          var needBtnW = fbBtnVisible ? Math.max(fbBtnW, BTN_MIN_W) : 0;
-          var imgCardW = displayW + 14;
+          var needBtnW = 0;
+          if (fbBtnVisible) {
+            var scrollW = FB_CARD.scrollWidth;              // 含 padding 的内容宽（三按钮+gap+左右留白）
+            var sumBtn = 0;                                  // 三枚按钮固有宽之和
+            var btns = FB_CARD.querySelectorAll('.fb-btn');
+            for (var bi = 0; bi < btns.length; bi++) sumBtn += btns[bi].offsetWidth;
+            sumBtn += (btns.length - 1) * 6;                 // gap 6px × 间隔数（v0.33.76 缩小间距）
+            needBtnW = Math.max(scrollW, sumBtn + 20);      // 按钮+间距+两侧 padding 10px×2
+            needBtnW = Math.max(needBtnW, fbBtnW);
+            if (needBtnW === 0) needBtnW = BTN_EST_W;       // 首帧未布局时用估算兜底
+          }
+          var imgCardW = displayW;
           var contentW = fbBtnVisible ? Math.max(imgCardW, needBtnW) : imgCardW;
           var targetW = clampW(contentW);
           if (targetW > 0) payload.width = targetW;
