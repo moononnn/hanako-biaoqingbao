@@ -1036,6 +1036,10 @@ export default async function registerRoutes(app, ctx) {
   });
 
   app.get('/sticker', (c) => {
+    // 卡片 HTML 内联了当前版本脚本；禁止浏览器/宿主复用旧页面，避免更新后继续执行旧确认逻辑。
+    c.header('Cache-Control', 'no-store, no-cache, must-revalidate');
+    c.header('Pragma', 'no-cache');
+    c.header('Expires', '0');
     const id = c.req.query('id') || '';
     const label = c.req.query('label') || '表情包';
     const description = c.req.query('description') || '';
@@ -1102,8 +1106,9 @@ export default async function registerRoutes(app, ctx) {
     } catch {}
 
     const sessionPath = c.req.query('sessionPath') || '';
+    const sessionId = c.req.query('sessionId') || '';
 
-    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold, fb: showFb, sessionPath }).replace(/</g, '\\u003c');
+    const STICKER_CFG = JSON.stringify({ id, agent, emotion, init: initPref, dislikes: initDislikes, fit: fitEnabled, fitThreshold, fb: showFb, sessionPath, sessionId }).replace(/</g, '\\u003c');
 
     return c.html(`<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1187,10 +1192,14 @@ export default async function registerRoutes(app, ctx) {
     .chat-invite-btn:hover { background: #df86a0; }
     /* v0.25.0 - 卡片内联聊天面板 */
     .chat-panel {
+      width: 100%; height: 420px; min-height: 0; overflow: hidden;
       display: flex; flex-direction: column; gap: 6px;
       background: #fafdfb; border: 1px solid #d5e5dd; border-radius: 8px;
       padding: 8px;
+      box-sizing: border-box;
     }
+    /* v0.34.6 - 修改建议区不再限 42vh：diff 内容长时在建议区内滚动，
+       不再被 iframe 裁切线截掉（iframe 高度 < 420 时 diff 内容必须能滚到） */
     .chat-panel-head { display: flex; align-items: center; gap: 8px; }
     .chat-panel-head img {
       width: 38px; height: 38px; object-fit: cover;
@@ -1204,11 +1213,13 @@ export default async function registerRoutes(app, ctx) {
     }
     .chat-close-btn:hover { background: #e6f3ed; }
     .chat-msgs {
-      height: 190px; overflow-y: auto;
+      height: auto; min-height: 64px; flex: 1 1 190px; overflow-y: auto;
       display: flex; flex-direction: column; gap: 6px;
       background: #f4faf7; border: 1px solid #e2eee8; border-radius: 8px;
       padding: 8px;
     }
+    /* v0.34.8 - 修改建议卡改为嵌进聊天流（随消息一起滚动），不再占面板中间固定区块；
+       消息区也不再让空间——建议卡就是消息流里的一条卡片，滚动即可看到完整 diff 与按钮 */
     .chat-empty { color: #8a9b92; font-size: 11px; text-align: center; padding: 14px 0; line-height: 1.6; }
     .msg {
       max-width: 85%; padding: 6px 10px; border-radius: 10px;
@@ -1219,22 +1230,26 @@ export default async function registerRoutes(app, ctx) {
     .msg-thinking { align-self: flex-start; background: #fff; border: 1px dashed #d5e5dd; color: #8a9b92; }
     .msg-error { align-self: flex-start; background: #fdf0f3; border: 1px solid #f0c4d2; color: #b0546e; }
     .chat-sug {
+      width: 100%; flex-shrink: 0; box-sizing: border-box;
+      display: flex; flex-direction: column;
       background: #fff7f9; border: 1px solid #eebdcd; border-radius: 8px; padding: 8px;
     }
-    .chat-sug-title { font-size: 11px; color: #b0546e; font-weight: 600; margin-bottom: 6px; }
-    .chat-sug-diff { font-size: 11px; color: #2d3a35; line-height: 1.7; word-break: break-word; }
+    .chat-sug-title { font-size: 11px; color: #b0546e; font-weight: 600; margin-bottom: 6px; flex-shrink: 0; }
+    .chat-sug-diff {
+      font-size: 11px; color: #2d3a35; line-height: 1.7; word-break: break-word;
+    }
     .chat-sug-diff .diff-row { margin-bottom: 2px; }
     .chat-sug-diff .diff-label { color: #8a5a68; font-weight: 600; margin-right: 4px; }
     .chat-sug-diff .diff-old { color: #b3a8ac; text-decoration: line-through; margin-right: 4px; }
     .chat-sug-diff .diff-new { color: #2d6b52; font-weight: 600; }
-    .chat-sug-actions { display: flex; gap: 8px; margin-top: 8px; }
+    .chat-sug-actions { display: flex; gap: 8px; margin-top: 8px; flex-shrink: 0; }
     .chat-sug-btn { border: none; border-radius: 999px; font-size: 11px; padding: 4px 12px; cursor: pointer; }
     .chat-sug-btn.no { background: transparent; border: 1px solid #d5e5dd; color: #4a9277; }
     .chat-sug-btn.no:hover { background: #e6f3ed; }
     .chat-sug-btn.yes { background: #e89bb0; color: #fff; }
     .chat-sug-btn.yes:hover { background: #df86a0; }
     .chat-sug-btn:disabled { opacity: .55; cursor: default; }
-    .chat-input-row { display: flex; gap: 6px; align-items: flex-end; }
+    .chat-input-row { display: flex; gap: 6px; align-items: flex-end; flex-shrink: 0; }
     .chat-input-row textarea {
       flex: 1; resize: none;
       border: 1px solid #d5e5dd; border-radius: 8px;
@@ -1336,6 +1351,89 @@ export default async function registerRoutes(app, ctx) {
         else if (surface) parts.push('pluginSurfaceSession=' + encodeURIComponent(surface));
         return parts.length > 0 ? '?' + parts.join('&') : '';
       }
+      function authUrl(url) {
+        var query = authQuery();
+        if (!query) return url;
+        return url + (url.indexOf('?') >= 0 ? '&' : '') + query.slice(1);
+      }
+      // 新版页面凭证优先走请求头，同时保留 query 兼容旧版 Hana。
+      function authInit(init) {
+        var next = Object.assign({}, init || {});
+        var locParams = new URLSearchParams(window.location.search);
+        var surface = locParams.get('pluginSurfaceSession');
+        if (!surface) return next;
+        var headers = {};
+        var source = next.headers || {};
+        if (typeof source.forEach === 'function') source.forEach(function (value, key) { headers[key] = value; });
+        else Object.keys(source).forEach(function (key) { headers[key] = source[key]; });
+        headers['X-Hana-Plugin-Surface-Session'] = surface;
+        next.headers = headers;
+        return next;
+      }
+      function timedPromise(promise, timeoutMs) {
+        var timer = null;
+        var timeout = new Promise(function (_, reject) {
+          timer = setTimeout(function () {
+            var error = new Error('请求超时');
+            error.name = 'TimeoutError';
+            reject(error);
+          }, timeoutMs);
+        });
+        return Promise.race([promise, timeout]).then(function (value) {
+          clearTimeout(timer);
+          return value;
+        }, function (error) {
+          clearTimeout(timer);
+          throw error;
+        });
+      }
+      function timedFetch(url, init, timeoutMs) {
+        return timedPromise(fetch(url, init), timeoutMs);
+      }
+      function waitMs(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+      function sameStringList(a, b) {
+        if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+        for (var i = 0; i < a.length; i++) {
+          if (String(a[i] == null ? '' : a[i]).trim() !== String(b[i] == null ? '' : b[i]).trim()) return false;
+        }
+        return true;
+      }
+      function stickerMatchesSuggestion(sticker, suggestion) {
+        if (!sticker || !suggestion) return false;
+        var tags = sticker.tags || {};
+        var checked = false;
+        if (suggestion.description !== undefined) {
+          checked = true;
+          if (String(sticker.description || '').trim() !== String(suggestion.description || '').trim()) return false;
+        }
+        if (suggestion.semantic_description !== undefined) {
+          checked = true;
+          if (String(sticker.semantic_description || '').trim() !== String(suggestion.semantic_description || '').trim()) return false;
+        }
+        var fields = ['emotion', 'scene', 'keywords'];
+        for (var i = 0; i < fields.length; i++) {
+          var field = fields[i];
+          if (suggestion[field] !== undefined) {
+            checked = true;
+            if (!sameStringList(tags[field] || [], suggestion[field])) return false;
+          }
+        }
+        return checked;
+      }
+      // 确认请求可能已经写入成功，只是响应在 iframe 侧丢失；回查落盘结果再决定是否报错。
+      async function recoverConfirmedChange(stickerId, suggestion) {
+        for (var attempt = 0; attempt < 3; attempt++) {
+          try {
+            var res = await timedFetch(authUrl(apiBase() + '/api/list?id=' + encodeURIComponent(stickerId)), authInit({ method: 'GET' }), 2500);
+            var data = await timedPromise(res.json(), 2500);
+            var list = data && data.ok && Array.isArray(data.data) ? data.data : [];
+            var sticker = list.find(function (item) { return item && item.id === stickerId; });
+            if (stickerMatchesSuggestion(sticker, suggestion)) return true;
+          } catch (e) {}
+          if (attempt < 2) await waitMs(180 + attempt * 240);
+        }
+        return false;
+      }
       function showToast(msg, isErr) {
         toast.textContent = msg;
         toast.classList.toggle('err', !!isErr);
@@ -1427,13 +1525,16 @@ export default async function registerRoutes(app, ctx) {
             agentId: cfg.agent,
           };
           if (cfg.sessionPath) body.sessionPath = cfg.sessionPath;
+          // v0.33.81 - 显式传 sessionId（发图时 ctx.sessionId 的权威值），避免后端从 jsonl 文件头
+          // 解析 sessionId 失败（无媒体消息的会话头部匹配不到）导致“没有找到对应的配图记录”。
+          if (cfg.sessionId) body.sessionId = cfg.sessionId;
           if (nextFeedback === 'positive') body.feedbackKind = nextFbKind;
           // 应景账本需要 context_emotion；submitBallFeedback 从 recent-match 记录取 emotion，这里兜底传一下
-          var res = await fetch(apiBase() + '/api/ball/feedback' + authQuery(), {
+          var res = await fetch(apiBase() + '/api/ball/feedback' + authQuery(), authInit({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body)
-          });
+          }));
           var data = await res.json();
           if (data.ok) {
             if (nextFeedback === 'negative') {
@@ -1503,13 +1604,19 @@ export default async function registerRoutes(app, ctx) {
         } else {
           for (var i = 0; i < rows.length; i++) diff.appendChild(rows[i]);
         }
-        document.getElementById('chat-sug').hidden = false;
+        // v0.34.8 - 建议卡作为消息流里的一条卡片，move 到消息区末尾并异步滚动到底，
+        //   确保完整 diff 与「确认修改 / 再看看」按钮随聊天流可达，不再挤在面板中间
+        var sugEl = document.getElementById('chat-sug');
+        var box = document.getElementById('chat-msgs');
+        box.appendChild(sugEl);
+        sugEl.hidden = false;
+        box.scrollTop = box.scrollHeight;
         reportChatSize();
       }
       function hideSuggestion() {
         chatSuggestion = null;
         var sug = document.getElementById('chat-sug');
-        if (!sug.hidden) { sug.hidden = true; reportChatSize(); }
+        if (sug && !sug.hidden) { sug.hidden = true; reportChatSize(); }
       }
       async function sendChat() {
         var input = document.getElementById('chat-input');
@@ -1517,22 +1624,23 @@ export default async function registerRoutes(app, ctx) {
         if (!msg || chatBusy) return;
         appendMsg('user', msg);
         input.value = '';
-        input.style.height = 'auto';
+        input.style.height = ''; // v0.34.2 - 清空后恢复默认高度，不残留上一帧的内联高度
         chatBusy = true;
         var sendBtn = document.getElementById('chat-send-btn');
         sendBtn.disabled = true;
         sendBtn.textContent = '思考中...';
         var thinking = appendMsg('thinking', '小花正在思考...');
         try {
-          var res = await fetch(apiBase() + '/api/sticker/chat' + authQuery(), {
+          var res = await fetch(apiBase() + '/api/sticker/chat' + authQuery(), authInit({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ sticker_id: cfg.id, message: msg, session_id: chatSessionId })
-          });
+          }));
           var data = await res.json();
           thinking.remove();
+          // 失败回合也可能带回聊天号，保留它才能让“继续”沿用当前上下文。
+          if (data.session_id) chatSessionId = data.session_id;
           if (data.ok) {
-            chatSessionId = data.session_id;
             appendMsg('assistant', data.reply || '（无回复）');
             if (data.suggestion) renderSuggestion(data.suggestion, data.old_tags || {});
             else hideSuggestion();
@@ -1552,29 +1660,60 @@ export default async function registerRoutes(app, ctx) {
         if (!chatSessionId || !chatSuggestion || chatBusy) return;
         chatBusy = true;
         var btn = document.getElementById('chat-sug-yes');
+        var requestSessionId = chatSessionId;
+        var requestStickerId = cfg.id;
+        var requestSuggestion = chatSuggestion;
+        var finished = false;
         btn.disabled = true;
         btn.textContent = '保存中...';
-        try {
-          var res = await fetch(apiBase() + '/api/sticker/chat/confirm' + authQuery(), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ session_id: chatSessionId, sticker_id: cfg.id, new_tags: chatSuggestion })
-          });
-          var data = await res.json();
-          if (data.ok) {
-            showToast(data.vector_regenerated ? '已修改，标签和向量都更新了' : '已修改');
-            closeChat();
-          } else {
-            showToast('保存失败：' + (data.error || ''), true);
-            btn.disabled = false;
-            btn.textContent = '确认修改';
-          }
-        } catch (e) {
-          showToast('网络开小差了，再试一次？', true);
+        // v0.34.10 - 确认接口只写本地元数据，向量重算已在后端异步处理，正常应立即返回。
+        //   这里不绑定 AbortController/AbortSignal：部分宿主 iframe 对 fetch 的 signal 支持不完整，
+        //   会在请求尚未发出时直接抛异常，误报「网络开小差了」。
+        var confirmInit = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: requestSessionId, sticker_id: requestStickerId, new_tags: requestSuggestion })
+        };
+        function resetConfirmButton() {
+          if (!btn) return;
           btn.disabled = false;
           btn.textContent = '确认修改';
         }
-        chatBusy = false;
+        function finishConfirm(recovered) {
+          finished = true;
+          showToast(recovered ? '已修改（刚才回包晚了一点）' : '已修改');
+          closeChat();
+        }
+        try {
+          var res = await timedFetch(apiBase() + '/api/sticker/chat/confirm' + authQuery(), authInit(confirmInit), 30000);
+          var data;
+          try { data = await timedPromise(res.json(), 5000); } catch (e) { data = null; }
+          if (data && data.ok) {
+            // 后端确认成功即标签已落盘（向量异步重算，不阻塞）。
+            finishConfirm(false);
+          } else if (await recoverConfirmedChange(requestStickerId, requestSuggestion)) {
+            // 兼容“后端已写入、但响应体没回到 iframe”的半成功请求。
+            finishConfirm(true);
+          } else {
+            var errMsg = (data && data.error) ? data.error : ('HTTP ' + res.status);
+            if (res.status === 409) {
+              showToast('确认回包没接到，修改建议先留着；可以继续聊一轮后再确认', true);
+            } else {
+              showToast('保存失败：' + errMsg, true);
+            }
+          }
+        } catch (e) {
+          // 网络/超时先回查落盘结果，只有查不到时才保留重试入口。
+          if (await recoverConfirmedChange(requestStickerId, requestSuggestion)) {
+            finishConfirm(true);
+          } else {
+            var isTimeout = e && (e.name === 'AbortError' || e.name === 'TimeoutError');
+            showToast(isTimeout ? '网络有点慢，结果还没确认，再点一次' : '网络开小差了，结果还没确认，再点一次', true);
+          }
+        } finally {
+          chatBusy = false;
+          if (!finished) resetConfirmButton();
+        }
       }
       function openChat() {
         chatMode = true;
@@ -1582,6 +1721,8 @@ export default async function registerRoutes(app, ctx) {
         document.getElementById('img-card').style.display = 'none';
         document.getElementById('fb-card').style.display = 'none';
         hideInvite();
+        // v0.34.2 - 打开时按当前视口定面板高度，与上报值一致（CSS 默认 420 作兜底）
+        chatPanel.style.height = chatFixedHeight() + 'px';
         chatPanel.hidden = false;
         var mini = document.getElementById('chat-mini-img');
         var big = document.querySelector('.img-card img');
@@ -1607,11 +1748,11 @@ export default async function registerRoutes(app, ctx) {
         document.getElementById('fb-card').style.display = '';
         if (state === 'negative') showInvite();
         if (chatSessionId) {
-          fetch(apiBase() + '/api/sticker/chat/close' + authQuery(), {
+          fetch(apiBase() + '/api/sticker/chat/close' + authQuery(), authInit({
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ session_id: chatSessionId })
-          }).catch(function () {});
+          })).catch(function () {});
           chatSessionId = null;
         }
         chatSuggestion = null;
@@ -1637,10 +1778,24 @@ export default async function registerRoutes(app, ctx) {
       // v0.33.4 - 挂到 window：fitCard 在第二个独立 IIFE 里调用 postResize，
       //   不挂 window 的话每次执行都 ReferenceError，尺寸上报从未发出（宿主永远拿不到真实宽高）
       window.postResize = postResize;
+      // v0.34.2 - 聊天面板固定高度，打破「上报高度 → 宿主改 iframe → 面板随 100vh 收缩 → 再上报」
+      //   的自引用循环（每打一个字 input 事件重设 textarea 高度 + 上报，宿主应用时有损耗就累积缩小，
+      //   输入框被压成一条缝）。面板高度只在上报一次后保持不变，内容变化全部在面板内部消化。
+      // v0.34.6 - 高度上限 420→470：建议区 diff 需要更多空间展示修改前后对照，
+      //   宿主对 card 槽位高度 clamp 上限是 600，470 安全。
+      var CHAT_PANEL_H = 470;
+      var lastChatHeight = 0;
+      function chatFixedHeight() {
+        // 小屏兜底：不超过视口可用高度太多
+        return Math.min(CHAT_PANEL_H, Math.max(240, window.innerHeight - 120));
+      }
       function reportChatSize() {
         if (!chatMode) return;
-        var h = chatPanel.offsetHeight + 26;
-        postResize({ height: clampH(Math.round(h)), width: clampW(window.innerWidth) });
+        var width = Math.max(50, Math.min(400, Math.round(window.innerWidth)));
+        var height = chatFixedHeight();
+        if (height === lastChatHeight) return; // 高度没变化不上报，避免重复 resize 触发宿主再处理
+        lastChatHeight = height;
+        postResize({ height: height, width: width });
       }
 
       posBtn.addEventListener('click', function () { sendFb('image'); });
@@ -1654,9 +1809,13 @@ export default async function registerRoutes(app, ctx) {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
       });
       chatInput.addEventListener('input', function () {
-        this.style.height = 'auto';
-        this.style.height = Math.min(this.scrollHeight, 80) + 'px';
-        reportChatSize();
+        // v0.34.2 - 输入框只在自己真实变高时才改高度（打破 scrollHeight 负反馈），面板高度固定后无需再上报
+        var lineH = 20;
+        var want = Math.min(Math.max(this.scrollHeight, lineH + 2), 80);
+        if (Math.abs(want - this.offsetHeight) > 4) {
+          this.style.height = 'auto';
+          this.style.height = want + 'px';
+        }
       });
       document.getElementById('chat-sug-yes').addEventListener('click', confirmSuggestion);
       document.getElementById('chat-sug-no').addEventListener('click', function () {

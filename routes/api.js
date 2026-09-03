@@ -349,9 +349,12 @@ export default async function registerRoutes(app, ctx) {
   // ═══ GET /api/list — 列表（可按情绪筛选） ═══
   app.get('/api/list', (c) => {
     const emotion = c.req.query('emotion') || '';
+    const id = c.req.query('id') || '';
     const meta = readMeta();
     let result = meta;
-    if (emotion) {
+    if (id) {
+      result = meta.filter(s => s.id === id);
+    } else if (emotion) {
       const emList = emotion.split(',').map(s => s.trim());
       result = meta.filter(s => emList.some(em =>
         (s.tags?.emotion || []).some(tag => tag.includes(em) || em.includes(tag))
@@ -1587,6 +1590,46 @@ export default async function registerRoutes(app, ctx) {
     }
   }
 
+  // 确认接口的重复请求需要按字段比较，不能依赖对象键顺序。
+  function sameChatTagPatch(a, b) {
+    const fields = ['description', 'semantic_description', 'emotion', 'scene', 'keywords'];
+    return fields.every((field) => {
+      const aHas = Object.prototype.hasOwnProperty.call(a || {}, field);
+      const bHas = Object.prototype.hasOwnProperty.call(b || {}, field);
+      if (aHas !== bHas) return false;
+      return !aHas || JSON.stringify(a[field]) === JSON.stringify(b[field]);
+    });
+  }
+
+  function chatTagPatchMatchesSticker(sticker, patch) {
+    const tags = sticker?.tags || {};
+    const current = {
+      description: sticker?.description || '',
+      semantic_description: sticker?.semantic_description || '',
+      emotion: tags.emotion || [],
+      scene: tags.scene || [],
+      keywords: tags.keywords || [],
+    };
+    const fields = ['description', 'semantic_description', 'emotion', 'scene', 'keywords'];
+    const present = fields.filter((field) => Object.prototype.hasOwnProperty.call(patch || {}, field));
+    return present.length > 0 && present.every((field) => JSON.stringify(current[field]) === JSON.stringify(patch[field]));
+  }
+
+  function scheduleConfirmedSessionExpiry(sessionId, session) {
+    const expire = () => {
+      if (chatSessions.get(sessionId) !== session) return;
+      const remaining = CHAT_SESSION_TTL - (Date.now() - session.lastActive);
+      if (remaining <= 0) {
+        chatSessions.delete(sessionId);
+        return;
+      }
+      const timer = setTimeout(expire, remaining + 10);
+      timer.unref?.();
+    };
+    const timer = setTimeout(expire, CHAT_SESSION_TTL + 10);
+    timer.unref?.();
+  }
+
   // 调用 content analysis 模型（Hana 选定模型直连，fallback 自定义 API）
   async function callTextModel(messages, opts = {}) {
     const cfg = opts.config && typeof opts.config === 'object'
@@ -1605,6 +1648,7 @@ export default async function registerRoutes(app, ctx) {
         maxTokens: opts.maxTokens ?? 800,
         temperature: opts.temperature ?? 0.5,
         timeoutMs: opts.timeoutMs ?? 30000,
+        reasoningEffort: opts.reasoningEffort,
         signal: opts.signal,
       });
     }
@@ -1642,6 +1686,24 @@ export default async function registerRoutes(app, ctx) {
     }
 
     return { ok: false, error: '未知的模型来源' };
+  }
+
+  // v0.34.9 - 短聊天先用小预算，思考耗尽时只重试一次并放大正文预算。
+  // 部分兼容网关不会真正关闭 DeepSeek 思考，单靠 thinking.disabled 不够。
+  const CHAT_MAX_TOKENS = [900, 2400];
+  async function callChatTextModel(messages) {
+    let result;
+    for (let i = 0; i < CHAT_MAX_TOKENS.length; i++) {
+      result = await callTextModel(messages, {
+        maxTokens: CHAT_MAX_TOKENS[i],
+        temperature: 0.6,
+        reasoningEffort: 'low',
+      });
+      if (result.ok) return result;
+      if (i === CHAT_MAX_TOKENS.length - 1 || !isRetriableTextCallError(result.error)) break;
+      ctx?.log?.warn?.('[biaoqingbao] 配图聊天正文为空，改用更大预算重试');
+    }
+    return result;
   }
 
   // 系统 prompt：指导 AI 怎么跟用户聊标签调整
@@ -1693,7 +1755,7 @@ export default async function registerRoutes(app, ctx) {
       // 获取或创建 session
       let sid = session_id;
       let session;
-      if (sid && chatSessions.has(sid) && chatSessions.get(sid).sticker_id === sticker_id) {
+      if (sid && chatSessions.has(sid) && chatSessions.get(sid).sticker_id === sticker_id && !chatSessions.get(sid).confirmed_tags) {
         session = chatSessions.get(sid);
       } else {
         sid = genSessionId();
@@ -1754,8 +1816,11 @@ export default async function registerRoutes(app, ctx) {
         ...session.history,
       ];
 
-      const result = await callTextModel(messages, { maxTokens: 900, temperature: 0.6 });
-      if (!result.ok) return json({ ok: false, error: result.error }, 500);
+      const result = await callChatTextModel(messages);
+      if (!result.ok) {
+        // 保留会话号，前端后续点“继续”时还能沿用本轮上下文。
+        return json({ ok: false, session_id: sid, error: result.error }, 500);
+      }
 
       const rawReply = result.data || '';
       session.history.push({ role: 'assistant', content: rawReply });
@@ -1862,6 +1927,22 @@ export default async function registerRoutes(app, ctx) {
         cleanTags.keywords = list;
       }
 
+      // 回包可能在写入后丢失，保留短期确认状态让同一建议安全重试。
+      if (session.confirmed_tags) {
+        if (sameChatTagPatch(session.confirmed_tags, cleanTags) && chatTagPatchMatchesSticker(sticker, cleanTags)) {
+          session.lastActive = Date.now();
+          return json({
+            ok: true,
+            message: '已修改',
+            already_applied: true,
+            vector_regenerated: false,
+            vector_error: null,
+            sticker: meta[idx],
+          });
+        }
+        return json({ ok: false, error: '这个聊天会话已经确认过另一份修改，请重新聊聊这张图' }, 409);
+      }
+
       // 更新标签（保留原有字段，只覆盖 new_tags 里提供的）
       if (cleanTags.description !== undefined) sticker.description = cleanTags.description;
       if (cleanTags.semantic_description !== undefined) sticker.semantic_description = cleanTags.semantic_description;
@@ -1872,9 +1953,10 @@ export default async function registerRoutes(app, ctx) {
       sticker.tagged_at = new Date().toISOString();
 
       writeMeta(meta);
-
-      // 清理 session
-      if (session_id && chatSessions.has(session_id)) chatSessions.delete(session_id);
+      // 不立即删除 session：确认回包丢失时，重复点击同一建议必须能返回 already_applied。
+      session.confirmed_tags = cleanTags;
+      session.lastActive = Date.now();
+      scheduleConfirmedSessionExpiry(session_id, session);
 
       // v0.26.0：用户改了名字/描述 → 记教学样本（异步，不影响确认响应）
       const afterKw = sticker.tags?.keywords || [];
@@ -1884,50 +1966,56 @@ export default async function registerRoutes(app, ctx) {
           .catch(() => {});
       }
 
-      // 单图重算 embedding（基于新的 semantic_description）
-      let vectorOk = false;
-      let vectorError = null;
-      if (sticker.semantic_description && sticker.semantic_description.trim()) {
-        const embResult = await generateEmbeddings(sticker.semantic_description);
-        if (embResult.ok && embResult.data[0]) {
-          const vectorsData = readVectors();
-          // v0.19.5 - 用解析后的真实 model/dimensions（schema 字段是 modelId，不能用 embCfg.model）
-          const { model: currentModel, dimensions: currentDims } = resolveEmbeddingApi();
-          if (vectorsData.model && currentModel && vectorsData.model !== currentModel) {
-            vectorError = `向量模型已更换（${vectorsData.model} → ${currentModel}），请到图库页「图库语义索引」里整体重算`;
-            ctx?.log?.warn?.('[biaoqingbao] 单条重算被跳过:', vectorError);
+      // v0.34.6 - 单图重算 embedding 改为异步（不阻塞确认响应）：
+      //   之前 embed API（siliconflow）慢或超时会卡住 confirm 端点 30s+，
+      //   前端 fetch 无超时等不到响应，误报「网络开小差」（实际标签已改成功）。
+      //   现在确认秒回成功，向量重算后台进行；重算结果只在日志里记录，
+      //   不影响用户看到的确认结果。
+      void (async () => {
+        try {
+          let vectorOk = false;
+          let vectorError = null;
+          if (sticker.semantic_description && sticker.semantic_description.trim()) {
+            const embResult = await generateEmbeddings(sticker.semantic_description);
+            if (embResult.ok && embResult.data[0]) {
+              const vectorsData = readVectors();
+              const { model: currentModel, dimensions: currentDims } = resolveEmbeddingApi();
+              if (vectorsData.model && currentModel && vectorsData.model !== currentModel) {
+                vectorError = `向量模型已更换（${vectorsData.model} → ${currentModel}），请到图库页「图库语义索引」里整体重算`;
+                ctx?.log?.warn?.('[biaoqingbao] 单条重算被跳过:', vectorError);
+              } else {
+                if (!vectorsData.vectors) vectorsData.vectors = {};
+                vectorsData.vectors[sticker_id] = embResult.data[0];
+                vectorsData.generated_at = new Date().toISOString();
+                if (!vectorsData.model) vectorsData.model = currentModel || '';
+                if (!vectorsData.dimensions) vectorsData.dimensions = currentDims || 0;
+                writeVectors(vectorsData);
+                vectorOk = true;
+              }
+            } else {
+              vectorError = embResult.error;
+              ctx?.log?.warn?.('[biaoqingbao] 重算向量失败:', embResult.error);
+            }
           } else {
-            if (!vectorsData.vectors) vectorsData.vectors = {};
-            vectorsData.vectors[sticker_id] = embResult.data[0];
-            vectorsData.generated_at = new Date().toISOString();
-            // 确保 model/dimensions 有值
-            if (!vectorsData.model) vectorsData.model = currentModel || '';
-            if (!vectorsData.dimensions) vectorsData.dimensions = currentDims || 0;
-            writeVectors(vectorsData);
-            vectorOk = true;
+            const vectorsData = readVectors();
+            if (vectorsData.vectors && vectorsData.vectors[sticker_id]) {
+              delete vectorsData.vectors[sticker_id];
+              vectorsData.generated_at = new Date().toISOString();
+              writeVectors(vectorsData);
+              vectorOk = true;
+            }
           }
-        } else {
-          vectorError = embResult.error;
-          ctx?.log?.warn?.('[biaoqingbao] 重算向量失败:', embResult.error);
+          ctx?.log?.info?.(`[biaoqingbao] sticker ${sticker_id} 标签已修改（vector: ${vectorOk ? 'ok' : 'fail'}）`);
+        } catch (e) {
+          ctx?.log?.warn?.('[biaoqingbao] 异步向量重算异常:', e.message);
         }
-      } else {
-        // v0.19.5 - 语义描述被清空时，删除该图旧向量，避免孤儿向量
-        const vectorsData = readVectors();
-        if (vectorsData.vectors && vectorsData.vectors[sticker_id]) {
-          delete vectorsData.vectors[sticker_id];
-          vectorsData.generated_at = new Date().toISOString();
-          writeVectors(vectorsData);
-          vectorOk = true;
-        }
-      }
-
-      ctx?.log?.info?.(`[biaoqingbao] sticker ${sticker_id} 标签已修改（vector: ${vectorOk ? 'ok' : 'fail'})`);
+      })();
 
       return json({
         ok: true,
-        message: vectorOk ? '已修改，向量也重算了' : '已修改',
-        vector_regenerated: vectorOk,
-        vector_error: vectorOk ? null : vectorError,
+        message: '已修改',
+        vector_regenerated: false,
+        vector_error: null,
         sticker: meta[idx],
       });
     } catch (e) {

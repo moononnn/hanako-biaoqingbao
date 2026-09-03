@@ -45,6 +45,7 @@
   // 已有 signal 的调用（上传 60s / ZIP 120s / 检查更新 12s 等）保持原样不动
   function apiFetch(url, opts) {
     opts = opts || {};
+    var noAbort = opts.noAbort === true;
     var timeout = opts.timeout;
     if (!timeout) {
       if (/\/api\/(batch-auto-tag|auto-tag|auto-tag-id|sticker\/chat)/.test(url)) timeout = 90000; // 识图/聊天（模型可能思考很久）
@@ -53,15 +54,97 @@
       else timeout = 15000;                                                                          // 普通 API
     }
     var init = {};
-    for (var k in opts) if (k !== 'timeout') init[k] = opts[k];
+    for (var k in opts) if (k !== 'timeout' && k !== 'noAbort') init[k] = opts[k];
     var auth = getAuthParams();
     if (auth.surface && !auth.token) {
       var headers = new Headers(init.headers || {});
       headers.set('X-Hana-Plugin-Surface-Session', auth.surface);
       init.headers = headers;
     }
-    if (!init.signal) init.signal = AbortSignal.timeout(timeout);
-    return fetch(url, init);
+    if (!noAbort && !init.signal) {
+      // v0.34.7 - AbortSignal.timeout() 是较新的 Web API，宿主 iframe 内核（老版 Chromium/Electron）
+      //   不支持时构造 signal 会抛异常 → fetch 直接进 catch → 误报「网络开小差」。
+      //   改成 setTimeout + AbortController 兼容写法，老内核也认。
+      // v0.34.10 - 个别宿主连 AbortController signal 也不完整，确认接口可显式跳过 signal。
+      try {
+        var ctrl = new AbortController();
+        var timer = setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, timeout);
+        init.signal = ctrl.signal;
+        init.signal.__clearTimer = timer;
+      } catch (e) {
+        // AbortController 也不支持（极老内核）：放弃超时，至少请求能发出去
+      }
+    }
+    // 请求结束（无论成败）都清掉超时定时器，避免泄漏
+    return fetch(url, init).then(function (r) {
+      if (init.signal && init.signal.__clearTimer) clearTimeout(init.signal.__clearTimer);
+      return r;
+    }, function (e) {
+      if (init.signal && init.signal.__clearTimer) clearTimeout(init.signal.__clearTimer);
+      throw e;
+    });
+  }
+
+  function waitMs(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+  function timedPromise(promise, timeoutMs) {
+    var timer = null;
+    var timeout = new Promise(function (_, reject) {
+      timer = setTimeout(function () {
+        var error = new Error('请求超时');
+        error.name = 'TimeoutError';
+        reject(error);
+      }, timeoutMs);
+    });
+    return Promise.race([promise, timeout]).then(function (value) {
+      clearTimeout(timer);
+      return value;
+    }, function (error) {
+      clearTimeout(timer);
+      throw error;
+    });
+  }
+  function sameStringList(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (String(a[i] == null ? '' : a[i]).trim() !== String(b[i] == null ? '' : b[i]).trim()) return false;
+    }
+    return true;
+  }
+  function stickerMatchesSuggestion(sticker, suggestion) {
+    if (!sticker || !suggestion) return false;
+    var tags = sticker.tags || {};
+    var checked = false;
+    if (suggestion.description !== undefined) {
+      checked = true;
+      if (String(sticker.description || '').trim() !== String(suggestion.description || '').trim()) return false;
+    }
+    if (suggestion.semantic_description !== undefined) {
+      checked = true;
+      if (String(sticker.semantic_description || '').trim() !== String(suggestion.semantic_description || '').trim()) return false;
+    }
+    var fields = ['emotion', 'scene', 'keywords'];
+    for (var i = 0; i < fields.length; i++) {
+      var field = fields[i];
+      if (suggestion[field] !== undefined) {
+        checked = true;
+        if (!sameStringList(tags[field] || [], suggestion[field])) return false;
+      }
+    }
+    return checked;
+  }
+  // 确认请求可能已经写入成功，只是页面没有收到响应；回查落盘结果再决定是否报错。
+  async function recoverChatChange(stickerId, suggestion) {
+    for (var attempt = 0; attempt < 3; attempt++) {
+      try {
+        var resp = await timedPromise(apiFetch(withAuth(API + '/api/list?id=' + encodeURIComponent(stickerId)), { noAbort: true }), 2500);
+        var data = await timedPromise(resp.json(), 2500);
+        var list = data && data.ok && Array.isArray(data.data) ? data.data : [];
+        var sticker = list.find(function (item) { return item && item.id === stickerId; });
+        if (stickerMatchesSuggestion(sticker, suggestion)) return true;
+      } catch (e) {}
+      if (attempt < 2) await waitMs(180 + attempt * 240);
+    }
+    return false;
   }
 
   // ═══════════════════════════════════
@@ -2317,8 +2400,9 @@
       });
       var data = await resp.json();
       thinkingBubble.remove();
+      // 失败回合也可能带回聊天号，保留它才能让“继续”沿用当前上下文。
+      if (data.session_id) chatSessionId = data.session_id;
       if (data.ok) {
-        chatSessionId = data.session_id;
         appendChatBubble('assistant', data.reply || '（无回复）');
         if (data.suggestion) {
           chatCurrentSuggestion = data.suggestion;
@@ -2372,33 +2456,55 @@
   async function confirmChatChange() {
     if (!chatSessionId || !chatCurrentSuggestion) return;
     var btn = $('chat-preview-confirm');
+    var requestSessionId = chatSessionId;
+    var requestStickerId = chatStickerId;
+    var requestSuggestion = chatCurrentSuggestion;
+    var finished = false;
     btn.disabled = true;
     btn.textContent = '保存中...';
+    function resetConfirmButton() {
+      if (!btn) return;
+      btn.disabled = false;
+      btn.textContent = '✅ 确认修改';
+    }
+    async function finishConfirm(recovered) {
+      finished = true;
+      toast(recovered ? '已修改（刚才回包晚了一点）' : '已修改');
+      closeChatModal();
+      // 刷新展柜失败不能倒灌成“确认失败”，标签已经在后端落盘。
+      try {
+        await loadStickers();
+        await refreshPreferences();
+      } catch (e) {}
+    }
     try {
       var resp = await apiFetch(withAuth(API + '/api/sticker/chat/confirm'), {
+        noAbort: true,
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          session_id: chatSessionId,
-          sticker_id: chatStickerId,
-          new_tags: chatCurrentSuggestion,
+          session_id: requestSessionId,
+          sticker_id: requestStickerId,
+          new_tags: requestSuggestion,
         }),
       });
-      var data = await resp.json();
-      if (data.ok) {
-        toast(data.vector_regenerated ? '已修改，向量也重算了' : '已修改');
-        closeChatModal();
-        await loadStickers();
-        await refreshPreferences();
+      var data;
+      try { data = await timedPromise(resp.json(), 5000); } catch (e) { data = null; }
+      if (data && data.ok) {
+        await finishConfirm(false);
+      } else if (await recoverChatChange(requestStickerId, requestSuggestion)) {
+        await finishConfirm(true);
       } else {
-        toast('保存失败: ' + (data.error || ''), true);
-        btn.disabled = false;
-        btn.textContent = '✅ 确认修改';
+        toast('保存失败: ' + ((data && data.error) || ('HTTP ' + resp.status)), true);
       }
     } catch (e) {
-      toast('网络错误: ' + e.message, true);
-      btn.disabled = false;
-      btn.textContent = '✅ 确认修改';
+      if (await recoverChatChange(requestStickerId, requestSuggestion)) {
+        await finishConfirm(true);
+      } else {
+        toast('网络错误: ' + e.message, true);
+      }
+    } finally {
+      if (!finished) resetConfirmButton();
     }
   }
 
@@ -2434,8 +2540,14 @@
         }
       });
       input.addEventListener('input', function () {
-        this.style.height = 'auto';
-        this.style.height = Math.min(this.scrollHeight, 96) + 'px';
+        // v0.34.2 - 打破「打字→重设高度→弹窗重排→scrollHeight 失真→再设更矮」的负反馈循环：
+        //   单行以内保持默认高度不动，超出才按内容撑高（上限 96px），且只在真实长高时更新。
+        var lineH = 20;
+        var want = Math.min(Math.max(this.scrollHeight, lineH + 2), 96);
+        if (Math.abs(want - this.offsetHeight) > 4) {
+          this.style.height = 'auto';
+          this.style.height = want + 'px';
+        }
       });
     }
     var confirmBtn = $('chat-preview-confirm');

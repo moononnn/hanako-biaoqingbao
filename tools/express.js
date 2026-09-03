@@ -196,7 +196,7 @@ export function buildStickerCard({
     sessionId,
     sessionRef,
     sessionPath,
-    route: `/sticker?id=${encodeURIComponent(id)}&label=${encodeURIComponent(description)}&score=${score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}${sessionPath ? `&sessionPath=${encodeURIComponent(sessionPath)}` : ''}`,
+    route: `/sticker?id=${encodeURIComponent(id)}&label=${encodeURIComponent(description)}&score=${score}&emotion=${encodeURIComponent(emotion)}&agent=${encodeURIComponent(agentId || '')}${sessionPath ? `&sessionPath=${encodeURIComponent(sessionPath)}` : ''}${sessionId ? `&sessionId=${encodeURIComponent(sessionId)}` : ''}`,
     aspectRatio: calcCardAspectRatio(size, smart, sizeMode),
     title: emotionLabel ? `${emotionLabel}小表情来啦` : '小表情来啦',
   };
@@ -645,7 +645,7 @@ export async function execute(input, ctx) {
       emotion,
       primaryEmotion: primaryEmotionOf(best),
       agentId,
-      sessionId: ctx.sessionId,
+      sessionId: ctx.sessionId || ctx.sessionRef?.id || null,
       sessionRef: ctx.sessionRef,
       sessionPath: ctx.sessionPath,
       size,

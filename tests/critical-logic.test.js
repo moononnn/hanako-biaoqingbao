@@ -291,6 +291,66 @@ test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {
   assert.ok(source.includes("type: 'resize-request'"), '必须补发 resize-request 裸消息（0.712.5 宿主唯一认的裸尺寸事件）');
 });
 
+test('卡片内聊天的修改按钮在固定 iframe 高度下仍可达（回归：建议区落在卡片裁切线下方）', () => {
+  const source = fs.readFileSync(new URL('../routes/ui.js', import.meta.url), 'utf8');
+  // v0.34.2 - 面板改为固定高度（420px，JS 按视口兜底），不再依赖 calc(100vh) 跟随 iframe 收缩
+  assert.match(source, /\.chat-panel\s*\{\s*width: 100%; height: 420px; min-height: 0; overflow: hidden;/, '聊天面板必须固定高度（不再跟随 iframe 收缩）');
+  assert.ok(source.includes('height: auto; min-height: 64px; flex: 1 1 190px; overflow-y: auto;'), '消息区必须让出空间并独立滚动');
+  // v0.34.8 - 建议卡改成嵌进聊天流（随消息滚动），不再占面板中间固定区块：
+  //   建议区不再是独立 flex 区块，消息区也不再因 has-sug 被压缩
+  assert.ok(source.includes('width: 100%; flex-shrink: 0; box-sizing: border-box;'), '建议卡必须作为消息流内的卡片（满宽、不参与压缩）');
+  assert.ok(!source.includes('.chat-panel.has-sug .chat-msgs { flex-basis: 110px; }'), '消息区不再因建议卡让空间（建议卡嵌进聊天流）');
+  assert.ok(!source.includes('max-height: 55%;'), '建议卡不再限高 55%（改为随聊天流滚动）');
+  assert.ok(!source.includes('chatPanel.classList.add(\'has-sug\')'), '不再用 has-sug 类压缩消息区');
+  assert.ok(source.includes('.chat-sug-diff {'), 'diff 区样式必须存在');
+  assert.ok(source.includes('.chat-sug-actions { display: flex; gap: 8px; margin-top: 8px; flex-shrink: 0; }'), '确认修改操作栏必须始终保留');
+  // v0.34.8 - 建议卡 move 进消息区末尾并滚动到底，确保完整 diff 与按钮可达
+  assert.ok(source.includes('box.appendChild(sugEl);'), '建议卡必须 append 进消息区末尾');
+  assert.ok(source.includes('box.scrollTop = box.scrollHeight;'), '建议卡出现后必须滚动到消息区底部让按钮可达');
+  assert.ok(!source.includes('postResize({ height: clampH(Math.round(h)), width: clampW(window.innerWidth) });'), '聊天尺寸上报不得调用另一个 IIFE 里的不可见函数');
+  // v0.34.2 - 输入框不得每次 input 都重设高度 + 上报（自引用收缩循环的根源）
+  assert.ok(!source.includes("this.style.height = Math.min(this.scrollHeight, 80) + 'px';"), '输入框不得在每次 input 里按 scrollHeight 重设高度');
+  assert.ok(source.includes('chatPanel.style.height = chatFixedHeight() + \'px\''), '打开聊天时必须按当前视口设置面板高度');
+});
+
+test('确认修改支持回包丢失自检、不依赖 iframe AbortSignal，且卡片页面不缓存旧脚本', () => {
+  const ui = fs.readFileSync(new URL('../routes/ui.js', import.meta.url), 'utf8');
+  const client = fs.readFileSync(new URL('../assets/sticker-manager.js', import.meta.url), 'utf8');
+  const uiStart = ui.indexOf('async function confirmSuggestion()');
+  const uiEnd = ui.indexOf('function openChat()', uiStart);
+  assert.ok(uiStart >= 0 && uiEnd > uiStart, '主卡片确认函数必须存在');
+  const uiConfirm = ui.slice(uiStart, uiEnd);
+  assert.doesNotMatch(uiConfirm, /new AbortController|AbortSignal\.timeout|confirmInit\.signal/, '主卡片确认请求不能绑定不稳定的 signal');
+  const catchStart = uiConfirm.lastIndexOf('} catch (e) {');
+  const catchEnd = uiConfirm.indexOf('chatBusy = false;', catchStart);
+  assert.ok(catchStart >= 0 && catchEnd > catchStart, '主卡片确认失败分支必须存在');
+  const failureCatch = uiConfirm.slice(catchStart, catchEnd);
+  assert.doesNotMatch(failureCatch, /closeChat\(\)/, '网络/超时失败不能关闭聊天面板');
+  assert.match(uiConfirm, /function resetConfirmButton\(\)/, '失败后必须有统一的确认按钮恢复逻辑');
+  assert.match(uiConfirm, /finally \{[\s\S]*?if \(!finished\) resetConfirmButton\(\);/, '确认请求结束后必须无论异常与否恢复按钮状态');
+  assert.match(uiConfirm, /recoverConfirmedChange\(requestStickerId, requestSuggestion\)/, '确认异常时必须回查标签是否已落盘');
+  assert.match(uiConfirm, /确认回包没接到，修改建议先留着/, '会话回包异常也要保留修改建议');
+  const conflictStart = uiConfirm.indexOf('if (res.status === 409)');
+  const conflictEnd = uiConfirm.indexOf('} else {', conflictStart);
+  assert.ok(conflictStart >= 0 && conflictEnd > conflictStart, '409 失败分支必须存在');
+  assert.doesNotMatch(uiConfirm.slice(conflictStart, conflictEnd), /closeChat\(\)/, '会话回包异常不能关闭聊天面板');
+
+  const clientStart = client.indexOf('async function confirmChatChange()');
+  const clientEnd = client.indexOf('function closeChatModal()', clientStart);
+  assert.ok(clientStart >= 0 && clientEnd > clientStart, '图库确认函数必须存在');
+  const clientConfirm = client.slice(clientStart, clientEnd);
+  assert.match(clientConfirm, /noAbort:\s*true/, '图库确认请求必须显式跳过 AbortController');
+  assert.match(clientConfirm, /recoverChatChange\(requestStickerId, requestSuggestion\)/, '图库确认异常时必须回查标签是否已落盘');
+  assert.match(clientConfirm, /刷新展柜失败不能倒灌成“确认失败”/, '确认成功后的刷新失败不能被误报成确认失败');
+  assert.match(client, /if \(!noAbort && !init\.signal\)/, 'apiFetch 必须支持按请求跳过 signal');
+
+  assert.match(ui, /X-Hana-Plugin-Surface-Session/, '主卡片请求必须支持新版 surface session 请求头');
+  assert.match(ui, /function authUrl\(url\)/, '带查询参数的回查 URL 必须有统一鉴权拼接函数');
+  assert.match(ui, /url\.indexOf\('\?'\) >= 0 \? '&' : ''/, '回查 URL 不能把鉴权参数拼成第二个问号');
+  assert.match(ui, /timedPromise\(res\.json\(\), 5000\)/, '确认响应体解析也必须有超时保护');
+  assert.match(ui, /c\.header\('Cache-Control', 'no-store, no-cache, must-revalidate'\)/, '卡片页面必须禁止缓存旧版内联脚本');
+});
+
 test('新宿主（0.686+ 纯 card iframe）也必须按图片尺寸算 aspectRatio（回归：size 被旧分支条件挡住 → 恒回退 400:430 大白卡）', () => {
   const source = fs.readFileSync(new URL('../tools/express.js', import.meta.url), 'utf8');
   // size 必须无条件读取，不能再次被 `if (!deferredOk && !useNativeMedia)` 包住
