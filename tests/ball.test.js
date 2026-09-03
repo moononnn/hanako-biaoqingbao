@@ -11,6 +11,7 @@ import {
   buildBallSendPayload,
   buildSemanticContext,
   createRequestId,
+  createHeartbeatTracker,
   sessionFileDirFor,
   materializeStickerCopy,
   readSessionIdFromFile,
@@ -53,6 +54,41 @@ test('normalizePinnedIds 只保留现存 id、去重并固定版本', () => {
     { id: 'stk_002' },
   ]);
   assert.deepEqual(result, { version: 1, pinnedIds: ['stk_002'] });
+});
+
+test('心跳 tracker：收到心跳后 connected，超时后失联，reset 清空', () => {
+  const now = 1_000_000;
+  const tracker = createHeartbeatTracker({ staleAfterMs: 45000 });
+  // 初始：未心跳，不算失联（可能还没启动完）
+  assert.equal(tracker.connected, false);
+  assert.equal(tracker.isStale(now), false);
+  // 收到心跳
+  tracker.beat();
+  assert.equal(tracker.lastHeartbeat > 0, true);
+  assert.equal(tracker.connected, true);
+  // 未超时
+  assert.equal(tracker.isStale(tracker.lastHeartbeat + 10000), false);
+  assert.equal(tracker.sync(tracker.lastHeartbeat + 10000), true);
+  // 超时 → 失联
+  assert.equal(tracker.isStale(tracker.lastHeartbeat + 45001), true);
+  assert.equal(tracker.sync(tracker.lastHeartbeat + 45001), false);
+  // reset 清空
+  tracker.reset();
+  assert.equal(tracker.lastHeartbeat, null);
+  assert.equal(tracker.connected, false);
+  assert.equal(tracker.isStale(now), false);
+});
+
+test('心跳 tracker：超时前再心跳会刷新 lastHeartbeat，不会误判失联', () => {
+  const tracker = createHeartbeatTracker({ staleAfterMs: 45000 });
+  const t0 = 5_000_000;
+  tracker.beat();
+  assert.equal(tracker.isStale(t0 + 44000), false); // 边界内
+  tracker.beat(); // 刷新到当前时间
+  assert.equal(tracker.isStale(t0 + 44001 + 100), false); // 刷新后仍有 45s 余量
+  // 但停摆超过 45s 后仍会失联
+  tracker.beat();
+  assert.equal(tracker.isStale(tracker.lastHeartbeat + 45001), true);
 });
 
 test('纸飞机识图入库记录 tagged_at，图库不会误判为未识图', () => {
@@ -316,7 +352,7 @@ test('resolveTarget 不把固定目标绕过公开会话白名单', async () => 
   assert.equal(readPinnedTarget(ctx), null);
 });
 
-test('session:list 缺少 visibility 时不进入公开目标白名单', async () => {
+test('session:list 缺少 visibility 时按普通公开会话处理', async () => {
   const root = tempDir();
   const missingVisibility = writeSession(root, 'hanako', 'unknown.jsonl', [
     { type: 'message', timestamp: '2026-08-18T00:00:00.000Z', message: { role: 'user', content: '未标注公开性的对话' } },
@@ -326,8 +362,10 @@ test('session:list 缺少 visibility 时不进入公开目标白名单', async (
     bus: { request: async () => ({ sessions: [{ path: missingVisibility, agentId: 'hanako' }] }) },
   };
   await setPinnedTarget(ctx, { agentId: 'hanako', sessionPath: missingVisibility, title: '未标注' });
-  assert.equal(await resolveTarget(ctx), null);
-  assert.equal(readPinnedTarget(ctx), null);
+  const target = await resolveTarget(ctx);
+  assert.equal(target.sessionPath, missingVisibility);
+  assert.equal(target.pinned, true);
+  assert.equal(readPinnedTarget(ctx).sessionPath, missingVisibility);
 });
 
 test('listSessions 用 session:list 标题并提供助手名，私密会话不出现', async () => {
@@ -571,6 +609,124 @@ test('readSessionIdFromFile 从会话文件头部读出 sessionId', () => {
   assert.equal(readSessionIdFromFile(sessionPath), 'sess_real_id_123');
   // 文件不存在 → null
   assert.equal(readSessionIdFromFile(path.join(root, 'nope.jsonl')), null);
+});
+
+test('v0.33.81 会话文件头无 sess_ sessionId 时解析返回 null，但显式传 sessionId 反馈仍成功', async () => {
+  const root = tempDir();
+  // 复现真实 bug 场景：jsonl 头部只有顶层 session id（UUID，非 sess_），
+  // 没有带 details.media.items 的媒体消息，readSessionIdFromFile 匹配不到 sess_ 前缀。
+  const sessionPath = writeSession(root, 'hanako', 'sess_no_media.jsonl', [
+    { type: 'session', version: 3, id: '01a043b7-0679-7ef2-aedd-cf548a322ad6' },
+    {
+      type: 'message',
+      id: 'm1',
+      timestamp: '2026-08-27T14:54:51.942Z',
+      message: { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+    },
+  ]);
+  // 文件头解析不到 sess_ 前缀的 sessionId（旧实现会误匹配到 [SessionFile] 附件里的路径字符串）
+  assert.equal(readSessionIdFromFile(sessionPath), null);
+
+  const dataDir = tempDir();
+  fs.writeFileSync(path.join(dataDir, 'stickers.json'), JSON.stringify([{ id: 'stk_nomedia' }]), 'utf8');
+  await recordRecentMatch({
+    dataDir,
+    ctx: { sessionId: 'sess_nomedia_real', sessionPath },
+    stickerId: 'stk_nomedia',
+    description: '无媒体消息会话的图',
+    emotion: '开心',
+    agentId: 'hanako',
+    delivery: 'card',
+    ts: 200,
+  });
+  const ctx = {
+    dataDir,
+    // Hana 0.737+ 的普通会话列表省略 visibility；仍应允许卡片反馈。
+    bus: { request: async () => ({ sessions: [{ sessionId: 'sess_nomedia_real', title: '公开对话' }] }) },
+  };
+  // 前端显式传权威 sessionId（v0.33.81 修复后）→ 不依赖文件头解析，反馈成功
+  const result = await submitBallFeedback(ctx, {
+    dataDir,
+    sessionId: 'sess_nomedia_real',
+    stickerId: 'stk_nomedia',
+    feedback: 'positive',
+    feedbackKind: 'context',
+    expectedTs: 200,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.feedback_kind, 'context');
+});
+
+test('Hana 0.817 session:list 缺少 sessionId 时，按 session:get 解析显式反馈会话', async () => {
+  const root = tempDir();
+  const sessionPath = writeSession(root, 'hanako', 'new-contract.jsonl', [
+    { type: 'session', version: 3, id: '01a043b7-0679-7ef2-aedd-cf548a322ad6' },
+    { type: 'message', timestamp: '2026-09-03T08:00:00.000Z', message: { role: 'user', content: [{ type: 'text', text: '公开对话' }] } },
+  ]);
+  const dataDir = tempDir();
+  fs.writeFileSync(path.join(dataDir, 'stickers.json'), JSON.stringify([{ id: 'stk_new_contract' }]), 'utf8');
+  await recordRecentMatch({
+    dataDir,
+    ctx: { sessionId: 'sess_new_contract', sessionPath },
+    stickerId: 'stk_new_contract',
+    description: '新版会话契约测试图',
+    emotion: '无语',
+    agentId: 'hanako',
+    delivery: 'card',
+    ts: 300,
+  });
+
+  const calls = [];
+  const ctx = {
+    dataDir,
+    bus: {
+      request: async (name, payload) => {
+        calls.push({ name, payload });
+        if (name === 'session:list') {
+          return { sessions: [{ path: sessionPath, visibility: 'public', title: '公开对话' }] };
+        }
+        if (name === 'session:get') {
+          // 旧版 session:get 只给内部文件 UUID；显式 sessionId 仍应沿用调用方的权威值。
+          return { session: { path: sessionPath, id: '01a043b7-0679-7ef2-aedd-cf548a322ad6', visibility: 'public', agentId: 'hanako' } };
+        }
+        return { sessions: [] };
+      },
+    },
+  };
+  const result = await submitBallFeedback(ctx, {
+    sessionId: 'sess_new_contract',
+    stickerId: 'stk_new_contract',
+    feedback: 'positive',
+    feedbackKind: 'context',
+    expectedTs: 300,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.feedback_kind, 'context');
+  assert.deepEqual(calls.map((call) => call.name), ['session:list', 'session:get']);
+  assert.deepEqual(calls[1].payload, { sessionId: 'sess_new_contract' });
+});
+
+test('Hana 0.817 session:get 兜底仍拦截私密和插件私有会话', async () => {
+  const projections = [
+    { path: 'C:/Users/test/.hanako/agents/hanako/sessions/private.jsonl', id: '01a043b7-0679-7ef2-aedd-cf548a322ad6', visibility: 'private' },
+    { path: 'C:/Users/test/.hanako/agents/hanako/sessions/plugin.jsonl', id: '01a043b7-0679-7ef2-aedd-cf548a322ad7', visibility: 'public', ownerPluginId: 'other-plugin' },
+  ];
+  for (const projection of projections) {
+    const result = await submitBallFeedback({
+      dataDir: tempDir(),
+      bus: {
+        request: async (name) => name === 'session:list'
+          ? { sessions: [{ path: projection.path, visibility: 'public', title: '列表投影' }] }
+          : { session: projection },
+      },
+    }, {
+      sessionId: 'sess_new_contract_private',
+      stickerId: 'stk_private_guard_new',
+      feedback: 'positive',
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.status, 409);
+  }
 });
 
 test('validatePinnedReorder 只调序不增删：合法重排通过并规范化', () => {

@@ -3059,8 +3059,22 @@ class Ball(QWidget):
         self.frame_timer.setInterval(16)
         self.frame_timer.timeout.connect(self._tick_frame)
         self.frame_timer.start()
+        # 运行期心跳：每 15s 向 Node 上报一次，Node 45s 没收到判失联（渲染崩/事件循环卡死）
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(15000)
+        self._heartbeat_timer.timeout.connect(self._send_heartbeat)
+        self._heartbeat_timer.start()
         self.set_variant(self.variant)
         self.restore_position()
+
+    def _send_heartbeat(self):
+        # daemon 线程，避免请求卡住事件循环；失败静默（Node 会按超时判失联）
+        def worker():
+            try:
+                request_json("POST", "/heartbeat", {}, timeout=5)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True, name="biaoqingbao-heartbeat").start()
 
     def set_variant(self, variant):
         self.variant = normalize_variant(variant)
