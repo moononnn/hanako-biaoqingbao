@@ -17,6 +17,7 @@ import {
   normalizeTransferMetadata,
   planStickerIdMapping,
   remapMigrationData,
+  resolveExportDataKeys,
   validateTransferManifest,
   readLastExportDir,
   writeLastExportDir,
@@ -183,7 +184,7 @@ test('v2 搬家包只导出用户资产，排除凭据、日志和直接向量',
       'style-template.json': { current: '你说话很口语', history: [], source_agents: ['old-agent'], excluded_agents: [] },
       'style-profile.json': { level: 'balanced', source_agents: ['old-agent'], model: 'secret-model', providerId: 'secret-provider', baseUrl: 'https://secret.invalid', customApiKey: 'DO_NOT_EXPORT', embeddingModel: 'secret-embedding', filePath: 'C:\\secret\\profile.json' },
       'dialect-config.json': { version: 3, agents: { 'old-agent': { dialect: 'sichuan', enabled: true } } },
-      'agent-freq.json': { version: 2, default_daily: 50, default_task: 20, agents: { 'old-agent': { enabled: true, daily: 50, task: 20 } } },
+      'agent-freq.json': { version: 2, global_enabled: false, default_daily: 50, default_task: 20, agents: { 'old-agent': { enabled: true, daily: 50, task: 20 } } },
       'display-config.json': { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true },
       'ball-config.json': { version: 2, pinnedIds: ['stk_old'], variant: 'plane', pinnedTarget: 'machine-only' },
     };
@@ -201,6 +202,7 @@ test('v2 搬家包只导出用户资产，排除凭据、日志和直接向量',
     assert.equal(payload.stickers[0].sourceId, 'stk_old');
     assert.equal(payload.stickers[0].hash, hashBuffer(image));
     assert.deepEqual(payload.data.ballConfig.pinnedIds, ['stk_old']);
+    assert.equal(payload.data.agentFreq.global_enabled, false);
     assert.equal('pinnedTarget' in payload.data.ballConfig, false);
     assert.equal('vector' in payload.data.teaching.samples.stk_old, false);
     assert.equal('model' in payload.data.teaching, false);
@@ -306,4 +308,98 @@ test('管理页把完整搬家包放在数据与迁移页，图库保留普通�
   assert.match(api, /action === 'export_zip'/);
   assert.match(api, /normalizeMigrationPayload/);
   assert.match(api, /migrationReport/);
+});
+
+test('导出内容分组：组 id 解析成具体数据键，未知组忽略且顺序稳定', () => {
+  assert.deepEqual(resolveExportDataKeys(null), []);
+  assert.deepEqual(resolveExportDataKeys([]), []);
+  assert.deepEqual(resolveExportDataKeys(['preference']), ['preferences', 'teaching', 'contextFeedback', 'exposure']);
+  assert.deepEqual(resolveExportDataKeys(['style']), ['styleTemplate', 'styleProfile', 'styleFeedback']);
+  assert.deepEqual(resolveExportDataKeys(['dialect']), ['dialectConfig']);
+  assert.deepEqual(resolveExportDataKeys(['interface']), ['agentFreq', 'displayConfig', 'ballConfig']);
+  assert.deepEqual(resolveExportDataKeys(['dialect', 'bogus', 'preference']), ['dialectConfig', 'preferences', 'teaching', 'contextFeedback', 'exposure']);
+});
+
+test('buildMigrationPayload 只带 includeDataKeys 指定的键，null 则带全部', async () => {
+  await withTempDir(async (directory) => {
+    const dataDir = path.join(directory, 'data');
+    const stickersDir = path.join(dataDir, 'stickers');
+    await fsp.mkdir(stickersDir, { recursive: true });
+    await fsp.writeFile(path.join(stickersDir, 'cat.png'), fakePng(11));
+    const meta = [{ id: 'stk_1', file: 'cat.png', description: '猫' }];
+    const files = {
+      'preferences.json': { version: 1, users: {} },
+      'teaching-samples.json': { samples: {} },
+      'dialect-config.json': { version: 3, agents: { 'a1': { dialect: 'sichuan', enabled: true } } },
+      'agent-freq.json': { version: 2, global_enabled: true, default_daily: 50, default_task: 20, agents: {} },
+    };
+    for (const [name, value] of Object.entries(files)) await fsp.writeFile(path.join(dataDir, name), JSON.stringify(value));
+
+    const onlyDialect = buildMigrationPayload({ dataDir, stickersDir, meta, includeDataKeys: ['dialectConfig'] });
+    assert.deepEqual(Object.keys(onlyDialect.data), ['dialectConfig']);
+    assert.equal('preferences' in onlyDialect.data, false);
+
+    const all = buildMigrationPayload({ dataDir, stickersDir, meta });
+    assert.deepEqual(Object.keys(all.data).sort(), ['agentFreq', 'dialectConfig', 'preferences', 'teaching']);
+  });
+});
+
+test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤的 v2 包', async () => {
+  await withTempDir(async (directory) => {
+    const dataDir = path.join(directory, 'data');
+    const stickersDir = path.join(dataDir, 'stickers');
+    await fsp.mkdir(stickersDir, { recursive: true });
+    await fsp.writeFile(path.join(stickersDir, 'cat.png'), fakePng(12));
+    const meta = [{ id: 'stk_1', file: 'cat.png', description: '猫' }];
+    await fsp.writeFile(path.join(dataDir, 'dialect-config.json'), JSON.stringify({ version: 3, agents: { 'a1': { dialect: 'sichuan', enabled: true } } }));
+    await fsp.writeFile(path.join(dataDir, 'agent-freq.json'), JSON.stringify({ version: 2, global_enabled: true, default_daily: 50, default_task: 20, agents: {} }));
+
+    // 全不勾（[]）：v1 轻量包，只带图库，无 migration
+    const galleryOnly = await exportStickerArchive({ meta, stickersDir, dataDir, outputPath: path.join(directory, 'gallery.zip'), includeDataKeys: [] });
+    assert.equal(galleryOnly.ok, true);
+    assert.equal(galleryOnly.manifest.formatVersion, 1);
+    assert.equal(galleryOnly.migration, null);
+    const gArch = await extractStickerArchive(await fsp.readFile(path.join(directory, 'gallery.zip')));
+    assert.equal(gArch.migrationFound, false);
+
+    // 只勾方言：v2 包但 data 里只有方言
+    const dialectOnly = await exportStickerArchive({ meta, stickersDir, dataDir, outputPath: path.join(directory, 'dialect.zip'), includeDataKeys: ['dialectConfig'] });
+    assert.equal(dialectOnly.ok, true);
+    assert.equal(dialectOnly.manifest.formatVersion, 2);
+    const dArch = await extractStickerArchive(await fsp.readFile(path.join(directory, 'dialect.zip')));
+    assert.equal(dArch.migrationFound, true);
+    const dData = normalizeMigrationPayload(dArch.migration).data;
+    assert.deepEqual(Object.keys(dData), ['dialectConfig']);
+    assert.equal('agentFreq' in dData, false);
+
+    // 不传 includeDataKeys（老行为）：全量 v2 搬家包
+    const full = await exportStickerArchive({ meta, stickersDir, dataDir, outputPath: path.join(directory, 'full.zip') });
+    assert.equal(full.ok, true);
+    assert.equal(full.manifest.formatVersion, 2);
+    const fArch = await extractStickerArchive(await fsp.readFile(path.join(directory, 'full.zip')));
+    const fData = normalizeMigrationPayload(fArch.migration).data;
+    assert.equal('dialectConfig' in fData, true);
+    assert.equal('agentFreq' in fData, true);
+  });
+});
+
+test('导出内容勾选 UI 与提交契约：四个分组、全选框、摘要联动、dataGroups 提交', () => {
+  const ui = fs.readFileSync(path.join(process.cwd(), 'routes', 'ui.js'), 'utf8');
+  const client = fs.readFileSync(path.join(process.cwd(), 'assets', 'sticker-manager.js'), 'utf8');
+  const api = fs.readFileSync(path.join(process.cwd(), 'routes', 'api.js'), 'utf8');
+  // 弹窗提供四个内容勾选 + 全选框，且图库说明改为“不设勾选”
+  assert.match(ui, /id="export-group-preference"/);
+  assert.match(ui, /id="export-group-style"/);
+  assert.match(ui, /id="export-group-dialect"/);
+  assert.match(ui, /id="export-group-interface"/);
+  assert.match(ui, /id="export-check-all"/);
+  assert.doesNotMatch(ui, /把整个表情包插件带走/);
+  // 前端：提交 dataGroups，且有摘要联动
+  assert.match(client, /dataGroups: getCheckedExportGroups\(\)/);
+  assert.match(client, /export-group-preference/);
+  assert.match(client, /updateExportSummary\(\)/);
+  // 后端：读取并解析 dataGroups，不传时回退全量
+  assert.match(api, /resolveExportDataKeys/);
+  assert.match(api, /includeDataKeys/);
+  assert.match(api, /Array\.isArray\(body\.dataGroups\)/);
 });

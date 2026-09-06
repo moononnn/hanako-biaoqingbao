@@ -23,6 +23,13 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
     fs.writeFileSync(path.join(agentDir, 'config.yaml'), 'agent:\n  name: 同一个\n');
     fs.writeFileSync(path.join(agentDir, 'ishiki.md'), '# 人格定义\n');
     fs.writeFileSync(path.join(dataDir, 'stickers.json'), '[]');
+    fs.writeFileSync(path.join(dataDir, 'agent-freq.json'), JSON.stringify({
+      version: 2,
+      global_enabled: false,
+      default_daily: 50,
+      default_task: 20,
+      agents: { new: { enabled: true, daily: 15, task: 90 } },
+    }));
 
     const { writeStoredZip } = await import('./lib/zip-images.js');
     const { hashBuffer } = await import('./lib/sticker-transfer.js');
@@ -55,6 +62,13 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
             },
           },
         },
+        agentFreq: {
+          version: 2,
+          global_enabled: true,
+          default_daily: 90,
+          default_task: 10,
+          agents: { old: { enabled: false, daily: 0, task: 10 } },
+        },
       },
     };
     const zipPath = path.join(home, 'move.zip');
@@ -84,6 +98,7 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
     if (!migrationResult.ok) throw new Error(JSON.stringify(migrationResult));
     const meta = JSON.parse(fs.readFileSync(path.join(dataDir, 'stickers.json'), 'utf8'));
     const preferences = JSON.parse(fs.readFileSync(path.join(dataDir, 'preferences.json'), 'utf8'));
+    const agentFreq = JSON.parse(fs.readFileSync(path.join(dataDir, 'agent-freq.json'), 'utf8'));
 
     // 同一 v2 ZIP 从图库普通入口导入时只走图片/图库元数据，不偷偷恢复整套设置。
     const ordinaryResponse = await call({ action: 'import_zip', zipBase64, fileName: 'move.zip' });
@@ -96,6 +111,7 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
       importedId: migrationResult.data?.importedIds?.[0],
       mappedAgent: Object.keys(preferences.users || {})[0],
       mappedPreferred: preferences.users?.new?.mappings?.[0]?.preferred_ids?.[0],
+      globalEnabled: agentFreq.global_enabled,
       metaCount: meta.length,
       ordinaryStatus: ordinaryResponse.status,
       ordinaryMigration: ordinaryResult.data?.migration,
@@ -124,6 +140,7 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
     assert.equal(result.importedId, 'stk_001');
     assert.equal(result.mappedAgent, 'new');
     assert.equal(result.mappedPreferred, 'stk_001');
+    assert.equal(result.globalEnabled, false, '本机已关闭总闸时，迁移包不能把它悄悄重新打开');
     assert.equal(result.metaCount, 1);
     assert.equal(result.ordinaryStatus, 200);
     assert.equal(result.ordinaryMigration, false);

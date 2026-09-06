@@ -400,6 +400,37 @@ test('listSessions 用 session:list 标题并提供助手名，私密会话不�
   assert.ok(!sessions.some((s) => s.title === '私密隐藏'), '私密会话不得出现在列表');
 });
 
+test('listSessions 接受宿主缺失或为 null 的 visibility，并按宿主 modified 排序', async () => {
+  const currentPath = path.join(tempDir(), 'agents', 'hanako', 'sessions', 'current.jsonl');
+  const olderPath = path.join(tempDir(), 'agents', 'hanako', 'sessions', 'older.jsonl');
+  const ctx = {
+    bus: {
+      request: async () => ({
+        sessions: [
+          {
+            path: currentPath,
+            visibility: null,
+            agentId: 'hanako',
+            agentName: '小花',
+            title: '当前会话',
+            modified: '2026-08-18T02:02:00.000Z',
+          },
+          {
+            path: olderPath,
+            visibility: 'public',
+            agentId: 'hanako',
+            agentName: '小花',
+            title: '旧会话',
+            modified: '2026-08-18T02:01:00.000Z',
+          },
+        ],
+      }),
+    },
+  };
+  const sessions = await listSessions(ctx, 5);
+  assert.deepEqual(sessions.map((item) => item.title), ['当前会话', '旧会话']);
+});
+
 test('findMostActiveSession 按最后用户消息时间选择，不被助手回复 mtime 抢走', () => {
   const root = tempDir();
   const older = writeSession(root, 'hanako', 'old.jsonl', [
@@ -425,6 +456,26 @@ test('findMostActiveSession 可以按 session:list 白名单过滤私密会话',
   ]);
   const picked = findMostActiveSession({ hanaHome: root, allowedPaths: new Set([publicPath]) });
   assert.equal(picked.sessionPath, publicPath);
+});
+
+test('findMostActiveSession 有宿主活动时间时优先当前正在处理的会话', () => {
+  const root = tempDir();
+  const olderUser = writeSession(root, 'hanako', 'older-user.jsonl', [
+    { type: 'message', timestamp: '2026-08-18T01:00:00.000Z', message: { role: 'user', content: '较早用户消息' } },
+  ]);
+  const current = writeSession(root, 'hanako', 'current.jsonl', [
+    { type: 'message', timestamp: '2026-08-18T00:00:00.000Z', message: { role: 'user', content: '当前窗口较早的用户消息' } },
+    { type: 'message', timestamp: '2026-08-18T02:00:00.000Z', message: { role: 'assistant', content: '正在回复' } },
+  ]);
+  const picked = findMostActiveSession({
+    hanaHome: root,
+    activityByPath: new Map([
+      [path.normalize(olderUser), Date.parse('2026-08-18T02:01:00.000Z')],
+      [path.normalize(current), Date.parse('2026-08-18T02:02:00.000Z')],
+    ]),
+  });
+  assert.equal(picked.sessionPath, current);
+  assert.equal(picked.hostModifiedAt, Date.parse('2026-08-18T02:02:00.000Z'));
 });
 
 test('findMostActiveSession 无用户消息时才回退 mtime', () => {

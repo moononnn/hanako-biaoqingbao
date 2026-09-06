@@ -11,8 +11,9 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import {
-  readTextConfig, getAgentFreqSettings, consumeAgentStickerCooldown, resolveAgentId,
-  matchRitualWord, sanitizeTag, DATA_DIR, HANA_HOME,
+  readTextConfig, readAgentFreq, isAutoImageEnabled, getAgentFreqSettings,
+  consumeAgentStickerCooldown, resolveAgentId, matchRitualWord, sanitizeTag,
+  DATA_DIR, HANA_HOME,
 } from '../lib/shared.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -161,7 +162,12 @@ export default function (pi) {
     appendLog(debugLogPath, `[context] agent=${agentId} messages=${msgCount}`);
 
     try {
-      // 0. 全局开关与连续配图冷却
+      // 0. 全局总闸与连续配图冷却；全局关闭不改写各伙伴原有频率配置。
+      const freqConfig = readAgentFreq();
+      if (!isAutoImageEnabled(freqConfig)) {
+        appendLog(debugLogPath, '[context] 自动配图总闸已关闭，跳过情绪检测与配图提示');
+        return;
+      }
       const freqSettings = getAgentFreqSettings(agentId);
       if (!freqSettings.enabled) {
         appendLog(debugLogPath, `[context] 助手 ${agentId} 已关闭配图，跳过`);
@@ -187,6 +193,10 @@ export default function (pi) {
       // 3. 问候属于日常场景：只按 daily 抽一次，不调用辅助模型
       const ritualHit = detectRitual(event.messages);
       if (ritualHit) {
+        if (!isAutoImageEnabled(readAgentFreq())) {
+          appendLog(debugLogPath, '[context] 自动配图总闸在问候提示前关闭，跳过');
+          return;
+        }
         if (!passesFrequency(freqSettings.daily)) {
           appendLog(debugLogPath, `[context] ritual 命中但日常频率=${freqSettings.daily}% 未通过`);
           return;
@@ -205,7 +215,13 @@ export default function (pi) {
         return;
       }
 
-      // 5. 调辅助模型分析情绪 + 场景
+      // 5. 再检查一次总闸，覆盖频率预筛期间用户刚好关闭开关的竞态。
+      if (!isAutoImageEnabled(readAgentFreq())) {
+        appendLog(debugLogPath, '[context] 自动配图总闸在情绪检测前关闭，跳过');
+        return;
+      }
+
+      // 6. 调辅助模型分析情绪 + 场景
       const result = await callEmotionAnalysis(event.messages);
       if (!result.ok) {
         appendLog(debugLogPath, `[context] 情绪分析失败: ${result.error}`);
@@ -225,7 +241,7 @@ export default function (pi) {
         return;
       }
 
-      // 6. B 方案第二阶段：按 sceneFreq / preFreq 校准，使最终概率恰好等于场景频率
+      // 7. B 方案第二阶段：按 sceneFreq / preFreq 校准，使最终概率恰好等于场景频率
       const sceneType = data.scene_type || '中性';
       const sceneFreq = sceneType === '正事' ? freqSettings.task : freqSettings.daily;
       const conditionalPercent = getConditionalScenePercent(sceneFreq, preFreq);
@@ -234,7 +250,7 @@ export default function (pi) {
         return;
       }
 
-      // 7. 注入提示
+      // 8. 注入提示
       if (injectPrompt(event, emotion)) {
         appendLog(debugLogPath, `[context] ✅ 情绪感知: ${emotion} | 场景: ${sceneType} | freq: ${sceneFreq} | reason: ${data.reason || ''}`);
         console.log(`[biaoqingbao] ✅ 情绪感知: ${emotion} (场景:${sceneType} freq:${sceneFreq})`);

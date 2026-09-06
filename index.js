@@ -1,11 +1,11 @@
-﻿// 表情包插件 v0.5.0 — Plugin Entry (lifecycle)
+﻿// 表情包插件 — Plugin Entry (lifecycle)
 // 负责 plugin 激活时的初始化工作
 //
-// 关键：只导出 onload/onunload, 不要 default export,
-// 否则 lifecycle 系统会调用 default(ctx), 但 ctx 没传, 报错
-//
-// v0.5 改动：增加 lifecycle,让 plugin 能被"激活"
-// 之前只有 extensions + routes + tools, plugin 一直 inactive
+// 宿主版本说明：Hana 当前宿主按「默认导出的插件类」实例化，再无参调用
+// onload/onunload。仅导出具名 onload/onunload 时，正式版只会完成
+// lifecycle import，onload/onunload 永不执行（导致 Hana 重启时悬浮球
+// 不被优雅 stopBall，进程被连带强杀、零日志消失）。
+// 保留具名函数供旧式直接导入和单元测试使用（参考 hanabrew/drift-bottle）。
 
 import { readFileSync, existsSync, readdirSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -138,6 +138,24 @@ export async function onunload(ctx = {}) {
     ctx.log?.warn?.('[biaoqingbao] 悬浮球停止失败:', error?.message || error);
   }
 }
+
+// Hana 当前宿主实例化默认导出的插件类，把 ctx 挂到实例后无参调用 onload/onunload；
+// 保留具名函数供旧式直接导入和单元测试使用。
+class BiaoqingbaoPlugin {
+  constructor() {
+    this.ctx = null;
+  }
+
+  async onload() {
+    return onload(this.ctx);
+  }
+
+  async onunload() {
+    return onunload(this.ctx);
+  }
+}
+
+export default BiaoqingbaoPlugin;
 
 // 注意：observer.js 现在使用 Pi SDK Extension API（pi.on() 事件订阅）
 // 由 HanaAgent plugin system 自动加载并传给 Pi SDK

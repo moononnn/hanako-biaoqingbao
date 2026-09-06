@@ -19,7 +19,10 @@ import {
   isMediaOnlyHost,
   trySendDeferredImage,
 } from '../tools/express.js';
-import { backfillTaggedAtEntries, collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT } from '../lib/shared.js';
+import {
+  backfillTaggedAtEntries, collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT,
+  normalizeAgentFreqConfig, isAutoImageEnabled,
+} from '../lib/shared.js';
 import { KNOWN_CONFUSABLES, buildConfusableSection } from '../lib/known-confusables.js';
 
 function seededRandom(seed = 1) {
@@ -152,6 +155,45 @@ test('deferred 降级路径：非 0.679 宿主仍走 iframe 卡片', () => {
   });
 });
 
+test('自动配图总闸默认开启，关闭时只保留全局状态并完整保留伙伴频率配置', () => {
+  const original = {
+    version: 2,
+    default_daily: 70,
+    default_task: 30,
+    agents: {
+      hanako: { enabled: false, daily: 15, task: 90 },
+      feiyue: { enabled: true, daily: 50, task: 20 },
+    },
+  };
+  const enabled = normalizeAgentFreqConfig(original);
+  assert.equal(enabled.global_enabled, true, '旧配置缺少总闸字段时必须默认开启');
+  assert.equal(isAutoImageEnabled(enabled), true);
+
+  const disabled = normalizeAgentFreqConfig({ ...original, global_enabled: false });
+  assert.equal(disabled.global_enabled, false);
+  assert.deepEqual(disabled.agents, enabled.agents, '关闭总闸不得改写伙伴 enabled/daily/task');
+  assert.equal(disabled.default_daily, enabled.default_daily);
+  assert.equal(disabled.default_task, enabled.default_task);
+  assert.equal(isAutoImageEnabled(disabled), false);
+});
+
+test('自动配图总闸接在 observer/express 门口，频率保存接口关闭时拒绝旧写入', () => {
+  const observer = fs.readFileSync(new URL('../extensions/observer.js', import.meta.url), 'utf8');
+  const express = fs.readFileSync(new URL('../tools/express.js', import.meta.url), 'utf8');
+  const dialect = fs.readFileSync(new URL('../extensions/dialect-boost.js', import.meta.url), 'utf8');
+  const ball = fs.readFileSync(new URL('../lib/ball.js', import.meta.url), 'utf8');
+  const api = fs.readFileSync(new URL('../routes/api.js', import.meta.url), 'utf8');
+  assert.match(observer, /isAutoImageEnabled\(freqConfig\)/);
+  assert.match(observer, /自动配图总闸已关闭[\s\S]*?return;/);
+  assert.match(express, /isAutoImageEnabled\(readAgentFreq\(\)\)/);
+  assert.match(express, /自动配图总闸已关闭[\s\S]*?return reply/);
+  assert.doesNotMatch(dialect, /isAutoImageEnabled|readAgentFreq|global_enabled/, '方言加强版不能读取自动配图总闸');
+  assert.doesNotMatch(ball, /agent-freq|isAutoImageEnabled|global_enabled/, '纸飞机主动功能不能读取自动配图总闸');
+  assert.match(api, /app\.post\('\/api\/agent-freq\/global'/);
+  assert.match(api, /current\.global_enabled === false[\s\S]*?伙伴配图频率/);
+  assert.match(api, /global_enabled: current\.global_enabled/);
+});
+
 test('两阶段抽样保持目标场景频率', () => {
   assert.equal(getConditionalScenePercent(20, 80), 25);
   assert.equal(getConditionalScenePercent(50, 50), 100);
@@ -280,6 +322,18 @@ test('配图卡片按图片实际尺寸动态定宽高比（v0.33.72：智能开
   // 尺寸缺失/非法回退默认
   assert.equal(buildStickerCard({ id: 'a', description: '缺尺寸', score: 1, emotion: '开心' }).aspectRatio, '400:430');
   assert.equal(buildStickerCard({ id: 'a', description: '非法尺寸', score: 1, emotion: '开心', size: { width: -1, height: 0 } }).aspectRatio, '400:430');
+});
+
+test('主页提供自动配图总闸，频率页关闭时显示原设置但锁定调整与保存', () => {
+  const ui = fs.readFileSync(new URL('../routes/ui.js', import.meta.url), 'utf8');
+  const client = fs.readFileSync(new URL('../assets/sticker-manager.js', import.meta.url), 'utf8');
+  assert.match(ui, /id="auto-image-toggle-top"/);
+  assert.match(ui, /不影响方言、识图和纸飞机/);
+  assert.match(client, /\/api\/agent-freq\/global/);
+  assert.match(client, /button\.disabled = disabled/);
+  assert.match(client, /总闸切换时丢弃频率页可能留下的本地草稿/);
+  assert.match(client, /if \(!globalAutoImageEnabled \|\| !freqDirty\) return/);
+  assert.match(client, /if \(!button \|\| !globalAutoImageEnabled\) return/);
 });
 
 test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {

@@ -32,6 +32,7 @@ import { extractStickerArchive, hasImageSignature, detectImageFormat } from '../
 import {
   exportStickerArchive,
   buildMigrationPayload,
+  resolveExportDataKeys,
   normalizeTransferMetadata,
   normalizeMigrationPayload,
   buildAgentMapping,
@@ -205,8 +206,15 @@ function mergeMigrationData(key, incoming) {
       },
     };
   }
-  if (key === 'dialectConfig' || key === 'agentFreq') {
+  if (key === 'dialectConfig') {
     return mergeAgentScopedData(current, incoming, 'agents');
+  }
+  if (key === 'agentFreq') {
+    const merged = mergeAgentScopedData(current, incoming, 'agents');
+    // 本机已经主动关闭总闸时，导入旧备份/其他环境不能悄悄把它重新打开；
+    // 其他频率字段仍按迁移包合并，用户之后可以在主页明确开启。
+    if (current?.global_enabled === false) merged.global_enabled = false;
+    return merged;
   }
   // 模板、画像、修正反馈和显示/悬浮球配置是全局资产，迁移包作为来源机的完整快照覆盖当前值。
   return incoming;
@@ -435,6 +443,10 @@ export default async function registerRoutes(app, ctx) {
         fs.mkdirSync(outputDir, { recursive: true });
         outputPath = chooseExportPath(outputDir);
         tempPath = `${outputPath}.${process.pid}.${Date.now()}.part`;
+        // 导出内容勾选（v0.34.17+）：只带用户勾选的组；不传 = 全量搬家（老行为）。
+        const includeDataKeys = Array.isArray(body.dataGroups)
+          ? resolveExportDataKeys(body.dataGroups)
+          : null;
         const result = await exportStickerArchive({
           meta: readMeta(),
           stickersDir: STICKERS_DIR,
@@ -442,6 +454,7 @@ export default async function registerRoutes(app, ctx) {
           dataDir: DATA_DIR,
           agentCatalog: readAgentCatalog(path.join(HANA_HOME, 'agents')),
           pluginVersion: readJsonFile(path.join(__dirname, '..', 'manifest.json'), {}).version || '',
+          includeDataKeys,
         });
         if (!result.ok) return json(result, 400);
 
@@ -2218,6 +2231,9 @@ export default async function registerRoutes(app, ctx) {
   // 用户点「刷新列表」后所有助手（含刚删的）会重新出现，自由度交给用户。
   app.post('/api/agents/remove', async (c) => {
     try {
+      if (readAgentFreqConfig().global_enabled === false) {
+        return json({ ok: false, error: '自动配图已关闭，请先重新开启后再调整伙伴配图设置' }, 409);
+      }
       const body = await c.req.json().catch(() => ({}));
       const agentId = body && String(body.agentId || '').trim();
       if (!agentId) return json({ ok: false, error: '缺少 agentId' }, 400);
@@ -2287,8 +2303,37 @@ export default async function registerRoutes(app, ctx) {
       if (body.agents != null && (typeof body.agents !== 'object' || Array.isArray(body.agents))) {
         return json({ ok: false, error: '助手频率配置格式不正确' }, 400);
       }
-      const saved = writeAgentFreqConfig(body);
+      // 总闸关闭期间拒绝旧页面/绕过前端的频率写入；总闸字段只能由下方专用接口修改。
+      const current = readAgentFreqConfig();
+      if (current.global_enabled === false) {
+        return json({ ok: false, error: '自动配图已关闭，暂不能调整伙伴配图频率' }, 409);
+      }
+      const saved = writeAgentFreqConfig({ ...body, global_enabled: current.global_enabled });
       return json({ ok: true, message: '已保存', data: saved });
+    } catch (e) {
+      return json({ ok: false, error: e.message });
+    }
+  });
+
+  // ── GET/POST /api/agent-freq/global - 自动配图总闸 ──
+  app.get('/api/agent-freq/global', (c) => {
+    const config = readAgentFreqConfig();
+    return json({ ok: true, enabled: config.global_enabled !== false, data: config });
+  });
+
+  app.post('/api/agent-freq/global', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const enabled = typeof body?.enabled === 'boolean'
+        ? body.enabled
+        : (typeof body?.global_enabled === 'boolean' ? body.global_enabled : null);
+      if (enabled === null) {
+        return json({ ok: false, error: 'enabled 必须是布尔值' }, 400);
+      }
+      // 只改总闸，完整带回当前伙伴配置，关闭/恢复不会把 daily、task、enabled 清零或删除。
+      const current = readAgentFreqConfig();
+      const saved = writeAgentFreqConfig({ ...current, global_enabled: enabled });
+      return json({ ok: true, message: enabled ? '自动配图已开启' : '自动配图已关闭', enabled, data: saved });
     } catch (e) {
       return json({ ok: false, error: e.message });
     }
@@ -2387,6 +2432,9 @@ export default async function registerRoutes(app, ctx) {
   // 兼容旧版完整名单写法：{ blockedIds: ["agent-a", "agent-b"] }
   app.post('/api/blocked-agents', async (c) => {
     try {
+      if (readAgentFreqConfig().global_enabled === false) {
+        return json({ ok: false, error: '自动配图已关闭，请先重新开启后再调整伙伴配图设置' }, 409);
+      }
       const body = await c.req.json();
       if (!body || !Array.isArray(body.blockedIds)) {
         return json({ ok: false, error: 'blockedIds 必须是数组' }, 400);

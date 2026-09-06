@@ -865,15 +865,56 @@
   }
 
   // v0.33.77 - 图库迁移：导出完整搬家包；目录可原生选择
+  // v0.34.17 - 导出内容按组勾选：图库常驻，可只选偏好/风格/方言/界面；全不勾 = 只导图库（v1 轻量包）
   var exportBusy = false;
+  var EXPORT_GROUPS = [
+    { id: 'preference', label: '偏好培养' },
+    { id: 'style', label: '学我说话' },
+    { id: 'dialect', label: '方言配置' },
+    { id: 'interface', label: '界面与悬浮球' },
+  ];
   function getExportConfig() {
     return window.__EXPORT_CONFIG__ || {};
   }
 
-  function updateExportSummary() {
+  function getCheckedExportGroups() {
+    return EXPORT_GROUPS.map(function (group) {
+      var box = $(group.id === 'interface' ? 'export-group-interface' : 'export-group-' + group.id);
+      return box && box.checked ? group.id : null;
+    }).filter(Boolean);
+  }
+
+  function allExportGroupsChecked() {
+    return EXPORT_GROUPS.every(function (group) {
+      var box = $(group.id === 'interface' ? 'export-group-interface' : 'export-group-' + group.id);
+      return box && box.checked;
+    });
+  }
+
+  function setExportSummary(text, isGalleryOnly) {
     var summary = $('export-summary');
     if (!summary) return;
-    summary.textContent = '会把图库里的全部表情包打成一个新的 ZIP 文件，不受当前筛选条件影响。';
+    summary.textContent = text;
+    if (isGalleryOnly) summary.classList.add('is-gallery-only');
+    else summary.classList.remove('is-gallery-only');
+  }
+
+  function updateExportSummary() {
+    var groups = getCheckedExportGroups();
+    if (groups.length === 0) {
+      setExportSummary('只导出表情包图库（图片 + 名称/描述/标签 + 语义描述），不带任何培养数据与设置。适合换机器搬图或分享。', true);
+    } else if (groups.length === EXPORT_GROUPS.length) {
+      setExportSummary('完整搬家包：图库 + 全部培养数据与设置都会带出。', false);
+    } else {
+      var names = EXPORT_GROUPS.filter(function (group) { return groups.indexOf(group.id) !== -1; })
+        .map(function (group) { return group.label; }).join('、');
+      setExportSummary('图库 + 已勾选的：' + names + '。', false);
+    }
+    var allBox = $('export-check-all');
+    if (allBox) {
+      allBox.checked = allExportGroupsChecked();
+      allBox.indeterminate = groups.length > 0 && groups.length < EXPORT_GROUPS.length;
+    }
   }
 
   function openExportModal() {
@@ -938,7 +979,7 @@
       var resp = await apiFetch(withAuth(API + '/api'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'export_zip', outputDir: directory }),
+        body: JSON.stringify({ action: 'export_zip', outputDir: directory, dataGroups: getCheckedExportGroups() }),
         signal: AbortSignal.timeout(120000),
       });
       var data = await resp.json();
@@ -951,13 +992,15 @@
       var summary = $('export-summary');
       var skippedItems = Array.isArray(info.skippedItems) ? info.skippedItems : [];
       if (summary) {
-        summary.textContent = (data.message || ('已导出 ' + (info.exported || 0) + ' 张表情包'))
+        var base = getCheckedExportGroups().length === 0 ? '只导出了表情包图库' : (data.message || ('已导出 ' + (info.exported || 0) + ' 张表情包'));
+        summary.textContent = base
           + (info.fileName ? '\n文件名：' + info.fileName : '');
         if (skippedItems.length) {
           summary.textContent += '\n' + skippedItems.slice(0, 5).map(function (item) {
             return item.file + '：' + item.reason;
           }).join('\n');
         }
+        summary.classList.remove('is-gallery-only');
       }
       var exportToast = (data.message || 'ZIP 导出完成') + (info.fileName ? '：' + info.fileName : '');
       toast(exportToast, skippedItems.length > 0);
@@ -2581,7 +2624,8 @@
   //  v0.18.x 助手配图频率（场景维度化：日常 / 正事）
   // ════════════════════════════════════════════════════════════════
   var freqAgentsData = [];
-  var freqConfigData = { version: 2, default_daily: 50, default_task: 20, agents: {} };
+  var freqConfigData = { version: 2, global_enabled: true, default_daily: 50, default_task: 20, agents: {} };
+  var globalAutoImageEnabled = true;
   var currentScene = 'daily';
   var freqDirty = false;
   var duplicateAgentNames = {};
@@ -2636,6 +2680,97 @@
     if (button) button.disabled = true;
   }
 
+  function applyAgentFreqLock() {
+    var disabled = !globalAutoImageEnabled;
+    var view = $('view-agent-freq');
+    if (view) view.classList.toggle('global-off', disabled);
+    var sceneToggle = $('agent-freq-scene-toggle');
+    if (sceneToggle) {
+      sceneToggle.querySelectorAll('.scene-toggle-btn').forEach(function (button) { button.disabled = disabled; });
+    }
+    var list = $('agent-freq-list');
+    if (list) {
+      list.querySelectorAll('button[data-act]').forEach(function (button) { button.disabled = disabled; });
+    }
+    var saveButton = $('save-agent-freq-btn');
+    if (saveButton && disabled) saveButton.disabled = true;
+    var note = $('agent-freq-global-note');
+    if (note) {
+      note.classList.toggle('is-off', disabled);
+      note.textContent = disabled
+        ? '自动配图总闸已关闭。伙伴原有的频率和允许状态仍保留，下面只展示设置，重新开启后才能调整；方言、识图和纸飞机不受影响。'
+        : '自动配图总闸已开启。关闭后会暂停自动情绪检测和伙伴自动发图，但不影响方言、识图和纸飞机。';
+    }
+  }
+
+  function applyGlobalAutoImageConfig(config) {
+    if (config && typeof config === 'object') freqConfigData = config;
+    globalAutoImageEnabled = !(freqConfigData && freqConfigData.global_enabled === false);
+    // 服务器返回的是当前已落盘快照；总闸切换时丢弃频率页可能留下的本地草稿，避免恢复后误保存旧稿。
+    markFreqSaved();
+    renderGlobalAutoImageState();
+    applyAgentFreqLock();
+    if (freqAgentsData.length > 0) renderAgentFreqList();
+  }
+
+  function renderGlobalAutoImageState() {
+    var toggle = $('auto-image-toggle-top');
+    var status = $('auto-image-status');
+    if (!toggle) return;
+    var enabled = globalAutoImageEnabled;
+    toggle.classList.toggle('on', enabled);
+    toggle.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+    var switchEl = toggle.querySelector('.ball-toggle-switch');
+    if (switchEl) switchEl.classList.toggle('on', enabled);
+    toggle.title = enabled
+      ? '关闭自动情绪检测和自动配图；不影响方言、识图和纸飞机'
+      : '开启自动情绪检测和自动配图；不影响方言、识图和纸飞机';
+    if (status) status.textContent = enabled ? '已开启' : '已关闭';
+  }
+
+  async function loadGlobalAutoImageState() {
+    var status = $('auto-image-status');
+    var toggle = $('auto-image-toggle-top');
+    if (status) status.textContent = '读取中…';
+    if (toggle) toggle.disabled = true;
+    try {
+      var result = await apiFetch(withAuth(API + '/api/agent-freq/global'), { signal: AbortSignal.timeout(5000) }).then(function (r) { return r.json(); });
+      if (!result || !result.ok || !result.data) throw new Error((result && result.error) || '读取失败');
+      applyGlobalAutoImageConfig(result.data);
+    } catch (e) {
+      if (status) status.textContent = '读取失败';
+      if (toggle) toggle.title = '自动配图状态读取失败：' + (e.message || '请稍后再试');
+    } finally {
+      if (toggle) toggle.disabled = false;
+    }
+  }
+
+  async function toggleGlobalAutoImage() {
+    var toggle = $('auto-image-toggle-top');
+    var status = $('auto-image-status');
+    if (!toggle || toggle.disabled) return;
+    var enabled = !globalAutoImageEnabled;
+    toggle.disabled = true;
+    if (status) status.textContent = '处理中…';
+    try {
+      var response = await apiFetch(withAuth(API + '/api/agent-freq/global'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: enabled }),
+        signal: AbortSignal.timeout(5000),
+      });
+      var result = await response.json();
+      if (!result || !result.ok || !result.data) throw new Error((result && result.error) || '保存失败');
+      applyGlobalAutoImageConfig(result.data);
+      toast(enabled ? '自动配图已开启' : '自动配图已关闭；原有伙伴设置已保留');
+    } catch (e) {
+      renderGlobalAutoImageState();
+      toast('自动配图开关保存失败：' + (e.message || '未知错误'), true);
+    } finally {
+      toggle.disabled = false;
+    }
+  }
+
   function renderAgentFreq() {
     var list = $('agent-freq-list');
     if (!list) return;
@@ -2665,11 +2800,14 @@
         var name = freqAgentsData[i].name || freqAgentsData[i].id;
         duplicateAgentNames[name] = (duplicateAgentNames[name] || 0) + 1;
       }
+      globalAutoImageEnabled = !(freqConfigData && freqConfigData.global_enabled === false);
       markFreqSaved();
       renderAgentFreqList();
       bindSceneToggle();
       bindFreqList();
       bindFreqSave();
+      renderGlobalAutoImageState();
+      applyAgentFreqLock();
     }).catch(function () {
       list.innerHTML = '<div style="color:var(--text-muted);font-size:13px">加载失败，请稍后重试</div>';
     });
@@ -2682,6 +2820,7 @@
     var btns = toggle.querySelectorAll('.scene-toggle-btn');
     btns.forEach(function (btn) {
       btn.addEventListener('click', function () {
+        if (!globalAutoImageEnabled) return;
         var scene = this.getAttribute('data-scene');
         if (currentScene === scene) return;
         currentScene = scene;
@@ -2726,6 +2865,7 @@
     var html = '';
     for (var i = 0; i < freqAgentsData.length; i++) html += renderAgentFreqRow(freqAgentsData[i]);
     list.innerHTML = html;
+    applyAgentFreqLock();
   }
 
   function findAgentFreqRow(agentId) {
@@ -2743,6 +2883,7 @@
     var agent = freqAgentsData.find(function (item) { return item.id === agentId; });
     if (!row || !agent) return;
     row.outerHTML = renderAgentFreqRow(agent);
+    applyAgentFreqLock();
     var newRow = findAgentFreqRow(agentId);
     if (!newRow || !focusAction) return;
     var buttons = newRow.querySelectorAll('button[data-act]');
@@ -2759,7 +2900,7 @@
     list.dataset.bound = '1';
     list.addEventListener('click', function (event) {
       var button = event.target.closest('button[data-act]');
-      if (!button) return;
+      if (!button || !globalAutoImageEnabled) return;
       var agentId = button.getAttribute('data-agent-id');
       if (!agentId) return;
       var action = button.getAttribute('data-act');
@@ -2811,7 +2952,7 @@
     if (!saveButton || saveButton.dataset.bound === '1') return;
     saveButton.dataset.bound = '1';
     saveButton.addEventListener('click', function () {
-      if (!freqDirty) return;
+      if (!globalAutoImageEnabled || !freqDirty) return;
       var status = $('agent-freq-save-status');
       saveButton.disabled = true;
       if (status) { status.textContent = '正在保存…'; status.classList.remove('is-dirty'); }
@@ -2820,16 +2961,32 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(freqConfigData),
         signal: AbortSignal.timeout(5000),
-      }).then(function (response) { return response.json(); })
-        .then(function (result) {
-          if (!result.ok) throw new Error(result.error || '保存失败');
-          freqConfigData = result.data;
-          markFreqSaved();
-          toast('已保存');
-        }).catch(function (error) {
-          markFreqDirty();
-          toast('保存失败：' + error.message, true);
+      }).then(function (response) {
+        return response.json().then(function (result) {
+          if (!result.ok) {
+            var error = new Error(result.error || '保存失败');
+            error.status = response.status;
+            throw error;
+          }
+          return result;
         });
+      }).then(function (result) {
+        freqConfigData = result.data;
+        globalAutoImageEnabled = !(freqConfigData && freqConfigData.global_enabled === false);
+        markFreqSaved();
+        renderGlobalAutoImageState();
+        applyAgentFreqLock();
+        toast('已保存');
+      }).catch(function (error) {
+        if (error && error.status === 409) {
+          // 另一页面先关了总闸：回读服务器快照，丢弃本地草稿并立即锁定当前页。
+          loadGlobalAutoImageState();
+          toast('自动配图已关闭，频率设置已锁定', true);
+          return;
+        }
+        markFreqDirty();
+        toast('保存失败：' + error.message, true);
+      });
     });
   }
 
@@ -4294,6 +4451,7 @@
   // ═══════════════════════════════════
   document.addEventListener('DOMContentLoaded', function () {
     loadStickers();
+    loadGlobalAutoImageState();
     loadBallState();
     loadSemanticIndexStatus();
     checkBatchTasks();
@@ -4342,6 +4500,8 @@
     // 设置按钮与主页悬浮球开关
     $('btn-settings').addEventListener('click', openSettings);
     $('guide-settings-btn').addEventListener('click', openSettings);
+    var autoImageToggleBtn = $('auto-image-toggle-top');
+    if (autoImageToggleBtn) autoImageToggleBtn.addEventListener('click', toggleGlobalAutoImage);
     var ballToggleBtn = $('ball-toggle-top');
     if (ballToggleBtn) ballToggleBtn.addEventListener('click', toggleBall);
     // v0.19.5 - 检查更新按钮
@@ -4414,6 +4574,22 @@
     }
     var exportZipBtn = $('export-zip-btn');
     if (exportZipBtn) exportZipBtn.addEventListener('click', handleExportZip);
+    // v0.34.17 - 导出内容勾选联动摘要与全选状态
+    var exportGroupIds = ['export-group-preference', 'export-group-style', 'export-group-dialect', 'export-group-interface'];
+    exportGroupIds.forEach(function (id) {
+      var box = $(id);
+      if (box) box.addEventListener('change', updateExportSummary);
+    });
+    var exportCheckAll = $('export-check-all');
+    if (exportCheckAll) {
+      exportCheckAll.addEventListener('change', function () {
+        exportGroupIds.forEach(function (id) {
+          var box = $(id);
+          if (box) box.checked = exportCheckAll.checked;
+        });
+        updateExportSummary();
+      });
+    }
     var exportPickBtn = $('export-pick-folder');
     if (exportPickBtn) exportPickBtn.addEventListener('click', pickExportFolder);
     var exportDefaultBtn = $('export-use-default');

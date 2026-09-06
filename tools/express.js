@@ -13,8 +13,8 @@ import {
   PREFERENCES_FILE, DECISION_LOG_FILE, VECTORS_FILE,
   HANA_HOME, MIME_MAP,
   readEmbeddingConfig, resolveEmbeddingApi, generateEmbeddings,
-  cosineSimilarity, readVectors, getAgentFreqSettings, markAgentStickerCooldown, resolveAgentId,
-  collectPrefsForEmotion, atomicWriteJson, prefsScoreBonus,
+  cosineSimilarity, readVectors, readAgentFreq, isAutoImageEnabled, getAgentFreqSettings,
+  markAgentStickerCooldown, resolveAgentId, collectPrefsForEmotion, atomicWriteJson, prefsScoreBonus,
 } from '../lib/shared.js';
 import { resolveEmotionFactor } from '../lib/emotion-groups.js';
 import { getAgentExpressionBias } from '../lib/dialect.js';
@@ -492,8 +492,19 @@ export async function execute(input, ctx) {
 
   ctx?.log?.info?.(`[biaoqingbao] express 被调用: emotion="${emotion}"${stickerId ? `, stickerId="${stickerId}"` : ''}`);
 
-  // 主动调用不再重复抽概率，只遵守每位助手的全局开关。
+  // 主动调用不再重复抽概率，只遵守自动配图总闸与每位助手自己的允许状态。
   const agentId = resolveAgentId(null, ctx);
+  let autoImageEnabled = true;
+  try {
+    autoImageEnabled = isAutoImageEnabled(readAgentFreq());
+  } catch (error) {
+    ctx?.log?.warn?.('[biaoqingbao] 自动配图状态读取失败，拒绝 express 发图:', error?.message || error);
+    return reply({ ok: false, error: '自动配图状态读取失败，暂不发送表情包' });
+  }
+  if (!autoImageEnabled) {
+    ctx?.log?.info?.('[biaoqingbao] 自动配图总闸已关闭，拒绝 express 发图');
+    return reply({ ok: false, error: '自动配图已关闭，暂不发送表情包' });
+  }
   // v0.27.0 方言×表情包联动：按当前助手方言设置取气质权重（没开方言返回 null，不干预）
   const expressionBias = getAgentExpressionBias(agentId);
   try {
