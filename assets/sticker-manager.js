@@ -344,12 +344,57 @@
     var count = allStickers.length;
     var homeCount = $('home-count');
     if (homeCount) homeCount.textContent = count + ' 张';
-    var libMeta = $('home-lib-meta');
-    if (libMeta) libMeta.textContent = count ? count + ' 张表情包' : '图库为空，先添加图片';
+    updateHomeStats();
+    renderHomeStrip();
     ['embedding-index-btn', 'batch-tasks-badge', 'btnToggleMulti'].forEach(function (id) {
       var button = $(id);
       if (button) button.disabled = count === 0;
     });
+  }
+
+  // v0.34.18 - 首页统计：总张数 / 已打标签数
+  function updateHomeStats() {
+    var stats = $('home-stats');
+    if (!stats) return;
+    var total = allStickers.length;
+    if (!total) {
+      stats.innerHTML = '<span>还没有表情包</span>';
+      return;
+    }
+    var tagged = allStickers.filter(function (s) {
+      if (!s.tags) return false;
+      return (s.tags.emotion || []).length + (s.tags.scene || []).length + (s.tags.keywords || []).length > 0;
+    }).length;
+    var tagText = tagged === total ? '全部完成标签' : '已打标签 ' + tagged + ' / ' + total;
+    stats.innerHTML = '<span><span class="dot"></span>共 ' + total + ' 张</span>'
+      + '<span><span class="dot"></span>' + tagText + '</span>';
+  }
+
+  // v0.34.18 - 首页「最近入库」缩略带：取最近入库的 6 张真图，空库时给引导
+  function renderHomeStrip() {
+    var strip = $('home-strip');
+    if (!strip) return;
+    if (!allStickers.length) {
+      strip.innerHTML = '<button type="button" class="strip-empty" id="home-strip-empty">还没有表情包，点这里添加第一张</button>';
+      var emptyBtn = $('home-strip-empty');
+      if (emptyBtn) {
+        emptyBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          openModal('upload-modal');
+        });
+      }
+      return;
+    }
+    var recent = allStickers.slice().sort(function (a, b) {
+      return new Date(b.added_at || 0) - new Date(a.added_at || 0);
+    }).slice(0, 32);
+    var html = '';
+    for (var i = 0; i < recent.length; i++) {
+      var s = recent[i];
+      var url = withAuth(API + '/api/image?id=' + encodeURIComponent(s.id));
+      html += '<figure><img src="' + escHtml(url) + '" alt="' + escHtml(s.description || '表情包') + '" loading="lazy"></figure>';
+    }
+    strip.innerHTML = html;
   }
 
   function applyFilter() {
@@ -1242,25 +1287,18 @@
     var visionReady = hasConfiguredModel(visionConfig);
     var textReady = textConfig.enabled !== false && hasConfiguredModel(textConfig);
     var embeddingReady = hasConfiguredModel(embeddingConfig);
-    setGuideState('guide-vision', '识图模型', visionReady);
+    setGuideState('guide-vision', '识图', visionReady);
     if (textConfig.enabled === false) {
       var textEl = $('guide-text');
       if (textEl) {
-        textEl.textContent = '内容分析 · 已关闭';
+        textEl.textContent = '内容 · 已关闭';
         textEl.classList.remove('ready');
         textEl.classList.add('pending');
       }
     } else {
-      setGuideState('guide-text', '内容分析', textReady);
+      setGuideState('guide-text', '内容', textReady);
     }
-    setGuideState('guide-embedding', '向量检索', embeddingReady);
-    var note = $('model-guide-note');
-    if (note) {
-      var vectorNote = embeddingReady
-        ? '向量检索已接入，上传并完成识图后即可生成图库语义索引。'
-        : '向量检索需要配置一个 embedding 模型；更换模型后需要重新生成图库语义索引。';
-      note.textContent = '识图负责自动打标签，内容分析负责聊天时自动配图。' + vectorNote;
-    }
+    setGuideState('guide-embedding', '向量', embeddingReady);
   }
 
   function openSettings() {
@@ -1945,14 +1983,7 @@
       };
     }
 
-    // 更新首页偏好卡片
-    var prefMeta = $('home-pref-meta');
-    if (prefMeta) {
-      var parts = [];
-      if (allMappings.length > 0) parts.push(allMappings.length + ' 条偏好');
-      if (feedbacks.length > 0) parts.push(feedbacks.length + ' 条反馈');
-      prefMeta.textContent = parts.length > 0 ? parts.join(' · ') : '配图偏好与助手管理';
-    }
+    // v0.34.18 - 旧首页偏好卡片副标题已随新布局移除，此处不再更新
 
     var recent = entries.slice(-20).reverse();
     if (recent.length === 0) {
@@ -4459,21 +4490,51 @@
     updateUploadBtnState();
     autoBootBall(); // 打开插件页面自动启动悬浮球（半自动：手动关过则本次不再弹）
 
-    // 导航：首页卡片点击
-    document.querySelectorAll('.entry-card[data-goto]').forEach(function (card) {
-      card.addEventListener('click', function () {
+    // v0.34.18 - 导航：首页入口点击（主卡 / 右侧入口 / 底部提示），支持键盘 Enter/Space
+    document.querySelectorAll('.home-hero[data-goto], .home-entry[data-goto], .home-preference-tip[data-goto]').forEach(function (card) {
+      var go = function () {
         var target = card.getAttribute('data-goto');
         showView(target);
         if (target === 'preferences') initPreferencesView();
         if (target === 'agent-freq') renderAgentFreq();
         if (target === 'dialect') renderDialect();
         if (target === 'userstyle') renderUserstyle();
+      };
+      card.addEventListener('click', go);
+      card.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); }
       });
     });
 
-    // v0.33.77 - 顶部「数据与迁移」按钮
+    // v0.34.18 - 顶栏「设置」收纳菜单：检查更新 / 反馈 / 模型设置 / 数据与迁移
+    var settingsBtn = $('btn-settings');
+    var homeMenu = $('home-menu');
+    function closeHomeMenu() {
+      if (!homeMenu) return;
+      homeMenu.hidden = true;
+      if (settingsBtn) {
+        settingsBtn.setAttribute('aria-expanded', 'false');
+        settingsBtn.classList.remove('active');
+      }
+    }
+    if (settingsBtn && homeMenu) {
+      settingsBtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        var willOpen = homeMenu.hidden;
+        homeMenu.hidden = !willOpen;
+        settingsBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        settingsBtn.classList.toggle('active', willOpen);
+      });
+      homeMenu.addEventListener('click', function (e) { e.stopPropagation(); });
+      document.addEventListener('click', function () { if (!homeMenu.hidden) closeHomeMenu(); });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape' && !homeMenu.hidden) closeHomeMenu();
+      });
+    }
+
+    // v0.33.77 - 「数据与迁移」入口（v0.34.18 收进设置菜单）
     var dataMigrationNav = $('btn-data-migration');
-    if (dataMigrationNav) dataMigrationNav.addEventListener('click', function () { showView('data-migration'); });
+    if (dataMigrationNav) dataMigrationNav.addEventListener('click', function () { closeHomeMenu(); showView('data-migration'); });
 
     // 导航：方言页 → 学我说话
     var gotoUserstyleBtn = document.getElementById('goto-userstyle-btn');
@@ -4484,10 +4545,14 @@
       });
     }
 
-    // 导航：添加入库卡片 -> 打开上传弹窗
-    var uploadCard = document.querySelector('.entry-card[data-action="upload"]');
+    // 导航：添加入库入口 -> 打开上传弹窗
+    var uploadCard = document.querySelector('.home-entry[data-action="upload"]');
     if (uploadCard) {
-      uploadCard.addEventListener('click', function () { openModal('upload-modal'); });
+      var openUpload = function () { openModal('upload-modal'); };
+      uploadCard.addEventListener('click', openUpload);
+      uploadCard.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openUpload(); }
+      });
     }
 
     // 导航：返回按钮
@@ -4497,18 +4562,23 @@
       });
     });
 
-    // 设置按钮与主页悬浮球开关
-    $('btn-settings').addEventListener('click', openSettings);
-    $('guide-settings-btn').addEventListener('click', openSettings);
+    // v0.34.18 - 模型设置进设置菜单；顶栏「设置」本身只负责开关菜单
+    if ($('guide-settings-btn')) $('guide-settings-btn').addEventListener('click', openSettings);
+    if ($('btn-model-settings')) {
+      $('btn-model-settings').addEventListener('click', function () { closeHomeMenu(); openSettings(); });
+    }
     var autoImageToggleBtn = $('auto-image-toggle-top');
     if (autoImageToggleBtn) autoImageToggleBtn.addEventListener('click', toggleGlobalAutoImage);
     var ballToggleBtn = $('ball-toggle-top');
     if (ballToggleBtn) ballToggleBtn.addEventListener('click', toggleBall);
-    // v0.19.5 - 检查更新按钮
-    $('btn-check-update').addEventListener('click', checkUpdate);
+    // v0.19.5 - 检查更新按钮（v0.34.18 收进设置菜单）
+    if ($('btn-check-update')) {
+      $('btn-check-update').addEventListener('click', function () { closeHomeMenu(); checkUpdate(); });
+    }
     // v0.27.1 - 反馈入口：打开 GitHub Issues（弹窗被拦时降级为复制链接）
     var fbBtn = document.getElementById('btn-feedback');
     if (fbBtn) fbBtn.addEventListener('click', function () {
+      closeHomeMenu();
       var issueUrl = 'https://github.com/moononnn/hanako-biaoqingbao/issues';
       var opened = null;
       try { opened = window.open(issueUrl, '_blank'); } catch (e) {}
