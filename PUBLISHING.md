@@ -51,10 +51,10 @@
 
 ## 干净安装包范围
 
-安装包只放插件本体和运行所需的源码，共 63 个条目：
+安装包只放插件本体和运行所需的源码，共 64 个条目：
 
 - `manifest.json`、`package.json`、`index.js`
-- `lib/`、`routes/`、`tools/`、`extensions/`、`assets/`、`python/`、`skills/`
+- `lib/`、`routes/`、`tools/`、`extensions/`、`assets/`、`python/`、`skills/`、`scripts/`
 - `README.md`、`CHANGELOG.md`、`TESTING.md`、`THIRD_PARTY_NOTICES.md`
 - `LICENSE`、`NOTICE`、`COMMERCIAL-LICENSE.md`
 
@@ -68,9 +68,13 @@
 
 打包方式：`.NET ZipFile CreateFromDirectory`，`includeBaseDirectory=false`，条目名不带 `./` 或 `../` 前缀。
 
-### 已知偏差（下次发布时处理）
+### 测试文件联动规则
 
-发布包内保留 `package.json`，其中 `test` 脚本指向 `tests/*.test.js`，而 `tests/` 已排除。直接解压包跑 `npm test` 会得到「0 测试 + exit 0」的假绿灯。当前不影响用户（安装包不是给开发者跑的），下次发布时按二选一处理：给 test 脚本加「测试文件存在」哨兵，或移除脚本并在 README 开发章节注明测试只在源码仓库执行。
+安装包排除了 `tests/` 与 `python/test_ball_app.py`，因此 `npm test` 不能停在「排除文件但脚本照旧」的状态：`node --test tests/*.test.js` 在没有匹配文件时会输出 `tests 0 / pass 0 / fail 0` 并以 `exit 0` 结束，是能骗过自动审查的假绿灯。
+
+当前做法：`scripts/run-tests.mjs` 作为唯一测试入口，先确认 `tests/` 与 `*.test.js` 存在，缺任一都非零退出并给出明确提示；找到才调用 `node --test`。脚本以自身位置锚定仓库根，并把子进程工作目录钉在仓库根，因此从任意目录调用结果一致（测试用例里有依赖当前目录的相对路径）。
+
+以后新增或移动测试文件时，保持这个入口为唯一入口，不要再把裸 `node --test tests/*.test.js` 写回 `package.json`。
 
 ## 交叉审查门
 
