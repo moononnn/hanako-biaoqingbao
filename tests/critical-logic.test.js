@@ -6,7 +6,7 @@ import {
   getConditionalScenePercent,
   passesFrequency,
 } from '../extensions/observer.js';
-import { recoverInterruptedItems } from '../routes/_batch-tasks.js';
+import { recoverInterruptedItems, requeueFailedItems } from '../routes/_batch-tasks.js';
 import {
   scoreStickers,
   selectPreferenceMappings,
@@ -21,7 +21,7 @@ import {
 } from '../tools/express.js';
 import {
   backfillTaggedAtEntries, collectPrefsForEmotion, matchRitualWord, sanitizeTag, AUTOTAG_PROMPT,
-  normalizeAgentFreqConfig, isAutoImageEnabled,
+  normalizeAgentFreqConfig, isAutoImageEnabled, enqueueStickerDataWrite,
 } from '../lib/shared.js';
 import { KNOWN_CONFUSABLES, buildConfusableSection } from '../lib/known-confusables.js';
 
@@ -32,6 +32,21 @@ function seededRandom(seed = 1) {
     return state / 0x100000000;
   };
 }
+
+test('图库数据写队列：多个入口的读改写不会并发执行', async () => {
+  const order = [];
+  let active = 0;
+  let maxActive = 0;
+  await Promise.all([1, 2, 3].map((id) => enqueueStickerDataWrite(async () => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    order.push(id);
+    active -= 1;
+  })));
+  assert.equal(maxActive, 1);
+  assert.deepEqual(order, [1, 2, 3]);
+});
 
 test('deferred 原生图片块：成功时注册为 ui-only image task 并返回 taskId', async () => {
   const calls = [];
@@ -175,6 +190,21 @@ test('自动配图总闸默认开启，关闭时只保留全局状态并完整�
   assert.equal(disabled.default_daily, enabled.default_daily);
   assert.equal(disabled.default_task, enabled.default_task);
   assert.equal(isAutoImageEnabled(disabled), false);
+
+  // v0.34.30 - 伙伴配图页改成「档位即开关」、不再提交 enabled：由归一化按两档推导。
+  const derived = normalizeAgentFreqConfig({
+    version: 2,
+    default_daily: 50,
+    default_task: 20,
+    agents: {
+      off: { daily: 0, task: 0 },
+      onlyTask: { daily: 0, task: 20 },
+      dailyOnly: { daily: 15, task: 0 },
+    },
+  });
+  assert.equal(derived.agents.off.enabled, false, '两档都为 0 必须推导为关闭');
+  assert.equal(derived.agents.onlyTask.enabled, true, '只要有一档非 0 就算开启');
+  assert.equal(derived.agents.dailyOnly.enabled, true);
 });
 
 test('自动配图总闸接在 observer/express 门口，频率保存接口关闭时拒绝旧写入', () => {
@@ -331,9 +361,12 @@ test('主页提供自动配图总闸，频率页关闭时显示原设置但锁�
   assert.match(ui, /不影响方言、识图和纸飞机/);
   assert.match(client, /\/api\/agent-freq\/global/);
   assert.match(client, /button\.disabled = disabled/);
-  assert.match(client, /总闸切换时丢弃频率页可能留下的本地草稿/);
-  assert.match(client, /if \(!globalAutoImageEnabled \|\| !freqDirty\) return/);
-  assert.match(client, /if \(!button \|\| !globalAutoImageEnabled\) return/);
+  // v0.34.29 - 伙伴配图页改为即时保存：改一下就落盘，不再有本地草稿与保存按钮
+  assert.match(client, /function persistFreqConfig\(\)/);
+  assert.match(client, /freqSaveChain = freqSaveChain\.then/);
+  // 总闸关闭时锁定调整，但「移除伙伴」始终可用
+  assert.match(client, /if \(button\.getAttribute\('data-act'\) === 'remove-agent'\) return;/);
+  assert.match(client, /if \(!editingLibraryAgentId \|\| !globalAutoImageEnabled\) return/);
 });
 
 test('sticker iframe 页面遵守 Hana 握手与新版尺寸协议', () => {
@@ -537,6 +570,79 @@ test('已取消任务不会被重启恢复逻辑改动', () => {
 
   assert.deepEqual(recoverInterruptedItems(task), []);
   assert.deepEqual(task, before);
+});
+
+test('运行中重试失败项：放回当前任务队列队首，不取消整个任务', () => {
+  const task = {
+    status: 'running',
+    pending: ['p1'],
+    current_ids: ['cur1'],
+    completed: ['ok1'],
+    failed: [
+      { id: 'f1', error: '模型超时' },
+      { id: 'f2', error: '模型超时' },
+    ],
+  };
+
+  const result = requeueFailedItems(task);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.requeued, ['f1', 'f2']);
+  assert.deepEqual(task.pending, ['f1', 'f2', 'p1']); // 重试项插队首先跑
+  assert.deepEqual(task.failed, []);
+  assert.deepEqual(task.completed, ['ok1']); // 已成功的图不受影响
+});
+
+test('运行中重试失败项：可只重试指定的那几张（兼容旧字符串格式）', () => {
+  const task = {
+    status: 'running',
+    pending: [],
+    current_ids: [],
+    completed: [],
+    failed: ['a', { id: 'b', error: 'x' }, { id: 'c', error: 'x' }],
+  };
+
+  const result = requeueFailedItems(task, ['b']);
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.requeued, ['b']);
+  assert.deepEqual(task.pending, ['b']);
+  assert.deepEqual(task.failed.map(f => (typeof f === 'string' ? f : f.id)), ['a', 'c']);
+});
+
+test('运行中重试失败项：已在队列/进行中/完成的图不重复排队，脏失败记录一并清掉', () => {
+  const task = {
+    status: 'running',
+    pending: ['f1'],
+    current_ids: ['f2'],
+    completed: ['f3'],
+    failed: [
+      { id: 'f1', error: 'x' },
+      { id: 'f2', error: 'x' },
+      { id: 'f3', error: 'x' },
+      { id: 'f4', error: 'x' },
+    ],
+  };
+
+  const result = requeueFailedItems(task);
+
+  assert.deepEqual(result.requeued, ['f4']); // 只有 f4 真的需要重排
+  assert.deepEqual(task.pending, ['f4', 'f1']);
+  assert.deepEqual(task.failed, []); // 其余是脏数据，留着会和新结果打架
+});
+
+test('运行中重试失败项：任务不在运行中或没有失败项时拒绝，且不改动数据', () => {
+  const done = { status: 'completed', pending: [], current_ids: [], completed: [], failed: [{ id: 'x', error: 'e' }] };
+  const beforeDone = structuredClone(done);
+  assert.equal(requeueFailedItems(done).ok, false);
+  assert.deepEqual(done, beforeDone);
+
+  const clean = { status: 'running', pending: ['p'], current_ids: [], completed: [], failed: [] };
+  const beforeClean = structuredClone(clean);
+  assert.equal(requeueFailedItems(clean).ok, false);
+  assert.deepEqual(clean, beforeClean);
+
+  assert.equal(requeueFailedItems(null).ok, false);
 });
 
 test('向量通道参与选图：无标签匹配时，语义相近的图仍能被选中（回归：少 await 导致向量通道静默失效）', () => {

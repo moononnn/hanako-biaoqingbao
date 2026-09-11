@@ -22,6 +22,7 @@ from PyQt6.QtCore import QEvent, QObject, QRectF, Qt, QPoint, QSize, QTimer, QBu
 from PyQt6.QtGui import QColor, QCursor, QIcon, QImage, QKeySequence, QMovie, QPainter, QPixmap, QKeyEvent, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QGraphicsOpacityEffect,
     QGridLayout,
@@ -1004,6 +1005,9 @@ class RecognizePanel(QFrame):
         self.busy = False
         self.request_seq = 0
         self.sticker_id = None
+        self.semantic_description = ''
+        self.group_suggestions = []
+        self.group_checkboxes = []
         self.setObjectName('recognizePanel')
         # 等待粘贴态捕获 Ctrl+V；WidgetWithChildrenShortcut 保证焦点在子控件时也能收到
         self._paste_shortcut = QShortcut(QKeySequence.StandardKey.Paste, self)
@@ -1019,6 +1023,10 @@ class RecognizePanel(QFrame):
             'QLabel#recogLbl { color:#46574f; font-size:11px; font-weight:600; }'
             'QTextEdit { background:#fffdf7; border:1px solid #d7e5dc; border-radius:7px; color:#46574f; font-family:"Microsoft YaHei UI"; font-size:11px; padding:4px 6px; }'
             'QTextEdit:focus { border-color:#5dae8e; }'
+            'QFrame#recogGroupBox { background:#eef8f2; border:1px solid #cfe5d7; border-radius:8px; }'
+            'QLabel#recogGroupHint { color:#5f8373; font-size:10px; }'
+            'QCheckBox#recogGroupCheck { color:#46574f; font-size:11px; spacing:5px; }'
+            'QCheckBox#recogGroupCheck::indicator { width:14px; height:14px; }'
             'QPushButton { min-height:26px; padding:0 10px; border-radius:9px; font-family:"Microsoft YaHei UI"; font-size:11px; }'
             'QPushButton#recogGo { color:#fffdf7; background:#5dae8e; border:1px solid #5dae8e; }'
             'QPushButton#recogGo:hover { background:#4f9d7e; }'
@@ -1097,6 +1105,23 @@ class RecognizePanel(QFrame):
         kw_row.addWidget(self.edit_kw, 1)
         root.addLayout(kw_row)
 
+        self.group_box = QFrame(self)
+        self.group_box.setObjectName('recogGroupBox')
+        group_root = QVBoxLayout(self.group_box)
+        group_root.setContentsMargins(8, 5, 8, 5)
+        group_root.setSpacing(3)
+        self.group_hint = QLabel('识图参考到分组；勾选后，确认入库时才会加入')
+        self.group_hint.setObjectName('recogGroupHint')
+        self.group_hint.setWordWrap(True)
+        group_root.addWidget(self.group_hint)
+        self.group_checks_row = QHBoxLayout()
+        self.group_checks_row.setContentsMargins(0, 0, 0, 0)
+        self.group_checks_row.setSpacing(8)
+        group_root.addLayout(self.group_checks_row)
+        root.addWidget(self.group_box)
+        self.group_box.setMaximumHeight(58)
+        self.group_box.hide()
+
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
         self.btn_cancel = QPushButton('放弃')
@@ -1123,6 +1148,7 @@ class RecognizePanel(QFrame):
         self.busy = False
         self.sticker_id = None
         self.image_b64 = None
+        self.clear_group_suggestions()
         self.step = 'wait_paste'
         self.title.setText('粘贴识别图片')
         self.status.setText('等待粘贴…')
@@ -1307,15 +1333,67 @@ class RecognizePanel(QFrame):
             self.title.setText('确认入库')
             self.btn_go.setText('确认入库')
             self.btn_go.setEnabled(True)
+            self.update_group_confirm_text()
 
+    def update_group_confirm_text(self):
+        if self.step != 'editing':
+            return
+        if not self.group_checkboxes:
+            self.btn_go.setText('确认入库')
+            return
+        selected = any(checkbox.isChecked() for checkbox in self.group_checkboxes)
+        self.btn_go.setText('确认入库并加入分组' if selected else '仅入库')
+
+    def clear_group_suggestions(self):
+        while self.group_checks_row.count():
+            item = self.group_checks_row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.group_checkboxes = []
+        self.group_suggestions = []
+        self.group_box.hide()
+        self.update_group_confirm_text()
+
+    def fill_group_suggestions(self, data):
+        self.clear_group_suggestions()
+        suggestions = data.get('group_suggestions') if isinstance(data, dict) else []
+        if not isinstance(suggestions, list):
+            return
+        for suggestion in suggestions[:5]:
+            if not isinstance(suggestion, dict):
+                continue
+            group_id = str(suggestion.get('groupId') or '').strip()
+            group_name = str(suggestion.get('groupName') or '').strip()
+            if not group_id or not group_name:
+                continue
+            matched = str(suggestion.get('matchedTerm') or '').strip()
+            label = '加入「' + group_name + '」'
+            if matched and matched != group_name:
+                label += '（识图叫法：' + matched + '）'
+            checkbox = QCheckBox(label, self.group_box)
+            checkbox.setObjectName('recogGroupCheck')
+            checkbox.setChecked(True)
+            checkbox.setProperty('groupId', group_id)
+            checkbox.setToolTip('确认入库时才会真正加入这个分组，可取消勾选')
+            checkbox.stateChanged.connect(lambda _state: self.update_group_confirm_text())
+            self.group_checkboxes.append(checkbox)
+            self.group_checks_row.addWidget(checkbox)
+            self.group_suggestions.append(suggestion)
+        if self.group_checkboxes:
+            self.group_checks_row.addStretch(1)
+            self.group_box.show()
 
     def clear_tags(self):
+        self.semantic_description = ''
         self.edit_desc.setPlainText('')
         self.edit_emo.setPlainText('')
         self.edit_scene.setPlainText('')
         self.edit_kw.setPlainText('')
+        self.clear_group_suggestions()
 
     def fill_tags(self, data):
+        self.semantic_description = str(data.get('semantic_description') or '').strip()[:300]
         self.edit_desc.setPlainText(data.get('description') or '')
         self.edit_emo.setPlainText('，'.join(data.get('emotion') or []))
         self.edit_scene.setPlainText('，'.join(data.get('scene') or []))
@@ -1324,12 +1402,19 @@ class RecognizePanel(QFrame):
     def collect_tags(self):
         def spl(t):
             return [x for x in (x.strip() for x in t.replace('，', ',').split(',')) if x]
+        group_ids = []
+        for checkbox in self.group_checkboxes:
+            if checkbox.isChecked():
+                group_id = str(checkbox.property('groupId') or '').strip()
+                if group_id and group_id not in group_ids:
+                    group_ids.append(group_id)
         return {
             'description': self.edit_desc.toPlainText().strip(),
-            'semantic_description': self.edit_desc.toPlainText().strip(),
+            'semantic_description': self.semantic_description or self.edit_desc.toPlainText().strip(),
             'emotion': spl(self.edit_emo.toPlainText()),
             'scene': spl(self.edit_scene.toPlainText()),
             'keywords': spl(self.edit_kw.toPlainText()),
+            'groupIds': group_ids,
         }
 
     def on_primary(self):
@@ -1369,8 +1454,9 @@ class RecognizePanel(QFrame):
             'keywords': sorted(str(x).strip() for x in (d.get('keywords') or []) if str(x).strip()),
         }
         self.fill_tags(d)
+        self.fill_group_suggestions(d)
         self.set_step('editing')
-        self.status.setText('识别完成，可编辑标签')
+        self.status.setText('识别完成，可编辑标签；分组建议也要由你确认')
         self.cover()
 
     def confirm_save(self):
@@ -1381,6 +1467,7 @@ class RecognizePanel(QFrame):
         self.btn_go.setEnabled(False)
         seq = self.request_seq
         tags = self.collect_tags()
+        group_ids = tags.pop('groupIds', [])
         # v0.26.0 教学机制：用户手动改过描述/关键词才记教学样本（AI 自动结果不算教学）
         auto = getattr(self, '_auto_tags', None)
         edited = False
@@ -1389,7 +1476,7 @@ class RecognizePanel(QFrame):
                 str(tags.get('description') or '').strip() != auto.get('description')
                 or sorted(str(x).strip() for x in (tags.get('keywords') or []) if str(x).strip()) != auto.get('keywords')
             )
-        payload = {'imageBase64': self.image_b64, 'fileName': self.source_name or f'ball_{int(time.time())}.{self.image_ext}', 'tags': tags, 'addToBall': True, 'teaching': edited}
+        payload = {'imageBase64': self.image_b64, 'fileName': self.source_name or f'ball_{int(time.time())}.{self.image_ext}', 'tags': tags, 'groupIds': group_ids, 'addToBall': True, 'teaching': edited}
         worker = BackgroundRequest(lambda: request_json('POST', '/recognition-confirm', payload, timeout=90), self, 'biaoqingbao-recog-confirm')
         self._worker = worker
         worker.done.connect(lambda result, s=seq: self._on_confirm_done(result, s))
@@ -1420,6 +1507,7 @@ class RecognizePanel(QFrame):
         self.busy = False
         self._paste_shortcut.setEnabled(False)
         self._stop_preview_movie()
+        self.clear_group_suggestions()
         self.hide()
 
     def _finish_worker(self, worker):

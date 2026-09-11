@@ -104,11 +104,13 @@ test('纸飞机识图入库记录 tagged_at，图库不会误判为未识图', (
       scene: ['分享'],
       keywords: ['小猫'],
     },
+    groupIds: ['semantic-fish'],
   });
   assert.equal(entry.added_at, now);
   assert.equal(entry.tagged_at, now);
   assert.equal(entry.description, '一只开心的小猫');
   assert.deepEqual(entry.tags.emotion, ['开心']);
+  assert.deepEqual(entry.groupIds, ['semantic-fish']);
 });
 
 test('safeStickerPath 拒绝路径穿越和目录外文件', () => {
@@ -119,6 +121,28 @@ test('safeStickerPath 拒绝路径穿越和目录外文件', () => {
   assert.equal(safeStickerPath(root, '../secret.txt'), null);
   assert.equal(safeStickerPath(root, 'C:\\secret.txt'), null);
   assert.equal(safeStickerPath(root, ''), null);
+});
+
+test('safeStickerPath 拒绝根目录 junction 和图库内部指向外部的父目录', (t) => {
+  const base = tempDir();
+  const outside = path.join(base, 'outside');
+  const linkedRoot = path.join(base, 'linked-root');
+  const normalRoot = path.join(base, 'normal-root');
+  const linkedChild = path.join(normalRoot, 'linked');
+  try {
+    fs.mkdirSync(outside, { recursive: true });
+    fs.mkdirSync(normalRoot, { recursive: true });
+    fs.writeFileSync(path.join(outside, 'secret.png'), 'x');
+    fs.symlinkSync(outside, linkedRoot, 'junction');
+    fs.symlinkSync(outside, linkedChild, 'junction');
+  } catch (error) {
+    fs.rmSync(base, { recursive: true, force: true });
+    t.skip(`当前环境不能创建 junction：${error.code || error.message}`);
+    return;
+  }
+  assert.equal(safeStickerPath(linkedRoot, 'secret.png'), null);
+  assert.equal(safeStickerPath(normalRoot, 'linked\\\\secret.png'), null);
+  fs.rmSync(base, { recursive: true, force: true });
 });
 
 test('sanitizeBallText 清除控制字符并限制长度', () => {

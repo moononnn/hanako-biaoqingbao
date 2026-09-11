@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MIME_MAP, META_FILE, STICKERS_DIR } from '../lib/shared.js';
+import { MIME_MAP, META_FILE, STICKERS_DIR, resolveAgentId } from '../lib/shared.js';
+import { filterStickersForAgent, readGroupStore } from '../lib/sticker-groups.js';
+import { safeStickerPath } from '../lib/ball-core.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = META_FILE;
@@ -37,10 +38,12 @@ export async function execute(input, ctx) {
     return reply({ ok: false, error: '表情包库为空' });
   }
 
-  const sticker = stickers.find(s => s.id === id);
-  if (!sticker) return reply({ ok: false, error: `未找到ID为 "${id}" 的表情包` });
+  const agentId = resolveAgentId(null, ctx);
+  const sticker = filterStickersForAgent(stickers, agentId, readGroupStore()).find(s => s.id === id);
+  if (!sticker) return reply({ ok: false, error: `未找到ID为 "${id}" 的表情包，或该图片不在当前伙伴的可用分组中` });
 
-  const filePath = join(stickersDir, sticker.file);
+  const filePath = safeStickerPath(stickersDir, sticker.file);
+  if (!filePath) return reply({ ok: false, error: `图片文件 ${sticker.file} 路径不安全` });
   let buffer;
   try {
     buffer = await readFile(filePath);

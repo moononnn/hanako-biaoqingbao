@@ -4,8 +4,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   STICKERS_DIR, DATA_DIR, META_FILE,
-  readMeta, tagImage, json as jsonResp, atomicWriteJson,
+  readMeta, writeMeta, tagImage, json as jsonResp, atomicWriteJson,
+  enqueueStickerDataWrite,
 } from '../lib/shared.js';
+// v0.34.37 - 识别结果落盘逻辑与批量识图设置（与手动「全部应用」共用同一套写入规则）
+import {
+  isAutoApplyEnabled, buildApplyItems, applyItemsToMeta, selectPendingApplyIds,
+} from '../lib/batch-apply.js';
+import { safeStickerPath } from '../lib/ball-core.js';
+import {
+  readGroupStore,
+  isGroupStoreReadable,
+  buildRecognitionGroupHints,
+  suggestGroupsForTags,
+} from '../lib/sticker-groups.js';
 
 const BATCH_TASKS_FILE = path.join(DATA_DIR, 'batch-tasks.json');
 
@@ -108,7 +120,18 @@ function createBatchTask(stickerIds, concurrency = 3) {
 
 // ═══ Worker 池 ═══
 
+// v0.34.34 - 记录每个任务是否有活跃 worker 池，避免运行中重试时重复起池
+const activePools = new Set();
+
+function ensureWorkerPool(taskId) {
+  if (activePools.has(taskId)) return false;
+  startWorkerPool(taskId);
+  return true;
+}
+
 function startWorkerPool(taskId) {
+  if (activePools.has(taskId)) return; // 已有池在跑，不重复起
+  activePools.add(taskId);
   // fire-and-forget：setImmediate 让出当前事件循环，后台异步跑
   setImmediate(async () => {
     try {
@@ -123,8 +146,53 @@ function startWorkerPool(taskId) {
         saveTask(task);
         emitBus('biaoqingbao:batch-task-failed', { taskId, error: e.message });
       }
+    } finally {
+      activePools.delete(taskId);
+      // v0.34.34 - 兜底：池退出的同时正好有失败项被塞回 pending（运行中重试），
+      // 而收尾判定已错过时机时，这里重新起池，避免任务卡在 running
+      const latest = getTask(taskId);
+      if (latest && latest.status === 'running' && (latest.pending || []).length > 0) {
+        moduleCtx?.log?.info?.(`[batch] 任务 ${taskId} 池退出后仍有 ${latest.pending.length} 张待处理，重新起池`);
+        startWorkerPool(taskId);
+      }
     }
   });
+}
+
+// v0.34.37 - 任务完成后按设置自动应用识别结果（默认开）。
+// 失败不改任务状态：识别结果还在任务里，用户仍可在结果视图手动点「全部应用」。
+async function autoApplyTaskResults(taskId) {
+  try {
+    if (!isAutoApplyEnabled()) return 0;
+  } catch {
+    return 0;
+  }
+  const task = getTask(taskId);
+  if (!task) return 0;
+  const pendingApply = selectPendingApplyIds(task);
+  if (pendingApply.length === 0) return 0;
+
+  const items = buildApplyItems(task, pendingApply);
+  if (items.length === 0) return 0;
+
+  let updated = 0;
+  try {
+    await enqueueStickerDataWrite(async () => {
+      const meta = readMeta();
+      updated = applyItemsToMeta(meta, items);
+      if (updated > 0) writeMeta(meta);
+    });
+  } catch (e) {
+    moduleCtx?.log?.error?.(`[batch] 任务 ${taskId} 自动应用失败:`, e.message);
+    return 0;
+  }
+  // 一张都没写进去就不标记已应用，否则会变成「显示已应用但其实没写」
+  if (updated === 0) return 0;
+
+  markTaskApplied(taskId, items.map((item) => item.id));
+  moduleCtx?.log?.info?.(`[batch] 任务 ${taskId} 已自动应用 ${items.length} 张`);
+  emitBus('biaoqingbao:batch-task-auto-applied', { taskId, count: items.length });
+  return items.length;
 }
 
 async function runWorkerPool(taskId) {
@@ -146,12 +214,15 @@ async function runWorkerPool(taskId) {
     finalTask.completed_at = new Date().toISOString();
     finalTask.updated_at = finalTask.completed_at;
     saveTask(finalTask);
+    // v0.34.37 - 先落盘再自动应用：应用失败也不会弄坏任务状态
+    const autoApplied = await autoApplyTaskResults(taskId);
     emitBus('biaoqingbao:batch-task-completed', {
       taskId,
       summary: {
         total: finalTask.total,
         success: finalTask.completed.length,
         failed: finalTask.failed.length,
+        autoApplied,
       },
     });
   }
@@ -182,13 +253,17 @@ async function workerLoop(taskId, workerIdx) {
     try {
       const sticker = readMeta().find(s => s.id === stickerId);
       if (!sticker) throw new Error('sticker 不存在');
-      const filePath = path.join(STICKERS_DIR, sticker.file);
-      if (!fs.existsSync(filePath)) throw new Error('图片文件不存在');
+      const filePath = safeStickerPath(STICKERS_DIR, sticker.file);
+      if (!filePath || !fs.existsSync(filePath)) throw new Error('图片文件不存在或路径不安全');
       const buf = fs.readFileSync(filePath);
       // 由 tagImage 根据真实扩展名设置 MIME；动态 GIF 会先抽取关键帧。
-      const tagResult = await tagImage(buf.toString('base64'), sticker.file);
+      // 每张图开始识别前重读分组，让重命名/别名设置能自然进入后续任务。
+      const groupStore = readGroupStore();
+      const recognitionHints = isGroupStoreReadable(groupStore) ? buildRecognitionGroupHints(groupStore) : '';
+      const tagResult = await tagImage(buf.toString('base64'), sticker.file, { recognitionHints });
       if (tagResult.ok) {
         result = { ok: true, data: tagResult.data };
+        result.data.group_suggestions = suggestGroupsForTags(result.data, groupStore);
       } else {
         result = { ok: false, error: tagResult.error || '未知错误' };
       }
@@ -278,6 +353,52 @@ function markTaskRetried(taskId, stickerIds) {
   return { ok: true, cleared: before - task.failed.length };
 }
 
+// v0.34.34 - 运行中重试失败项：把 failed 里的图放回当前任务的 pending 队列。
+// 此前重试入口只在任务结束后出现（结果视图的「全部重试」/单项「重试」），
+// 任务跑到一半发现失败项时用户只能取消整个任务再重来。
+// 纯逻辑（不碰 IO），便于单测；调用方负责 saveTask + 起池。
+export function requeueFailedItems(task, stickerIds) {
+  if (!task) return { ok: false, error: '任务不存在', requeued: [] };
+  if (task.status !== 'running') {
+    return { ok: false, error: `任务状态为 ${task.status}，请在结果里重试`, requeued: [] };
+  }
+
+  const failedIds = new Set((task.failed || [])
+    .map(item => (typeof item === 'string' ? item : item?.id))
+    .filter(Boolean));
+  if (failedIds.size === 0) return { ok: false, error: '这个任务没有失败的项', requeued: [] };
+
+  const completed = new Set(task.completed || []);
+  const pending = new Set(task.pending || []);
+  const current = new Set(Array.isArray(task.current_ids) ? task.current_ids : []);
+  const requested = Array.isArray(stickerIds) && stickerIds.length > 0
+    ? stickerIds
+    : Array.from(failedIds);
+
+  const requeued = [];
+  for (const id of new Set(requested)) {
+    if (!id || !failedIds.has(id)) continue;
+    if (completed.has(id) || pending.has(id) || current.has(id)) continue;
+    requeued.push(id);
+  }
+  if (requeued.length === 0) return { ok: false, error: '没有可重试的失败项', requeued: [] };
+
+  const requeueSet = new Set(requeued);
+  // 重新排队的项、以及已经在队列/进行中/已完成态的项都从 failed 里清掉：
+  // 后者留在 failed 里是脏数据，会和跑完后的成功结果同时计入成败
+  task.failed = (task.failed || []).filter(item => {
+    const fid = typeof item === 'string' ? item : item?.id;
+    if (!fid) return false;
+    if (requeueSet.has(fid)) return false;
+    if (completed.has(fid) || pending.has(fid) || current.has(fid)) return false;
+    return true;
+  });
+  // 重试项插到队首：用户点名的这些先跑，剩下的继续排队
+  task.pending = [...requeued, ...(task.pending || [])];
+  task.updated_at = new Date().toISOString();
+  return { ok: true, requeued };
+}
+
 function listTasks(filter = {}) {
   const all = readBatchTasks();
   let tasks = all.order.map(id => all.tasks[id]).filter(Boolean);
@@ -332,6 +453,7 @@ function resumeAllTasks() {
   const all = readBatchTasks();
   let resumed = 0;
   let changed = false;
+  const autoApplyIds = []; // v0.34.37 - 重启后直接完成的任务也要走一次自动应用
 
   for (const id of all.order) {
     const task = all.tasks[id];
@@ -359,6 +481,7 @@ function resumeAllTasks() {
       task.updated_at = task.completed_at;
       changed = true;
       moduleCtx?.log?.info?.(`[batch] 任务 ${id} 无待处理项目，直接标记为完成`);
+      autoApplyIds.push(id);
       emitBus('biaoqingbao:batch-task-completed', {
         taskId: id,
         summary: {
@@ -371,6 +494,10 @@ function resumeAllTasks() {
   }
 
   if (changed) writeBatchTasks(all);
+  // 写盘之后再自动应用（上面的任务对象是先改内存、最后一次性落盘）
+  for (const id of autoApplyIds) {
+    autoApplyTaskResults(id).catch(() => {});
+  }
   if (resumed > 0) {
     moduleCtx?.log?.info?.(`[batch] 共恢复 ${resumed} 个任务`);
   }
@@ -484,6 +611,27 @@ export function registerBatchTasksRoutes(app, ctx) {
     const stickerIds = Array.isArray(body.sticker_ids) ? body.sticker_ids : [];
     if (stickerIds.length === 0) return jsonResp({ ok: false, error: '缺少 sticker_ids' }, 400);
     return jsonResp(markTaskApplied(id, stickerIds));
+  });
+
+  // POST /api/batch-task/:id/retry-failed — 运行中把失败的图放回队列重跑（不取消任务）
+  app.post('/api/batch-task/:id/retry-failed', async (c) => {
+    const id = c.req.param('id');
+    const task = getTask(id);
+    if (!task) return jsonResp({ ok: false, error: '任务不存在' }, 404);
+    const body = await c.req.json().catch(() => ({}));
+    const stickerIds = Array.isArray(body?.sticker_ids) ? body.sticker_ids : [];
+    const result = requeueFailedItems(task, stickerIds);
+    if (!result.ok) return jsonResp(result, 400);
+    saveTask(task);
+    ensureWorkerPool(task.id);
+    moduleCtx?.log?.info?.(`[batch] 任务 ${task.id} 运行中重试 ${result.requeued.length} 张`);
+    emitBus('biaoqingbao:batch-task-requeued', { taskId: task.id, count: result.requeued.length });
+    return jsonResp({
+      ok: true,
+      requeued: result.requeued.length,
+      pending: task.pending.length,
+      message: `已把 ${result.requeued.length} 张失败的图放回队列`,
+    });
   });
 
   // POST /api/batch-task/:id/retried — 重试成功后清除旧任务的失败记录

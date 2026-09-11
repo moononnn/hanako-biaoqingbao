@@ -10,6 +10,14 @@ import {
 } from '../lib/shared.js';
 import { TAG_TO_GROUP, resolveEmotionFactor } from '../lib/emotion-groups.js';
 import { getAgentExpressionBias } from '../lib/dialect.js';
+import {
+  readGroupStore,
+  filterStickersForAgent,
+  getAgentGroupConfig,
+  getKnownGroupIds,
+  getGroupPreferenceBonus,
+  getStickerGroupIds,
+} from '../lib/sticker-groups.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = META_FILE;
@@ -26,7 +34,7 @@ function reply(obj) {
 }
 
 export const name = "search_stickers";
-export const description = "搜索表情包，返回最匹配的候选列表（不含图片数据）。建议直接调 express 工具发表情包。keywords 精确匹配得分最高，是区分不同表情包的关键。emotion 传大类即可（搞笑/开心/难过/无语/感谢/鼓励）";
+export const description = "搜索表情包，返回最匹配的候选列表（不含图片数据）。建议直接调 express 工具发表情包。keywords 精确匹配得分最高，是区分不同表情包的关键。emotion 传大类即可（搞笑/开心/难过/无语/感谢/鼓励）。当前伙伴的分组白名单和分组偏爱会自动参与筛选与排序。";
 export const parameters = {
   type: "object",
   properties: {
@@ -61,9 +69,12 @@ export async function execute(input, ctx) {
   // v0.25.2 - 候选列表也吃偏好惩罚：vetoed/累计不喜欢的图不排前面（与 express 选图口径一致，避免「先 search 再 express」链路里不喜欢的图以最高分出现误导助手）
   let prefs = { preferred: [], vetoed: [], dislikes: {} };
   let expressionBias = null;
-  let agentId = null;
+  const agentId = resolveAgentId(null, ctx);
+  const groupStore = readGroupStore();
+  const groupConfig = getAgentGroupConfig(groupStore, agentId);
+  const knownGroupIds = getKnownGroupIds(groupStore);
+  stickers = filterStickersForAgent(stickers, agentId, groupStore);
   try {
-    agentId = resolveAgentId(null, ctx);
     expressionBias = getAgentExpressionBias(agentId);
     const pRaw = await readFile(PREFERENCES_FILE, 'utf-8');
     const pData = JSON.parse(pRaw);
@@ -145,7 +156,10 @@ export async function execute(input, ctx) {
       }
 
       // v0.25.2 - 偏好加权：不喜欢的图降权（与 express 的 prefsScoreBonus 同一系数）
+      const semanticScore = score;
       score += prefsScoreBonus(sticker.id, prefs);
+      // 分组偏爱只给已有查询命中的候选加小幅 bonus，不把单凭全局喜欢的无关图片再抬高。
+      if (semanticScore > 0 && score > 0) score += getGroupPreferenceBonus(sticker, groupConfig, knownGroupIds);
 
       return { sticker, score, matchDetails };
     });
@@ -163,6 +177,7 @@ export async function execute(input, ctx) {
     file: s.sticker.file,
     description: s.sticker.description,
     tags: s.sticker.tags,
+    group_ids: getStickerGroupIds(s.sticker, knownGroupIds),
     intensity: s.sticker._source?.intensity || 'medium',
     reply_mode: s.sticker._source?.reply_mode || 'either',
     score: Math.round(s.score * 100) / 100,

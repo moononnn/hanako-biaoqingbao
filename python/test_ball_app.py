@@ -1214,7 +1214,7 @@ class BallLayoutTests(unittest.TestCase):
         def fake_request_json(method, route, payload=None, timeout=10):
             captured.append((method, route, payload, timeout))
             if route == "/recognition":
-                return {"ok": True, "data": {"description": "一只猫", "emotion": ["开心"], "scene": [], "keywords": ["猫"]}}
+                return {"ok": True, "data": {"description": "一只猫", "semantic_description": "适合开心时轻松回应", "emotion": ["开心"], "scene": [], "keywords": ["猫"]}}
             if route == "/recognition-confirm":
                 return {"ok": True, "data": {"sticker": {"id": "stk_new_1"}}}
             return {"ok": True}
@@ -1235,6 +1235,7 @@ class BallLayoutTests(unittest.TestCase):
             confirm_calls = [c for c in captured if c[1] == "/recognition-confirm"]
             self.assertEqual(len(confirm_calls), 1)
             self.assertFalse(confirm_calls[0][2].get("teaching"))
+            self.assertEqual(confirm_calls[0][2]["tags"].get("semantic_description"), "适合开心时轻松回应")
 
             # 第二轮：改描述为「呆猫八条」再入库 → teaching 应为 True
             captured.clear()

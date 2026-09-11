@@ -1,6 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import { META_FILE } from '../lib/shared.js';
+import { META_FILE, resolveAgentId } from '../lib/shared.js';
+import { filterStickersForAgent, getKnownGroupIds, readGroupStore, getStickerGroupIds } from '../lib/sticker-groups.js';
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = META_FILE;
@@ -10,7 +11,7 @@ function reply(obj) {
 }
 
 export const name = "list_stickers";
-export const description = "浏览表情包库中的所有表情包，可按情绪或场景筛选";
+export const description = "浏览当前伙伴可用的表情包，可按情绪或场景筛选；伙伴分组白名单会自动生效";
 export const parameters = {
   type: "object",
   properties: {
@@ -30,7 +31,10 @@ export async function execute(input, ctx) {
     return reply({ ok: true, data: [], total: 0, message: '表情包库为空' });
   }
 
-  let filtered = stickers;
+  const agentId = resolveAgentId(null, ctx);
+  const groupStore = readGroupStore();
+  const knownGroupIds = getKnownGroupIds(groupStore);
+  let filtered = filterStickersForAgent(stickers, agentId, groupStore);
 
   if (emotion) {
     const emList = emotion.split(',').map(s => s.trim());
@@ -51,6 +55,7 @@ export async function execute(input, ctx) {
     file: s.file,
     description: s.description,
     tags: s.tags,
+    group_ids: getStickerGroupIds(s, knownGroupIds),
     added_at: s.added_at
   }));
 

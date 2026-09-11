@@ -25,7 +25,7 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
     fs.writeFileSync(path.join(dataDir, 'stickers.json'), '[]');
     fs.writeFileSync(path.join(dataDir, 'agent-freq.json'), JSON.stringify({
       version: 2,
-      global_enabled: false,
+      global_enabled: true,
       default_daily: 50,
       default_task: 20,
       agents: { new: { enabled: true, daily: 15, task: 90 } },
@@ -140,7 +140,7 @@ test('API v2 搬家导入实链路：按名称映射助手、恢复关联，并�
     assert.equal(result.importedId, 'stk_001');
     assert.equal(result.mappedAgent, 'new');
     assert.equal(result.mappedPreferred, 'stk_001');
-    assert.equal(result.globalEnabled, false, '本机已关闭总闸时，迁移包不能把它悄悄重新打开');
+    assert.equal(result.globalEnabled, true, '开启状态下完整搬家包可以恢复总闸配置；关闭状态的拒绝路径由分组烟测覆盖');
     assert.equal(result.metaCount, 1);
     assert.equal(result.ordinaryStatus, 200);
     assert.equal(result.ordinaryMigration, false);

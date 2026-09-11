@@ -20,9 +20,18 @@ import { resolveEmotionFactor } from '../lib/emotion-groups.js';
 import { getAgentExpressionBias } from '../lib/dialect.js';
 import { fitDecision } from '../lib/smart-fit.js';
 import { imageSizeFromBuffer } from '../lib/image-size.js';
+import { safeStickerPath } from '../lib/ball-core.js';
 import { recordRecentMatch } from '../lib/recent-match.js';
 import { readContextFits } from '../lib/context-feedback.js';
 import { readExposureStats, recordSuccessfulExposure, rerankWithExploration } from '../lib/exposure.js';
+import {
+  readGroupStore,
+  filterStickersForAgent,
+  getAgentGroupConfig,
+  getKnownGroupIds,
+  getGroupPreferenceBonus,
+  getStickerGroupIds,
+} from '../lib/sticker-groups.js';
 
 const OUTPUT_DIR_CFG = join(dataDir, 'output-dir.json');
 const NATIVE_MEDIA_MIN_VERSION = [0, 679, 0];
@@ -61,7 +70,7 @@ async function readVectorsCached() {
 // ⚠️ 副作用契约：原地修改 scored 数组（叠加 _score、补充新项）并返回同一个数组；
 // 调用方依赖此行为，改动返回值语义前必须先改 execute。
 // v0.25.0 - 新增 prefs 参数：向量补充通道同样应用偏好惩罚（修复 veto/不喜欢绕道向量通道钻回来的漏洞）
-export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, excludeIds, prefs) {
+export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, excludeIds, prefs, groupConfig = null, knownGroupIds = null) {
   if (!emotionVec || !vectorMap || Object.keys(vectorMap).length === 0) return scored;
 
   // 给已有打分的表情包加向量 bonus
@@ -81,7 +90,9 @@ export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, exc
       const sim = cosineSimilarity(emotionVec, vec);
       if (sim > 0.35) {
         // v0.25.0 - 补充命中也要吃偏好惩罚：vetoed/不喜欢次数照常降权，避免绕道向量通道复出
-        scored.push({ ...sticker, _score: sim * 10 + prefsScoreBonus(sticker.id, prefs) });
+        const baseScore = sim * 10 + prefsScoreBonus(sticker.id, prefs);
+        const groupBonus = baseScore > 0 ? getGroupPreferenceBonus(sticker, groupConfig, knownGroupIds) : 0;
+        scored.push({ ...sticker, _score: baseScore + groupBonus });
       }
     }
   }
@@ -91,7 +102,7 @@ export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, exc
 }
 
 // 向量检索：给已有打分加向量 bonus，并补充纯向量命中
-async function applyVectorScoring(scored, allStickers, emotion, excludeIds, prefs) {
+async function applyVectorScoring(scored, allStickers, emotion, excludeIds, prefs, groupConfig = null, knownGroupIds = null) {
   // v0.19.5 - 修复：readVectorsCached 是 async，少了 await 会导致向量通道整体静默失效
   const vectorsData = await readVectorsCached();
   if (!vectorsData?.vectors || Object.keys(vectorsData.vectors).length === 0) return scored;
@@ -111,7 +122,7 @@ async function applyVectorScoring(scored, allStickers, emotion, excludeIds, pref
   }
   if (!emotionVec) return scored;
 
-  return applyVectorBonus(scored, allStickers, emotionVec, vectorsData.vectors, excludeIds, prefs);
+  return applyVectorBonus(scored, allStickers, emotionVec, vectorsData.vectors, excludeIds, prefs, groupConfig, knownGroupIds);
 }
 
 function reply(obj) {
@@ -412,7 +423,7 @@ async function logDecision(emotion, stickerId, ctx, metadata = {}) {
 // 纯标签匹配打分（不调模型）
 // v0.27.0：新增 bias 参数（方言表情气质权重），情绪贡献分乘方言系数 + 加强度偏移；
 // 只影响情绪匹配分，prefs 偏好惩罚在系数之外照常生效。bias=null 时与原逻辑完全一致。
-export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null) {
+export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null, groupConfig = null, knownGroupIds = null) {
   const emoLower = (emotion || '').toLowerCase();
   return stickers
     .filter(s => !excludeIds.includes(s.id))
@@ -454,7 +465,12 @@ export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null)
       }
 
       // v0.25.0 - 偏好加权统一走 prefsScoreBonus（preferred +10 / vetoed -20 / 不喜欢次数 -10×count）
-      const score = emotionScore + prefsScoreBonus(sticker.id, prefs);
+      const baseScore = emotionScore + prefsScoreBonus(sticker.id, prefs);
+      // 分组偏爱只给已有情绪语义命中的候选加小幅 bonus；单凭全局喜欢不能让偏爱组再插队。
+      const groupBonus = emotionScore > 0 && baseScore > 0
+        ? getGroupPreferenceBonus(sticker, groupConfig, knownGroupIds)
+        : 0;
+      const score = baseScore + groupBonus;
 
       return { ...sticker, _score: score };
     })
@@ -463,7 +479,7 @@ export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null)
 }
 
 export const name = "express";
-export const description = "用表情包表达你（助手）自己的情绪。当你回复用户时，如果自己感受到了开心、委屈、心疼、无奈、感动、得意、无语等情绪，想用一张图片来表达自己的感受，就调用这个工具。只需要传一个情绪词，比如 express({ emotion: '开心' }) 或 express({ emotion: '心疼想抱抱你' })。这是助手自己的情绪表达方式，不是必须执行的任务。";
+export const description = "用表情包表达你自己的情绪。当你回复用户时，如果自己感受到了开心、委屈、心疼、无奈、感动、得意、无语等情绪，想用一张图片来表达自己的感受，就调用这个工具。只需要传一个情绪词，比如 express({ emotion: '开心' }) 或 express({ emotion: '心疼想抱抱你' })。这是你自己的情绪表达方式，不是必须执行的任务。当前伙伴的分组白名单会自动生效，标为偏爱的分组只会小幅提高出现机会。";
 export const sessionPermission = { kind: "session_file_output" };
 
 export const parameters = {
@@ -494,6 +510,9 @@ export async function execute(input, ctx) {
 
   // 主动调用不再重复抽概率，只遵守自动配图总闸与每位助手自己的允许状态。
   const agentId = resolveAgentId(null, ctx);
+  const groupStore = readGroupStore();
+  const groupConfig = getAgentGroupConfig(groupStore, agentId);
+  const knownGroupIds = getKnownGroupIds(groupStore);
   let autoImageEnabled = true;
   try {
     autoImageEnabled = isAutoImageEnabled(readAgentFreq());
@@ -526,6 +545,10 @@ export async function execute(input, ctx) {
   if (stickers.length === 0) {
     return reply({ ok: false, error: '表情包库是空的，请先添加一些表情包' });
   }
+  stickers = filterStickersForAgent(stickers, agentId, groupStore);
+  if (stickers.length === 0) {
+    return reply({ ok: true, data: { action: 'no_match', message: '当前伙伴的可用分组里没有表情包。可以到「伙伴配图频率」页调整分组白名单。' } });
+  }
 
   // 加载偏好（v0.19.5 - 传入 agentId，偏好只属于当前助手）
   const prefs = await loadPreferencesFor(emotion, agentId);
@@ -552,11 +575,11 @@ export async function execute(input, ctx) {
     const allExclude = [...new Set([...(exclude_ids || []), ...getRecent(agentId)])];
 
     // 打分匹配（v0.27.0：传入方言气质权重）
-    let scored = scoreStickers(stickers, emotion, allExclude, effectivePrefs, expressionBias);
+    let scored = scoreStickers(stickers, emotion, allExclude, effectivePrefs, expressionBias, groupConfig, knownGroupIds);
 
     if (scored.length === 0) {
       // 放宽限制：不排除最近用过的，再试一次
-      const relaxed = scoreStickers(stickers, emotion, [], effectivePrefs, expressionBias);
+      const relaxed = scoreStickers(stickers, emotion, [], effectivePrefs, expressionBias, groupConfig, knownGroupIds);
       scored.push(...relaxed);
     }
 
@@ -564,7 +587,7 @@ export async function execute(input, ctx) {
     // 若先 length=0 再 push(...vectorScored) 会把结果一起清空（vectorScored === scored），
     // 导致永远走到 no_match。恢复原地修改语义，不回填。
     // v0.25.0 - applyVectorScoring 传入 prefs：向量补充通道同样应用偏好惩罚
-    await applyVectorScoring(scored, stickers, emotion, allExclude, effectivePrefs);
+    await applyVectorScoring(scored, stickers, emotion, allExclude, effectivePrefs, groupConfig, knownGroupIds);
 
     if (scored.length === 0) {
       return reply({
@@ -593,7 +616,8 @@ export async function execute(input, ctx) {
   }
 
   // 读取图片 -> 复制 -> stage
-  const srcPath = join(stickersDir, best.file);
+  const srcPath = safeStickerPath(stickersDir, best.file);
+  if (!srcPath) return reply({ ok: false, error: `图片文件 ${best.file} 路径不安全` });
   let buffer;
   try {
     buffer = await readFile(srcPath);

@@ -5,7 +5,10 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { MAX_ENTRIES, extractStickerArchive, writeStoredZip } from '../lib/zip-images.js';
+import {
+  MAX_ENTRIES, MAX_IMAGE_BYTES, MAX_TOTAL_BYTES, MAX_METADATA_BYTES,
+  extractStickerArchive, writeStoredZip,
+} from '../lib/zip-images.js';
 import {
   buildStickerExportPlan,
   buildMigrationPayload,
@@ -70,6 +73,52 @@ test('ZIP 图片按真实签名归一化扩展名，错扩展名也能迁移', a
   });
 });
 
+test('导出与导入限制对齐：拒绝超大单图、总图片和迁移元数据', async () => {
+  await withTempDir(async (directory) => {
+    const stickersDir = path.join(directory, 'stickers');
+    await fsp.mkdir(stickersDir, { recursive: true });
+    const oversizedPath = path.join(stickersDir, 'oversized.png');
+    await fsp.writeFile(oversizedPath, Buffer.alloc(0));
+    await fsp.truncate(oversizedPath, MAX_IMAGE_BYTES + 1);
+    const oversized = buildStickerExportPlan({
+      stickersDir,
+      meta: [{ id: 'oversized', file: 'oversized.png', description: '太大' }],
+    });
+    assert.equal(oversized.files.length, 0);
+    assert.match(oversized.skipped[0].reason, /20MB/);
+
+    const totalCount = Math.floor(MAX_TOTAL_BYTES / MAX_IMAGE_BYTES) + 1;
+    const totalMeta = [];
+    for (let index = 0; index < totalCount; index += 1) {
+      const file = `total-${index}.png`;
+      const totalPath = path.join(stickersDir, file);
+      await fsp.writeFile(totalPath, Buffer.alloc(0));
+      await fsp.truncate(totalPath, MAX_IMAGE_BYTES);
+      totalMeta.push({ id: `total-${index}`, file, description: file });
+    }
+    const total = buildStickerExportPlan({ stickersDir, meta: totalMeta });
+    assert.match(total.limitError, /200MB/);
+
+    const smallPath = path.join(stickersDir, 'small.png');
+    await fsp.writeFile(smallPath, fakePng(99));
+    const metadataResult = await exportStickerArchive({
+      stickersDir,
+      outputPath: path.join(directory, 'metadata-too-large.zip'),
+      meta: [{ id: 'small', file: 'small.png', description: '小图' }],
+      migrationPayload: {
+        format: 'hana-biaoqingbao',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        agents: [],
+        stickers: [],
+        data: { oversized: 'x'.repeat(MAX_METADATA_BYTES) },
+      },
+    });
+    assert.equal(metadataResult.ok, false);
+    assert.match(metadataResult.error, /4MB/);
+  });
+});
+
 test('导出 ZIP 后可解析出图片、名称和标签，缺失图片会被跳过', async () => {
   await withTempDir(async (directory) => {
     const stickersDir = path.join(directory, 'stickers');
@@ -130,6 +179,28 @@ test('导出计划拒绝越界路径，并只读取普通图片文件', () => {
   });
   assert.equal(plan.files.length, 0);
   assert.equal(plan.skipped.length, 2);
+});
+
+test('导出拒绝图库内指向图库外的 junction', async (t) => {
+  await withTempDir(async (directory) => {
+    const stickersDir = path.join(directory, 'stickers');
+    const outsideDir = path.join(directory, 'outside');
+    await fsp.mkdir(stickersDir, { recursive: true });
+    await fsp.mkdir(outsideDir, { recursive: true });
+    await fsp.writeFile(path.join(outsideDir, 'secret.png'), fakePng(9));
+    try {
+      await fsp.symlink(outsideDir, path.join(stickersDir, 'linked'), 'junction');
+    } catch (error) {
+      t.skip(`当前环境不能创建 junction：${error.code || error.message}`);
+      return;
+    }
+    const plan = buildStickerExportPlan({
+      stickersDir,
+      meta: [{ id: 'secret', file: 'linked/secret.png', description: '不应导出' }],
+    });
+    assert.equal(plan.files.length, 0);
+    assert.equal(plan.skipped[0].reason, '图片路径或格式无效');
+  });
 });
 
 test('导出目录配置只保存最近一次目录', async () => {
@@ -350,7 +421,12 @@ test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤�
     const stickersDir = path.join(dataDir, 'stickers');
     await fsp.mkdir(stickersDir, { recursive: true });
     await fsp.writeFile(path.join(stickersDir, 'cat.png'), fakePng(12));
-    const meta = [{ id: 'stk_1', file: 'cat.png', description: '猫' }];
+    const meta = [{ id: 'stk_1', file: 'cat.png', description: '猫', groupIds: ['mood'] }];
+    await fsp.writeFile(path.join(dataDir, 'sticker-groups.json'), JSON.stringify({
+      version: 1,
+      groups: [{ id: 'mood', name: '情绪' }],
+      agents: { a1: { configured: true, groupIds: ['mood'], favoriteGroupIds: ['mood'], includeUngrouped: true } },
+    }));
     await fsp.writeFile(path.join(dataDir, 'dialect-config.json'), JSON.stringify({ version: 3, agents: { 'a1': { dialect: 'sichuan', enabled: true } } }));
     await fsp.writeFile(path.join(dataDir, 'agent-freq.json'), JSON.stringify({ version: 2, global_enabled: true, default_daily: 50, default_task: 20, agents: {} }));
 
@@ -361,8 +437,9 @@ test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤�
     assert.equal(galleryOnly.migration, null);
     const gArch = await extractStickerArchive(await fsp.readFile(path.join(directory, 'gallery.zip')));
     assert.equal(gArch.migrationFound, false);
+    assert.equal(gArch.metadata?.[0]?.groupIds, undefined);
 
-    // 只勾方言：v2 包但 data 里只有方言
+    // 只勾方言：v2 包但 data 里只有方言，分组归属也不随未勾选的数据偷偷带出
     const dialectOnly = await exportStickerArchive({ meta, stickersDir, dataDir, outputPath: path.join(directory, 'dialect.zip'), includeDataKeys: ['dialectConfig'] });
     assert.equal(dialectOnly.ok, true);
     assert.equal(dialectOnly.manifest.formatVersion, 2);
@@ -371,6 +448,23 @@ test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤�
     const dData = normalizeMigrationPayload(dArch.migration).data;
     assert.deepEqual(Object.keys(dData), ['dialectConfig']);
     assert.equal('agentFreq' in dData, false);
+    assert.equal(dArch.metadata?.[0]?.groupIds, undefined);
+
+    // 只勾图库分组：按范围导出时带出分组定义与图片归属
+    const groupsOnly = await exportStickerArchive({
+      meta,
+      stickersDir,
+      dataDir,
+      outputPath: path.join(directory, 'groups.zip'),
+      includeDataKeys: ['stickerGroups'],
+      groupFilter: { groupIds: ['mood'], includeUngrouped: false },
+    });
+    assert.equal(groupsOnly.ok, true);
+    const groupsArch = await extractStickerArchive(await fsp.readFile(path.join(directory, 'groups.zip')));
+    const groupsData = normalizeMigrationPayload(groupsArch.migration).data;
+    assert.deepEqual(groupsData.stickerGroups.groups.map((group) => group.id), ['mood']);
+    assert.deepEqual(groupsData.stickerGroups.agents.a1.groupIds, ['mood']);
+    assert.deepEqual(groupsArch.metadata?.[0]?.groupIds, ['mood']);
 
     // 不传 includeDataKeys（老行为）：全量 v2 搬家包
     const full = await exportStickerArchive({ meta, stickersDir, dataDir, outputPath: path.join(directory, 'full.zip') });
@@ -383,11 +477,11 @@ test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤�
   });
 });
 
-test('导出内容勾选 UI 与提交契约：四个分组、全选框、摘要联动、dataGroups 提交', () => {
+test('导出内容勾选 UI 与提交契约：五个分组、全选框、摘要联动、dataGroups 提交', () => {
   const ui = fs.readFileSync(path.join(process.cwd(), 'routes', 'ui.js'), 'utf8');
   const client = fs.readFileSync(path.join(process.cwd(), 'assets', 'sticker-manager.js'), 'utf8');
   const api = fs.readFileSync(path.join(process.cwd(), 'routes', 'api.js'), 'utf8');
-  // 弹窗提供四个内容勾选 + 全选框，且图库说明改为“不设勾选”
+  // 弹窗提供五个内容勾选（含图库分组）+ 全选框，且图库本体常驻
   assert.match(ui, /id="export-group-preference"/);
   assert.match(ui, /id="export-group-style"/);
   assert.match(ui, /id="export-group-dialect"/);

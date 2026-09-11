@@ -1,9 +1,7 @@
 import { copyFile, readFile } from 'node:fs/promises';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { genId, atomicWriteJson, enqueueToolWrite, META_FILE, STICKERS_DIR } from '../lib/shared.js';
+import { safeStickerPath } from '../lib/ball-core.js';
 
-const __dirname = fileURLToPath(new URL('.', import.meta.url));
 const metaPath = META_FILE;
 const stickersDir = STICKERS_DIR;
 
@@ -51,7 +49,8 @@ export async function execute(input, ctx) {
 
     const id = genId();
     const fileName = `${id}.${ext}`;
-    const destPath = join(stickersDir, fileName);
+    const destPath = safeStickerPath(stickersDir, fileName);
+    if (!destPath) return reply({ ok: false, error: '图库目录路径不安全，无法写入图片' });
 
     try {
       await copyFile(sourcePath, destPath);
