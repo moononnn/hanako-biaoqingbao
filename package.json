@@ -5,7 +5,7 @@
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "scripts": {
-    "test": "node --test tests/*.test.js"
+    "test": "node scripts/run-tests.mjs"
   },
   "engines": {
     "node": ">=20"
