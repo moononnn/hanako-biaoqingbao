@@ -6,7 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  PREFERRED_GROUP_BONUS,
+  GROUP_WEIGHT_BONUS,
+  LEGACY_FAVORITE_WEIGHT,
   MAX_GROUPS,
   MAX_GROUP_IDS_PER_STICKER,
   UNGROUPED_GROUP_ID,
@@ -79,7 +80,8 @@ test('分组数据归一化：未分组是虚拟状态，旧图没有 groupIds �
   });
   assert.deepEqual(store.groups.map((group) => group.id), ['people']);
   assert.deepEqual(store.agents.hanako.groupIds, ['people']);
-  assert.deepEqual(store.agents.hanako.favoriteGroupIds, ['people']);
+  // 旧版二值星标自动迁移成默认档权重，老数据力度不变。
+  assert.deepEqual(store.agents.hanako.groupWeights, { people: LEGACY_FAVORITE_WEIGHT });
   assert.deepEqual(getStickerGroupIds({ id: 'old' }, getKnownGroupIds(store)), []);
   assert.equal(UNGROUPED_GROUP_ID, '__ungrouped__');
   const stickers = [
@@ -165,7 +167,7 @@ test('伙伴分组白名单：未配置沿用全库，配置后默认保留未�
   const store = {
     groups: [{ id: 'role', name: '角色' }, { id: 'mood', name: '情绪' }],
     agents: {
-      limited: { configured: true, groupIds: ['role'], favoriteGroupIds: [], includeUngrouped: true },
+      limited: { configured: true, groupIds: ['role'], groupWeights: {}, includeUngrouped: true },
     },
   };
   const stickers = [
@@ -185,26 +187,60 @@ test('伙伴分组白名单：未配置沿用全库，配置后默认保留未�
   }));
 });
 
-test('分组偏爱只有小幅加分，不会让无匹配图片凭空进入候选', () => {
-  const store = { groups: [{ id: 'fav', name: '偏爱' }], agents: {
-    hanako: { configured: true, groupIds: ['fav'], favoriteGroupIds: ['fav'], includeUngrouped: true },
+test('分组权重：三档各自加权、多组命中取最重、无匹配图片不会被硬抬进候选', () => {
+  const store = { groups: [
+    { id: 'light', name: '轻' }, { id: 'fav', name: '偏爱' }, { id: 'main', name: '主推' },
+  ], agents: {
+    hanako: {
+      configured: true,
+      groupIds: ['light', 'fav', 'main'],
+      groupWeights: { light: 1, fav: 2, main: 3 },
+      includeUngrouped: true,
+    },
   } };
   const config = getAgentGroupConfig(store, 'hanako');
   const known = getKnownGroupIds(store);
-  assert.equal(getGroupPreferenceBonus({ groupIds: ['fav'] }, config, known), PREFERRED_GROUP_BONUS);
+  assert.deepEqual(config.groupWeights, { light: 1, fav: 2, main: 3 });
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['light'] }, config, known), GROUP_WEIGHT_BONUS[1]);
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['fav'] }, config, known), GROUP_WEIGHT_BONUS[2]);
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['main'] }, config, known), GROUP_WEIGHT_BONUS[3]);
   assert.equal(getGroupPreferenceBonus({ groupIds: [] }, config, known), 0);
   assert.equal(getGroupPreferenceBonus({ groupIds: ['missing'] }, config, known), 0);
+  // 一张图同时挂在多个加权分组上时取最重的一档，不叠加。
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['light', 'main'] }, config, known), GROUP_WEIGHT_BONUS[3]);
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['light', 'fav'] }, config, known), GROUP_WEIGHT_BONUS[2]);
+  assert.equal(getGroupPreferenceBonus({ groupIds: ['light'] }, config, known, { 1: 99 }), 99, '加权表可注入');
+
   const ranked = scoreStickers([
+    { id: 'main', description: '猫', tags: { emotion: ['开心'] }, groupIds: ['main'] },
     { id: 'fav', description: '猫', tags: { emotion: ['开心'] }, groupIds: ['fav'] },
+    { id: 'light', description: '猫', tags: { emotion: ['开心'] }, groupIds: ['light'] },
     { id: 'plain', description: '狗', tags: { emotion: ['开心'] } },
-    { id: 'irrelevant', description: '难过', tags: { emotion: ['难过'] }, groupIds: ['fav'] },
+    { id: 'irrelevant', description: '难过', tags: { emotion: ['难过'] }, groupIds: ['main'] },
   ], '开心', [], { preferred: [], vetoed: [], dislikes: {} }, null, config, known);
-  assert.deepEqual(ranked.map((item) => item.id), ['fav', 'plain']);
-  assert.equal(ranked[0]._score, 11);
+  assert.deepEqual(ranked.map((item) => item.id), ['main', 'fav', 'light', 'plain']);
+  assert.equal(ranked[0]._score - ranked[1]._score, GROUP_WEIGHT_BONUS[3] - GROUP_WEIGHT_BONUS[2]);
+  assert.equal(ranked[1]._score - ranked[2]._score, GROUP_WEIGHT_BONUS[2] - GROUP_WEIGHT_BONUS[1]);
   const preferredOnly = scoreStickers([
-    { id: 'fav', description: '猫', tags: { emotion: ['难过'] }, groupIds: ['fav'] },
-  ], '开心', [], { preferred: ['fav'], vetoed: [], dislikes: {} }, null, config, known);
-  assert.equal(preferredOnly[0]._score, 10, '全局偏爱本身不应再触发分组偏爱加分');
+    { id: 'main', description: '猫', tags: { emotion: ['难过'] }, groupIds: ['main'] },
+  ], '开心', [], { preferred: ['main'], vetoed: [], dislikes: {} }, null, config, known);
+  assert.equal(preferredOnly[0]._score, 10, '全局偏爱本身不应再触发分组权重加分');
+});
+
+test('旧版二值星标数据：读取时迁移成默认档权重，越界与未挂靠的权重不保留', () => {
+  const migrated = normalizeGroupStore({ groups: [{ id: 'fav', name: '偏爱' }], agents: {
+    hanako: { configured: true, groupIds: ['fav'], favoriteGroupIds: ['fav'] },
+  } });
+  assert.deepEqual(migrated.agents.hanako.groupWeights, { fav: LEGACY_FAVORITE_WEIGHT });
+  assert.equal(
+    getGroupPreferenceBonus({ groupIds: ['fav'] }, getAgentGroupConfig(migrated, 'hanako'), getKnownGroupIds(migrated)),
+    GROUP_WEIGHT_BONUS[LEGACY_FAVORITE_WEIGHT],
+  );
+  const clamped = normalizeGroupStore({
+    groups: [{ id: 'a', name: 'A' }, { id: 'b', name: 'B' }, { id: 'c', name: 'C' }],
+    agents: { hanako: { configured: true, groupIds: ['a', 'b'], groupWeights: { a: 99, b: 0, c: 3, missing: 2 } } },
+  });
+  assert.deepEqual(clamped.agents.hanako.groupWeights, { a: 3 }, '越界档位收敛到 3，未勾选或不存在的分组不保留权重');
 });
 
 test('图片分组支持统一设置和混合批量增删，空集合回到未分组', () => {
@@ -236,7 +272,7 @@ test('图片分组支持统一设置和混合批量增删，空集合回到未�
   assert.equal('groupIds' in tooMany[0], false, '超过上限时不应部分保存');
   const sixty = Array.from({ length: 60 }, (_, index) => ({ id: 'agent-group-' + index, name: '伙伴组' + index }));
   const wideStore = normalizeGroupStore({ groups: sixty, agents: {
-    wide: { configured: true, groupIds: sixty.map((group) => group.id), favoriteGroupIds: sixty.slice(0, 2).map((group) => group.id) },
+    wide: { configured: true, groupIds: sixty.map((group) => group.id), groupWeights: Object.fromEntries(sixty.slice(0, 2).map((group) => [group.id, 2])) },
   } });
   assert.equal(wideStore.agents.wide.groupIds.length, 60, '伙伴白名单不应复用单图 50 组上限');
   assert.equal(filterGroupStoreForExport(wideStore, { selectedGroupIds: sixty.map((group) => group.id) }).groups.length, 60, '导出筛选不应静默截断到 50 组');
@@ -245,13 +281,13 @@ test('图片分组支持统一设置和混合批量增删，空集合回到未�
 test('分组 ID 冲突时自动拆出新 ID，伙伴配置和图片关系可沿映射迁移', () => {
   const current = { groups: [{ id: 'same', name: '本机分组' }], agents: {} };
   const incoming = { groups: [{ id: 'same', name: '来源分组' }], agents: {
-    agent: { configured: true, groupIds: ['same'], favoriteGroupIds: ['same'], includeUngrouped: true },
+    agent: { configured: true, groupIds: ['same'], groupWeights: { same: 3 }, includeUngrouped: true },
   } };
   const merged = mergeGroupStores(current, incoming, { idFactory: () => 'imported' });
   assert.equal(merged.groupIdMap.get('same'), 'imported');
   assert.deepEqual(merged.store.groups.map((group) => group.id), ['same', 'imported']);
   assert.deepEqual(merged.store.agents.agent.groupIds, ['imported']);
-  assert.deepEqual(merged.store.agents.agent.favoriteGroupIds, ['imported']);
+  assert.deepEqual(merged.store.agents.agent.groupWeights, { imported: 3 });
   const full = { groups: Array.from({ length: MAX_GROUPS }, (_, index) => ({ id: 'existing' + index, name: '现有' + index })) };
   const overflow = mergeGroupStores(full, { groups: [{ id: 'new-group', name: '新分组' }] });
   assert.deepEqual(overflow.skippedGroupIds, ['new-group']);
@@ -260,7 +296,7 @@ test('分组 ID 冲突时自动拆出新 ID，伙伴配置和图片关系可沿�
 test('迁移重映射会同步改写分组 ID 和伙伴分组配置', () => {
   const incoming = normalizeGroupStore({
     groups: [{ id: 'same', name: '来源分组' }],
-    agents: { source: { configured: true, groupIds: ['same'], favoriteGroupIds: ['same'], includeUngrouped: true } },
+    agents: { source: { configured: true, groupIds: ['same'], groupWeights: { same: 2 }, includeUngrouped: true } },
   });
   const remapped = remapMigrationData({ stickerGroups: incoming }, {
     agentIdMap: new Map([['source', 'target']]),
@@ -268,7 +304,7 @@ test('迁移重映射会同步改写分组 ID 和伙伴分组配置', () => {
   });
   assert.equal(remapped.data.stickerGroups.groups[0].id, 'imported');
   assert.deepEqual(remapped.data.stickerGroups.agents.target.groupIds, ['imported']);
-  assert.deepEqual(remapped.data.stickerGroups.agents.target.favoriteGroupIds, ['imported']);
+  assert.deepEqual(remapped.data.stickerGroups.agents.target.groupWeights, { imported: 2 });
   const tooManyIncoming = normalizeMigrationPayload({
     version: 1,
     data: { stickerGroups: { groups: Array.from({ length: MAX_GROUPS + 1 }, (_, index) => ({ id: 'g' + index, name: 'G' + index })) } },
@@ -294,8 +330,8 @@ test('按多个分组导出取并集去重，并保留图片的全部分组关�
       version: 1,
       groups: [{ id: 'role', name: '角色' }, { id: 'mood', name: '情绪' }, { id: 'empty', name: '空组' }],
       agents: {
-        hanako: { configured: true, groupIds: ['role', 'mood'], favoriteGroupIds: ['role'], includeUngrouped: true },
-        other: { configured: true, groupIds: ['empty'], favoriteGroupIds: ['empty'], includeUngrouped: false },
+        hanako: { configured: true, groupIds: ['role', 'mood'], groupWeights: { role: 2 }, includeUngrouped: true },
+        other: { configured: true, groupIds: ['empty'], groupWeights: { empty: 2 }, includeUngrouped: false },
       },
     }));
     const plan = buildStickerExportPlan({
@@ -433,8 +469,9 @@ test('伙伴可用图库：一个开关控制不限 / 按分组挑', () => {
   assert.match(client, /list\.classList\.toggle\('is-locked', unlimited\)/);
   // 开关关掉时，一个都没勾过就默认全勾，不让她从空白开始
   assert.match(client, /if \(config\.groupIds\.length === 0 && config\.includeUngrouped !== true\) \{/);
-  // 不限图库时「优先」按钮置灰（本来就谁都能用，加权没意义）
-  assert.match(client, /\(enabled && !unlimited \? '' : ' disabled'\)/);
+  // 不限图库时「加权星星」置灰（本来就谁都能用，加权没意义）
+  assert.match(client, /renderGroupWeightStars\(group\.id, weight, enabled && !unlimited\)/);
+  assert.match(client, /\(enabled \? '' : ' disabled'\)/);
   // 移除伙伴入口改成看得懂的文字，不再是不知道怎么用的「⋯」
   assert.match(client, /class="agent-card-remove"[^>]*>移除</);
   assert.doesNotMatch(client, /class="agent-card-more"/, '⋯ 入口必须换掉');

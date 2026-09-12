@@ -48,7 +48,7 @@ test('分组 API 实链路：创建/重命名、图片归类、伙伴配置和�
     const concurrentMeta = JSON.parse(fs.readFileSync(path.join(dataDir, 'stickers.json'), 'utf8'));
     const grouped = await call('GET', '/api/groups');
     const agentSave = await call('POST', '/api/agent-groups', {
-      agents: { hanako: { configured: true, groupIds: [groupId], favoriteGroupIds: [groupId], includeUngrouped: false } },
+      agents: { hanako: { configured: true, groupIds: [groupId], groupWeights: { [groupId]: 3 }, includeUngrouped: false } },
     });
     const agentGet = await call('GET', '/api/agent-groups');
     const deleted = await call('POST', '/api/groups', { action: 'delete', groupId });
@@ -69,7 +69,7 @@ test('分组 API 实链路：创建/重命名、图片归类、伙伴配置和�
       ungroupedCount: grouped.data.data.ungroupedCount,
       agentSaved: agentSave.data.ok,
       agentConfigured: agentGet.data.data.agents.hanako.configured,
-      agentFavorite: agentGet.data.data.agents.hanako.favoriteGroupIds[0] === groupId,
+      agentWeight: agentGet.data.data.agents.hanako.groupWeights[groupId] === 3,
       deleted: deleted.data.ok,
       metaHasGroup: meta.some((item) => Array.isArray(item.groupIds) && item.groupIds.includes(groupId)),
       legacyClean: !Object.prototype.hasOwnProperty.call(meta[1], 'group_ids'),
@@ -106,7 +106,7 @@ test('分组 API 实链路：创建/重命名、图片归类、伙伴配置和�
     assert.equal(result.ungroupedCount, 1);
     assert.equal(result.agentSaved, true);
     assert.equal(result.agentConfigured, true);
-    assert.equal(result.agentFavorite, true);
+    assert.equal(result.agentWeight, true);
     assert.equal(result.deleted, true);
     assert.equal(result.metaHasGroup, false);
     assert.equal(result.legacyClean, true);

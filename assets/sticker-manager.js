@@ -818,7 +818,7 @@
       agents[id] = {
         configured: config.configured === true,
         groupIds: Array.isArray(config.groupIds) ? config.groupIds : [],
-        favoriteGroupIds: Array.isArray(config.favoriteGroupIds) ? config.favoriteGroupIds : [],
+        groupWeights: groupWeightPairs(config.groupWeights),
         includeUngrouped: config.includeUngrouped !== false,
       };
     });
@@ -3522,10 +3522,18 @@
     }
     if (config.includeUngrouped) parts.push('未分组图片');
     if (parts.length === 0) return '没有可用的图';
-    var favorites = Array.isArray(config.favoriteGroupIds) ? config.favoriteGroupIds.length : 0;
+    var weights = config.groupWeights && typeof config.groupWeights === 'object' ? config.groupWeights : {};
+    var weighted = 0;
+    var topWeight = 0;
+    Object.keys(weights).forEach(function (id) {
+      var w = Number(weights[id]) || 0;
+      if (w <= 0) return;
+      weighted += 1;
+      if (w > topWeight) topWeight = w;
+    });
     var text = parts.join('、');
     if (text.length > 22) text = parts.length + ' 项';
-    return favorites > 0 ? (text + ' · 优先 ' + favorites + ' 组') : text;
+    return weighted > 0 ? (text + ' · ' + weighted + ' 组加权' + (topWeight >= 3 ? '（有主推）' : '')) : text;
   }
 
   function renderAgentFreqRow(agent) {
@@ -3557,6 +3565,42 @@
     applyAgentFreqLock();
   }
 
+  // 分组权重（1~3 星）：key 为分组 id，值为档位；只有挂在已勾选分组上的才有效。
+  function pruneGroupWeights(weights, groupIds) {
+    var out = {};
+    var source = weights && typeof weights === 'object' ? weights : {};
+    Object.keys(source).forEach(function (id) {
+      var w = Math.round(Number(source[id]));
+      if (groupIds.indexOf(id) < 0 || !isFinite(w) || w <= 0) return;
+      out[id] = Math.min(w, 3);
+    });
+    return out;
+  }
+
+  // 指纹用：排序成数组，保证同样内容序列化结果稳定。
+  function groupWeightPairs(weights) {
+    var source = weights && typeof weights === 'object' ? weights : {};
+    return Object.keys(source).sort().map(function (id) { return [id, Math.min(Math.max(Math.round(Number(source[id])) || 0, 0), 3)]; });
+  }
+
+  var GROUP_WEIGHT_TEXT = { 1: '稍微偏一点', 2: '偏爱', 3: '主推' };
+
+  // 三颗星：点第 i 颗设为 i 星，再点同一颗取消。
+  function renderGroupWeightStars(groupId, weight, enabled) {
+    var html = '<span class="group-weight-stars' + (weight > 0 ? ' is-on' : '') + '" role="group" aria-label="分组权重">';
+    for (var i = 1; i <= 3; i++) {
+      var lit = i <= weight;
+      var tip = weight === i
+        ? '点击取消加权（当前 ' + i + ' 星：' + GROUP_WEIGHT_TEXT[i] + '）'
+        : '设为 ' + i + ' 星：' + GROUP_WEIGHT_TEXT[i] + '（只在已经勾上的分组里加权）';
+      html += '<button type="button" class="group-weight-star' + (lit ? ' is-lit' : '') + '"'
+        + ' data-lib-act="weight" data-group-id="' + escHtml(groupId) + '" data-weight="' + i + '"'
+        + (enabled ? '' : ' disabled') + ' title="' + tip + '" aria-label="' + i + ' 星">★</button>';
+    }
+    html += '</span>';
+    return html;
+  }
+
   function getLocalAgentGroupConfig(agentId) {
     var existing = groupData.agents && Object.prototype.hasOwnProperty.call(groupData.agents, agentId)
       ? groupData.agents[agentId]
@@ -3565,19 +3609,20 @@
       return {
         configured: existing.configured === true,
         groupIds: Array.isArray(existing.groupIds) ? existing.groupIds.slice() : [],
-        favoriteGroupIds: Array.isArray(existing.favoriteGroupIds) ? existing.favoriteGroupIds.slice() : [],
+        groupWeights: pruneGroupWeights(existing.groupWeights, Array.isArray(existing.groupIds) ? existing.groupIds : []),
         includeUngrouped: existing.includeUngrouped !== false,
       };
     }
-    return { configured: false, groupIds: [], favoriteGroupIds: [], includeUngrouped: true };
+    return { configured: false, groupIds: [], groupWeights: {}, includeUngrouped: true };
   }
 
   function saveLocalAgentGroupConfig(agentId, config) {
     if (!groupData.agents || typeof groupData.agents !== 'object') groupData.agents = {};
+    var groupIds = Array.from(new Set((config.groupIds || []).filter(Boolean)));
     groupData.agents[agentId] = {
       configured: config.configured === true,
-      groupIds: Array.from(new Set((config.groupIds || []).filter(Boolean))),
-      favoriteGroupIds: Array.from(new Set((config.favoriteGroupIds || []).filter(function (id) { return (config.groupIds || []).indexOf(id) >= 0; }))),
+      groupIds: groupIds,
+      groupWeights: pruneGroupWeights(config.groupWeights, groupIds),
       includeUngrouped: config.includeUngrouped !== false,
     };
   }
@@ -3803,11 +3848,12 @@
     var html = '<div class="group-check is-ungrouped"><input type="checkbox" data-lib-act="ungrouped"' + (config.includeUngrouped ? ' checked' : '') + (unlimited ? ' disabled' : '') + '><span>未分组图片</span></div>';
     groups.forEach(function (group) {
       var enabled = config.groupIds.indexOf(group.id) >= 0;
-      var favorite = config.favoriteGroupIds.indexOf(group.id) >= 0;
-      html += '<div class="group-check' + (favorite ? ' is-favorite' : '') + '">'
+      var weight = Math.round(Number(config.groupWeights && config.groupWeights[group.id])) || 0;
+      if (weight < 0) weight = 0;
+      html += '<div class="group-check' + (weight > 0 ? ' is-favorite' : '') + '">'
         + '<input type="checkbox" data-lib-act="group" data-group-id="' + escHtml(group.id) + '"' + (enabled ? ' checked' : '') + (unlimited ? ' disabled' : '') + '>'
         + '<span title="' + escHtml(group.name) + '">' + escHtml(group.name) + '</span>'
-        + '<button type="button" class="group-favorite-btn' + (favorite ? ' is-on' : '') + '" data-lib-act="favorite" data-group-id="' + escHtml(group.id) + '"' + (enabled && !unlimited ? '' : ' disabled') + ' title="' + (favorite ? '取消优先' : '让这个分组的图更容易被 ta 选中（只在已经勾上的分组里加权）') + '">优先</button>'
+        + renderGroupWeightStars(group.id, weight, enabled && !unlimited)
         + '</div>';
     });
     if (groups.length === 0) {
@@ -3865,12 +3911,16 @@
           var gid = control.getAttribute('data-group-id');
           config.groupIds = config.groupIds.filter(function (id) { return id !== gid; });
           if (control.checked && gid) config.groupIds.push(gid);
-          config.favoriteGroupIds = config.favoriteGroupIds.filter(function (id) { return config.groupIds.indexOf(id) >= 0; });
-        } else if (action === 'favorite') {
+          config.groupWeights = pruneGroupWeights(config.groupWeights, config.groupIds);
+        } else if (action === 'weight') {
           event.preventDefault();
-          var favId = control.getAttribute('data-group-id');
-          if (config.favoriteGroupIds.indexOf(favId) >= 0) config.favoriteGroupIds = config.favoriteGroupIds.filter(function (id) { return id !== favId; });
-          else if (config.groupIds.indexOf(favId) >= 0) config.favoriteGroupIds.push(favId);
+          var wId = control.getAttribute('data-group-id');
+          var targetWeight = parseInt(control.getAttribute('data-weight'), 10);
+          if (!wId || !targetWeight || config.groupIds.indexOf(wId) < 0) return;
+          if (!config.groupWeights || typeof config.groupWeights !== 'object') config.groupWeights = {};
+          var currentWeight = Math.round(Number(config.groupWeights[wId])) || 0;
+          if (currentWeight === targetWeight) delete config.groupWeights[wId];
+          else config.groupWeights[wId] = targetWeight;
         } else return;
         saveLocalAgentGroupConfig(editingLibraryAgentId, config);
         renderAgentLibraryList();

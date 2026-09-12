@@ -425,7 +425,7 @@ test('exportStickerArchive：includeDataKeys 控制 v1 轻量包与按组过滤�
     await fsp.writeFile(path.join(dataDir, 'sticker-groups.json'), JSON.stringify({
       version: 1,
       groups: [{ id: 'mood', name: '情绪' }],
-      agents: { a1: { configured: true, groupIds: ['mood'], favoriteGroupIds: ['mood'], includeUngrouped: true } },
+      agents: { a1: { configured: true, groupIds: ['mood'], groupWeights: { mood: 2 }, includeUngrouped: true } },
     }));
     await fsp.writeFile(path.join(dataDir, 'dialect-config.json'), JSON.stringify({ version: 3, agents: { 'a1': { dialect: 'sichuan', enabled: true } } }));
     await fsp.writeFile(path.join(dataDir, 'agent-freq.json'), JSON.stringify({ version: 2, global_enabled: true, default_daily: 50, default_task: 20, agents: {} }));

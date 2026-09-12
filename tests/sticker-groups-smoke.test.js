@@ -47,7 +47,7 @@ test('分组真实烟测：伙伴选图白名单、分组导出/导入、全量�
     const groupId = created.data.group.id;
     const membership = await call('POST', '/api/groups/membership', { stickerIds: ['a'], addGroupIds: [groupId] });
     const agentSave = await call('POST', '/api/agent-groups', {
-      agents: { hanako: { configured: true, groupIds: [groupId], favoriteGroupIds: [groupId], includeUngrouped: false } },
+      agents: { hanako: { configured: true, groupIds: [groupId], groupWeights: { [groupId]: 3 }, includeUngrouped: false } },
     });
     const smart = await call('POST', '/api/smart-pick', { context: '请选一张开心图', agentId: 'hanako' });
     const exported = await call('POST', '/api', {
@@ -64,11 +64,11 @@ test('分组真实烟测：伙伴选图白名单、分组导出/导入、全量�
     const restored = await call('GET', '/api/groups');
 
     const replaced = await call('POST', '/api/agent-groups', {
-      agents: { other: { configured: true, groupIds: [groupId], favoriteGroupIds: [], includeUngrouped: false } },
+      agents: { other: { configured: true, groupIds: [groupId], groupWeights: {}, includeUngrouped: false } },
     });
     const afterReplace = await call('GET', '/api/agent-groups');
     const restoredAgent = await call('POST', '/api/agent-groups', {
-      agents: { hanako: { configured: true, groupIds: [groupId], favoriteGroupIds: [groupId], includeUngrouped: false } },
+      agents: { hanako: { configured: true, groupIds: [groupId], groupWeights: { [groupId]: 2 }, includeUngrouped: false } },
     });
     fs.writeFileSync(path.join(dataDir, 'agent-freq.json'), JSON.stringify({ version: 2, global_enabled: false, agents: {} }));
     const blockedSave = await call('POST', '/api/agent-groups', { agents: {} });

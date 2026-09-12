@@ -31,7 +31,7 @@ test('四条选图工具链实际遵守伙伴分组白名单与安全图片读�
         { id: 'blocked-group', name: '禁止' },
       ],
       agents: {
-        limited: { configured: true, groupIds: ['allowed-group'], favoriteGroupIds: [], includeUngrouped: false },
+        limited: { configured: true, groupIds: ['allowed-group'], groupWeights: {}, includeUngrouped: false },
       },
     }));
     fs.writeFileSync(path.join(dataDir, 'agent-freq.json'), JSON.stringify({
