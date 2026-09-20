@@ -51,7 +51,7 @@
 
 ## 干净安装包范围
 
-安装包只放插件本体和运行所需的源码，共 64 个条目：
+安装包只放插件本体和运行所需的源码，当前 68 个条目（v0.34.44 口径；随新增文件变化，打包后以实际清单为准）：
 
 - `manifest.json`、`package.json`、`index.js`
 - `lib/`、`routes/`、`tools/`、`extensions/`、`assets/`、`python/`、`skills/`、`scripts/`
