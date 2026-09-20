@@ -12,7 +12,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import { resumeBatchTasks } from './routes/_batch-tasks.js';
-import { backfillTaggedAt, ensureDataDir } from './lib/shared.js';
+import { backfillTaggedAt, ensureDataDir, DATA_DIR } from './lib/shared.js';
 import { stopBall } from './lib/ball.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -128,6 +128,16 @@ export async function onload(ctx = {}) {
   }
 
   ctx.log?.info?.('[biaoqingbao] onload 完成');
+
+  // v0.34.40 — 对外索引：给别的消费者读的公开快照（图库 / 分组白名单 / 偏好 / 最近发送）。
+  // 启动时重建一份，之后的变动由 public-index-touch 去抖刷新。失败不影响插件本身。
+  try {
+    const { writePublicIndex } = await import('./lib/public-index.js');
+    const index = writePublicIndex({ dataDir: DATA_DIR, agentIds });
+    ctx.log?.info?.(`[biaoqingbao] 对外索引已重建：${index.stickerCount} 张图 / ${Object.keys(index.partners).length} 个伙伴`);
+  } catch (e) {
+    ctx.log?.warn?.('[biaoqingbao] 对外索引重建失败:', e?.message || e);
+  }
 }
 
 export async function onunload(ctx = {}) {
