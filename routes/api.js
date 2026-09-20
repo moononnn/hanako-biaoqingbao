@@ -12,7 +12,7 @@ import {
   readMeta, writeMeta, enqueueStickerDataWrite,
   readVisionConfig, writeVisionConfig, getProviderApiConfig,
   getAvailableVisionModels, getAvailableTextModels,
-  tagImage,
+  callCodexVision, tagImage,
   readEmbeddingConfig, writeEmbeddingConfig, resolveEmbeddingApi,
   generateEmbeddings, readVectors, writeVectors,
   readTextConfig, writeTextConfig,
@@ -102,6 +102,7 @@ import {
 } from '../lib/batch-apply.js';
 import { registerBatchTasksRoutes } from './_batch-tasks.js';
 import { safeStickerPath } from '../lib/ball-core.js';
+import { isCodexVisionProvider } from '../lib/vision-codex.js';
 import { applyPreferenceFeedback, mutatePreferences } from '../lib/feedback.js';
 import { removeStickerExposure } from '../lib/exposure.js';
 import { removeStickerContextFeedback, readContextFeedback, removeContextFitEntry, applyContextFit } from '../lib/context-feedback.js';
@@ -1484,6 +1485,17 @@ export default async function registerRoutes(app, ctx) {
       } else {
         return json({ ok: false, error: '未选择模型' });
       }
+      // Codex OAuth 没有传统 API Key，交给 Hana 凭据接口和 Responses 适配层。
+      if (body.source !== 'custom' && isCodexVisionProvider(body.providerId)) {
+        const testImg = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==';
+        const reply = await callCodexVision(ctx, {
+          source: 'hana', providerId: body.providerId, modelId: body.modelId,
+        }, [{ role: 'user', content: [
+          { type: 'text', text: '这是什么颜色？一个词回答。' },
+          { type: 'image_url', image_url: { url: testImg } },
+        ] }], 50, 30000);
+        return json({ ok: true, data: { reply: reply.substring(0, 100) } });
+      }
       if (!baseUrl || !apiKey || !model) {
         return json({ ok: false, error: '配置不完整，请填写所有字段' });
       }
@@ -1521,7 +1533,7 @@ export default async function registerRoutes(app, ctx) {
       const { imageBase64, fileName } = await c.req.json();
       if (!imageBase64) return json({ ok: false, error: '缺少图片数据' });
       const context = recognitionContext();
-      const result = await tagImage(imageBase64, fileName, { recognitionHints: context.recognitionHints });
+      const result = await tagImage(imageBase64, fileName, { recognitionHints: context.recognitionHints, ctx });
       attachRecognitionGroupSuggestions(result, context.store);
       if (!result.ok) ctx?.log?.warn?.('[biaoqingbao] 单图识图失败:', result.error);
       return json(result);
@@ -1547,7 +1559,7 @@ export default async function registerRoutes(app, ctx) {
       if (!filePath || !fs.existsSync(filePath)) return json({ ok: false, error: '图片文件不存在或路径不安全' }, 404);
       const buf = fs.readFileSync(filePath);
       const context = recognitionContext();
-      const result = await tagImage(buf.toString('base64'), sticker.file, { recognitionHints: context.recognitionHints });
+      const result = await tagImage(buf.toString('base64'), sticker.file, { recognitionHints: context.recognitionHints, ctx });
       attachRecognitionGroupSuggestions(result, context.store);
       if (!result.ok) {
         ctx?.log?.warn?.('[biaoqingbao] 单张识图失败:', result.error);

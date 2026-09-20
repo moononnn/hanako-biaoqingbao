@@ -260,7 +260,7 @@ async function workerLoop(taskId, workerIdx) {
       // 每张图开始识别前重读分组，让重命名/别名设置能自然进入后续任务。
       const groupStore = readGroupStore();
       const recognitionHints = isGroupStoreReadable(groupStore) ? buildRecognitionGroupHints(groupStore) : '';
-      const tagResult = await tagImage(buf.toString('base64'), sticker.file, { recognitionHints });
+      const tagResult = await tagImage(buf.toString('base64'), sticker.file, { recognitionHints, ctx: moduleCtx });
       if (tagResult.ok) {
         result = { ok: true, data: tagResult.data };
         result.data.group_suggestions = suggestGroupsForTags(result.data, groupStore);
