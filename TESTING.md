@@ -8,14 +8,17 @@
 npm test
 ```
 
-当前覆盖（376 项 Node 测试、78 项 Python 测试，2026-09-12）：
+当前覆盖（388 项 Node 测试、78 项 Python 测试，2026-09-20）：
 
-本轮新增（v0.34.38 → v0.34.39）：
+本轮新增（v0.34.40 → v0.34.44）：
 
-- Node：伙伴分组权重三档：三档加权值映射、加权表可注入、一张图命中多个加权分组时取最重不叠加、无匹配候选不会因权重进榜、全局偏爱不触发分组加权、旧版二值星标迁移成默认档、越界权重收敛与未挂靠权重不保留、分组合并/重映射/按组导出同步搬运权重（`tests/sticker-groups.test.js`、`tests/sticker-groups-smoke.test.js`、`tests/sticker-transfer.test.js`）。
-- Node：测试入口假绿灯回归：`scripts/run-tests.mjs` 缺测试文件时非零退出、以自身位置锚定仓库根、从任意目录调用结果一致。
+- Node：对外索引（`tests/public-index.test.js` 9 项）：摊平图库只带消费方需要的事实（`file` 带 `stickers/` 前缀）、配过白名单的伙伴只拿到组内图、未配白名单拿全集、否掉的图从偏心里剔除、偏好跨多条 mapping 合并且不在可用集合里的偏爱被剔除、最近发送跨会话合并去重按时间倒序、伙伴清单取三处数据并集加上显式传入的 `agentIds`、坏数据退化成空结构、`writePublicIndex` 落盘到 `dataDir/public-index.json`。
+- Node：Codex 视觉适配（`tests/vision-codex.test.js` 3 项）：Codex provider 走 Responses 端点并使用 OpenAI 的 input image 结构、SSE 解析只留可见正文并忽略 reasoning 事件、OAuth 请求缺字段时明确报错。
 
 历史轮次覆盖：
+
+- Node：伙伴分组权重三档（v0.34.39）：三档加权值映射、加权表可注入、一张图命中多个加权分组时取最重不叠加、无匹配候选不会因权重进榜、全局偏爱不触发分组加权、旧版二值星标迁移成默认档、越界权重收敛与未挂靠权重不保留、分组合并/重映射/按组导出同步搬运权重（`tests/sticker-groups.test.js`、`tests/sticker-groups-smoke.test.js`、`tests/sticker-transfer.test.js`）。
+- Node：测试入口假绿灯回归（v0.34.39）：`scripts/run-tests.mjs` 缺测试文件时非零退出、以自身位置锚定仓库根、从任意目录调用结果一致。
 
 - Node：伙伴隐藏名单（v0.34.33）：`lib/hidden-agents.js` 纯函数与只读 IO（去重去空、坏数据当空、读写往返、幂等隐藏/恢复、空 id 不动名单、列表过滤，6 项）。
 - Node：可用图库弹窗（v0.34.32）：断言左右两栏模式切换已移除、顶部「全部图库」开关存在、开关状态驱动列表置灰、「优先」在不限图库时置灰、关掉开关时空勾选默认全勾、移除入口是可读文字（1 项）。
@@ -88,6 +91,7 @@ python -m unittest test_ball_app.py -v
   - 任务恢复显示（v0.33.83）：最新任务状态优先、失败原因持久显示、待保存草稿不被旧任务冒充；`GET /api/style-template` 保留 `confirmed` 并通过隔离子进程实链路验证
   - 选定文本模型调用（v0.33.84）：Hana 配置的 provider/model 不再静默落到全局 utility；DeepSeek Responses 使用 `reasoning.effort=none`，Chat Completions 使用 `thinking.disabled`；正文提取隔离 reasoning、完整/混搭/未闭合隐藏块清洗、空正文统一错误与超时/接口路径回归
   - 合并终检重试（v0.33.98）：重试切换为独立校对提示，携带上一版草稿和机器标记词做最小改写；同时拦截编辑角色泄漏、模型自行换算的具体次数/百分比、未成对中文引号，并允许整数百分比的显示舍入误差
+- 识图模型协议：Codex Responses 请求转换、OAuth 账号标识校验、SSE 正文解析与思考事件隔离
 - 识图 prompt：知名角色/梗图/系列报名字规则（虹夏/月薪喵/熊猫头/猫meme）、防幻觉特征核对、易混淆对照表拼接（爱音 vs 波奇）
 - 教学样本（用户教一次、以后识别更准）：向量匹配阈值、命名去重合并（含描述名字候选提取）、样本上限淘汰最旧、upsert 覆盖更新、embedding 失败静默跳过、删除样本；教学名单注入（最近 30 条按时间排序、名字+特征分离、无样本不注入）
 - 数据迁移与恢复（v0.26.1）：新位置已有数据不动、插件目录旧位置复制、安装备份最新优先恢复、无效备份跳过、恢复后幂等
