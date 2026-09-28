@@ -60,6 +60,28 @@ test('buildTextEndpoint：三种已支持接口不重复拼接路径', () => {
   assert.equal(buildTextEndpoint('https://a.test/v1', 'anthropic-messages'), 'https://a.test/v1/messages');
 });
 
+test('Codex Responses 内容模型使用 OAuth 凭据、系统指令和流式文本请求', () => {
+  const request = buildTextRequest({
+    providerId: 'openai-codex',
+    modelId: 'gpt-6-luna',
+    api: 'openai-codex-responses',
+    baseUrl: 'https://chatgpt.com/backend-api',
+    apiKey: 'oauth-token',
+    accountId: 'account-1',
+    headers: {},
+  }, messages, { maxTokens: 100 });
+
+  assert.equal(request.url, 'https://chatgpt.com/backend-api/codex/responses');
+  assert.equal(request.headers['chatgpt-account-id'], 'account-1');
+  assert.equal(request.headers.Authorization, 'Bearer oauth-token');
+  assert.equal(request.body.model, 'gpt-6-luna');
+  assert.equal(request.body.instructions, '只输出一句话。');
+  assert.equal(request.body.input[0].role, 'user');
+  assert.equal(request.body.input[0].content[0].text, '你好');
+  assert.equal(request.body.stream, true);
+  assert.equal('max_output_tokens' in request.body, false);
+});
+
 test('Responses 输出只取正文，不把 reasoning 混进模板', () => {
   const payload = {
     output: [
@@ -109,6 +131,53 @@ test('callConfiguredTextModel：真正请求插件选定模型，并显式关闭
     assert.equal(captured.url, 'https://model.test/responses');
     assert.deepEqual(captured.body.reasoning, { effort: 'none' });
     assert.equal(captured.body.max_output_tokens, 600);
+  } finally {
+    globalThis.fetch = oldFetch;
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('callConfiguredTextModel：Codex 内容模型走 OAuth Responses SSE，不误走 Chat Completions', async () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'biaoqingbao-codex-text-'));
+  const modelsPath = path.join(tempDir, 'models.json');
+  fs.writeFileSync(modelsPath, JSON.stringify({ providers: {
+    'openai-codex': {
+      api: 'openai-codex-responses',
+      models: [{ id: 'gpt-6-luna', input: ['text'] }],
+    },
+  } }));
+
+  const oldFetch = globalThis.fetch;
+  let captured;
+  let requestedProvider;
+  globalThis.fetch = async (url, init) => {
+    captured = { url, init, body: JSON.parse(init.body) };
+    return new Response([
+      'data: {"type":"response.output_text.delta","delta":"内容"}',
+      '',
+      'data: {"type":"response.output_text.delta","delta":"模型适配成功"}',
+      '',
+      'data: [DONE]',
+      '',
+    ].join('\n'), { status: 200 });
+  };
+  try {
+    const result = await callConfiguredTextModel(
+      { bus: { request: async (_topic, payload) => {
+        requestedProvider = payload.providerId;
+        return { baseUrl: 'https://chatgpt.com/backend-api', apiKey: 'oauth-token', accountId: 'account-1' };
+      } } },
+      { providerId: 'openai-codex', modelId: 'gpt-6-luna' },
+      messages,
+      { modelsPath, timeoutMs: 1000 },
+    );
+    assert.equal(result.ok, true);
+    assert.equal(result.data, '内容模型适配成功');
+    assert.equal(requestedProvider, 'openai-codex-oauth');
+    assert.equal(captured.url, 'https://chatgpt.com/backend-api/codex/responses');
+    assert.equal(captured.body.stream, true);
+    assert.equal(captured.body.instructions, '只输出一句话。');
+    assert.equal(captured.init.headers['chatgpt-account-id'], 'account-1');
   } finally {
     globalThis.fetch = oldFetch;
     fs.rmSync(tempDir, { recursive: true, force: true });
