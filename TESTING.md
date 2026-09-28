@@ -8,9 +8,30 @@
 npm test
 ```
 
-当前覆盖（388 项 Node 测试、78 项 Python 测试，2026-09-20）：
+当前覆盖（422 项 Node 测试、78 项 Python 测试；2026-09-28 两套测试均已实跑）：
 
-本轮新增（v0.34.40 → v0.34.44）：
+本轮新增（v0.34.53 → v0.34.55）：
+
+- Node：Jev 旁路观测接入真实决策现场，正样本必采、负样本抽样，记录实际决定、情绪细节、会话锚点与分析耗时；内容分析支持 Hana GPT/Codex OAuth Responses SSE。（`tests/jev-shadow.test.js`、`tests/text-model.test.js`）
+- Node：茶话会来源表情包记录可独立读取与编辑；情境关键词、表达姿态、强度及语义描述参与搜图/自动配图评分。（`tests/chahuahui-usage.test.js`、`tests/chahuahui-editor.test.js`、`tests/keyword-scoring.test.js`）
+
+- Node：情境/语气/强度只在明确匹配时加权，缺失字段不误惩罚；搜图与 express 共用基础情境评分，硬否决图不进入向量候选；前三名按分数加权抽样，兼顾变化与排序（`tests/keyword-scoring.test.js`、`tests/sticker-groups-tools.test.js`、`tests/critical-logic.test.js`）。
+- 命令：`node --check tools/express.js`、`node --check tools/search-stickers.js`、`node --check extensions/observer.js`、`npm test`。自动测试不覆盖当前 Hana 中的模型实际输出和最终发图手感，需重启 Hana 后实机观察。
+
+此前新增（v0.34.50）：
+
+- Node：Jev 旁路与正式分析链隔离、摘要日志不落完整 state、默认关闭与每日调用上限、observer 传递伙伴标识（`tests/jev-shadow.test.js` 4 项）。
+
+上一轮新增（v0.34.49）：
+
+- Node：Jev 专用 API 的端点拼接、结构化请求校验和“只提供接口、不接管现有自动配图”契约（`tests/jev.test.js` 4 项）；Key 配置默认独立保存，Windows 使用系统加密。
+
+上一轮新增（v0.34.46）：
+
+- Node：茶话会来源账本读取与汇总（`tests/chahuahui-usage.test.js` 2 项）：可选读取、坏数据静默降级、按图片去重并保留最近时间与发送次数；时间字段校验与页面语法检查通过。
+- UI：无配图决策日志时也先绑定偏好页事件，确保茶话会记录仍能进入「和小花聊聊」。
+
+上一轮（v0.34.40 → v0.34.44）：
 
 - Node：对外索引（`tests/public-index.test.js` 9 项）：摊平图库只带消费方需要的事实（`file` 带 `stickers/` 前缀）、配过白名单的伙伴只拿到组内图、未配白名单拿全集、否掉的图从偏心里剔除、偏好跨多条 mapping 合并且不在可用集合里的偏爱被剔除、最近发送跨会话合并去重按时间倒序、伙伴清单取三处数据并集加上显式传入的 `agentIds`、坏数据退化成空结构、`writePublicIndex` 落盘到 `dataDir/public-index.json`。
 - Node：Codex 视觉适配（`tests/vision-codex.test.js` 3 项）：Codex provider 走 Responses 端点并使用 OpenAI 的 input image 结构、SSE 解析只留可见正文并忽略 reasoning 事件、OAuth 请求缺字段时明确报错。
@@ -89,7 +110,7 @@ python -m unittest test_ball_app.py -v
   - 存储：profile 默认空值/写入回读/归一化去重；feedback 读写/超限截断尾保；mergeDiffIntoFeedback 删→反例增→锁定、去重、源标记
   - API 接线：/api/style-profile 画像+反馈查询、confirm 时 diff 沉淀（首版确认不误沉淀）
   - 任务恢复显示（v0.33.83）：最新任务状态优先、失败原因持久显示、待保存草稿不被旧任务冒充；`GET /api/style-template` 保留 `confirmed` 并通过隔离子进程实链路验证
-  - 选定文本模型调用（v0.33.84）：Hana 配置的 provider/model 不再静默落到全局 utility；DeepSeek Responses 使用 `reasoning.effort=none`，Chat Completions 使用 `thinking.disabled`；正文提取隔离 reasoning、完整/混搭/未闭合隐藏块清洗、空正文统一错误与超时/接口路径回归
+  - 选定文本模型调用（v0.33.84、v0.34.55）：Hana 配置的 provider/model 不再静默落到全局 utility；DeepSeek Responses 使用 `reasoning.effort=none`，Chat Completions 使用 `thinking.disabled`；Codex OAuth Responses 复用账号凭据并解析 SSE 正文；正文提取隔离 reasoning、完整/混搭/未闭合隐藏块清洗、空正文统一错误与超时/接口路径回归
   - 合并终检重试（v0.33.98）：重试切换为独立校对提示，携带上一版草稿和机器标记词做最小改写；同时拦截编辑角色泄漏、模型自行换算的具体次数/百分比、未成对中文引号，并允许整数百分比的显示舍入误差
 - 识图模型协议：Codex Responses 请求转换、OAuth 账号标识校验、SSE 正文解析与思考事件隔离
 - 识图 prompt：知名角色/梗图/系列报名字规则（虹夏/月薪喵/熊猫头/猫meme）、防幻觉特征核对、易混淆对照表拼接（爱音 vs 波奇）
