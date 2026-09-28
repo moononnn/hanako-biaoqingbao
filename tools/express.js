@@ -15,8 +15,9 @@ import {
   readEmbeddingConfig, resolveEmbeddingApi, generateEmbeddings,
   cosineSimilarity, readVectors, readAgentFreq, isAutoImageEnabled, getAgentFreqSettings,
   markAgentStickerCooldown, resolveAgentId, collectPrefsForEmotion, atomicWriteJson, prefsScoreBonus,
+  sanitizeTag,
 } from '../lib/shared.js';
-import { resolveEmotionFactor } from '../lib/emotion-groups.js';
+import { TAG_TO_GROUP, resolveEmotionFactor } from '../lib/emotion-groups.js';
 import { getAgentExpressionBias } from '../lib/dialect.js';
 import { fitDecision } from '../lib/smart-fit.js';
 import { imageSizeFromBuffer } from '../lib/image-size.js';
@@ -84,7 +85,7 @@ export function applyVectorBonus(scored, allStickers, emotionVec, vectorMap, exc
   // 补充纯向量命中（标签没匹配但语义相近的）
   const scoredIds = new Set(scored.map(s => s.id));
   for (const sticker of allStickers) {
-    if (scoredIds.has(sticker.id) || excludeIds.includes(sticker.id)) continue;
+    if (scoredIds.has(sticker.id) || excludeIds.includes(sticker.id) || prefs?.vetoed?.includes(sticker.id)) continue;
     const vec = vectorMap[sticker.id];
     if (vec) {
       const sim = cosineSimilarity(emotionVec, vec);
@@ -423,37 +424,65 @@ async function logDecision(emotion, stickerId, ctx, metadata = {}) {
 // 纯标签匹配打分（不调模型）
 // v0.27.0：新增 bias 参数（方言表情气质权重），情绪贡献分乘方言系数 + 加强度偏移；
 // 只影响情绪匹配分，prefs 偏好惩罚在系数之外照常生效。bias=null 时与原逻辑完全一致。
-export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null, groupConfig = null, knownGroupIds = null) {
-  const emoLower = (emotion || '').toLowerCase();
+// v0.34.51 - 关键词通道权重与封顶（值来自实测扫描，脚本见工作台 biaoqingbao-context-experiment）
+// 为什么需要这一组数：库里 keywords 是最富的字段（337 张图 / 334 张有 / 平均 9 个），
+// 但自动路径过去完全不查它。对照实测：emotion 标签精确 +8，向量通道 cosine×10（典型 3~9 分），
+// 关键词若只给 +5，加进去等于没加（五档结果一个都没变）。
+// 为什么单字只精确匹配：单字近似会把「困」命中「困惑」、「累」命中「累赘」这类不相关标签。
+// 为什么封顶 40：多条关键词同时命中时不能把情绪整个压掉（玩笑聊加班 ≠ 当下真想发加班怨气图）。
+// v0.34.52 - 语义描述也纳入情境匹配
+// semantic_description（30-50 字的「适合在什么场景发」）本来只拿去算向量，但里面写着的
+// 「等待消息」「回复慢」「加班」这类词正好是话题词。让它也参与关键词命中，现有图库不用重识就能白捡一层情境信息。
+// 权重低于短描述（长文本里出现一个词比短标签里出现更容易，误命中概率高）。
+const KEYWORD_WEIGHT = { exact: 20, partial: 6, description: 5, semantic: 4, cap: 40 };
+
+export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null, groupConfig = null, knownGroupIds = null, keywords = [], query = {}) {
+  const emotions = (Array.isArray(emotion) ? emotion : [emotion]).filter(Boolean);
+  const kwList = Array.isArray(keywords) ? keywords.filter(Boolean) : [];
+  const scenes = Array.isArray(query.scene) ? query.scene : (query.scene ? [query.scene] : []);
   return stickers
-    .filter(s => !excludeIds.includes(s.id))
+    .filter(s => !excludeIds.includes(s.id) && !prefs?.vetoed?.includes(s.id))
     .map(sticker => {
       let emotionScore = 0;
       const emotionHitTags = [];
       const tags = sticker.tags || {};
 
-      // 情绪词匹配 emotion 标签
-      for (const tag of (tags.emotion || [])) {
-        const tagLower = tag.toLowerCase();
-        if (tag === emotion) { emotionScore += 8; emotionHitTags.push(tag); }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 5; emotionHitTags.push(tag); }
-        else if (tagLower.includes(emoLower) || emoLower.includes(tagLower)) { emotionScore += 3; emotionHitTags.push(tag); }
+      for (const em of emotions) {
+        const emoLower = em.toLowerCase();
+        for (const tag of (tags.emotion || [])) {
+          const tagLower = tag.toLowerCase();
+          if (tag === em) { emotionScore += 8; emotionHitTags.push(tag); }
+          else if (tag.includes(em) || em.includes(tag)) { emotionScore += 5; emotionHitTags.push(tag); }
+          else if (tagLower.includes(emoLower) || emoLower.includes(tagLower)) { emotionScore += 3; emotionHitTags.push(tag); }
+          else if (TAG_TO_GROUP[em]?.some(g => TAG_TO_GROUP[tag]?.includes(g))) { emotionScore += 2; emotionHitTags.push(tag); }
+        }
+        for (const tag of (tags.scene || [])) {
+          if (tag === em) { emotionScore += 5; emotionHitTags.push(tag); }
+          else if (tag.includes(em) || em.includes(tag)) { emotionScore += 3; emotionHitTags.push(tag); }
+        }
+        for (const tag of (tags.keywords || [])) {
+          if (tag === em) { emotionScore += 4; emotionHitTags.push(tag); }
+          else if (tag.includes(em) || em.includes(tag)) { emotionScore += 2; emotionHitTags.push(tag); }
+        }
+        if (sticker.description && sticker.description.includes(em)) emotionScore += 3;
       }
 
-      // 情绪词匹配 scene 标签
-      for (const tag of (tags.scene || [])) {
-        if (tag === emotion) { emotionScore += 5; emotionHitTags.push(tag); }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 3; emotionHitTags.push(tag); }
+      // v0.34.51 - 关键词（情境）通道：只在调用方显式传 keywords 时参与，不传则与旧行为完全一致
+      let keywordScore = 0;
+      if (kwList.length > 0) {
+        for (const kw of kwList) {
+          const singleChar = kw.length <= 1;
+          for (const tag of (tags.keywords || [])) {
+            if (tag === kw) { keywordScore += KEYWORD_WEIGHT.exact; }
+            else if (!singleChar && (tag.includes(kw) || kw.includes(tag))) { keywordScore += KEYWORD_WEIGHT.partial; }
+          }
+          if (!singleChar) {
+            if (sticker.description && sticker.description.includes(kw)) { keywordScore += KEYWORD_WEIGHT.description; }
+            if (sticker.semantic_description && sticker.semantic_description.includes(kw)) { keywordScore += KEYWORD_WEIGHT.semantic; }
+          }
+        }
+        keywordScore = Math.min(KEYWORD_WEIGHT.cap, keywordScore);
       }
-
-      // 情绪词匹配 keywords 标签
-      for (const tag of (tags.keywords || [])) {
-        if (tag === emotion) { emotionScore += 4; emotionHitTags.push(tag); }
-        else if (tag.includes(emotion) || emotion.includes(tag)) { emotionScore += 2; emotionHitTags.push(tag); }
-      }
-
-      // 情绪词匹配 description
-      if (sticker.description && sticker.description.includes(emotion)) { emotionScore += 3; }
 
       // v0.27.0 方言×表情包联动：有情绪命中才参与（关键词/场景独立查询不受干扰）
       if (emotionScore > 0 && bias) {
@@ -465,9 +494,28 @@ export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null,
       }
 
       // v0.25.0 - 偏好加权统一走 prefsScoreBonus（preferred +10 / vetoed -20 / 不喜欢次数 -10×count）
-      const baseScore = emotionScore + prefsScoreBonus(sticker.id, prefs);
-      // 分组偏爱只给已有情绪语义命中的候选加小幅 bonus；单凭全局喜欢不能让偏爱组再插队。
-      const groupBonus = emotionScore > 0 && baseScore > 0
+      let sceneScore = 0;
+      for (const scene of scenes) {
+        if (!scene) continue;
+        for (const tag of (tags.scene || [])) {
+          if (tag === scene) sceneScore += 8;
+          else if (scene.length > 1 && tag.length > 1 && (tag.includes(scene) || scene.includes(tag))) sceneScore += 2;
+        }
+      }
+      // 图库的强度和语气不完整：只有明确标注/文本命中才加权，缺失不猜测。
+      let toneScore = 0;
+      const tone = String(query.tone || '').trim();
+      if (tone && ((tags.atmosphere || []).includes(tone) || (sticker.semantic_description || '').includes(tone))) toneScore = 6;
+      let intensityScore = 0;
+      const strength = sticker._source?.intensity;
+      if (query.intensity && strength) {
+        const normalized = strength === 'high' ? 'strong' : strength;
+        intensityScore = normalized === query.intensity ? 3 : -3;
+      }
+      const semanticScore = emotionScore + keywordScore + sceneScore;
+      const baseScore = semanticScore + (semanticScore > 0 ? toneScore + intensityScore : 0) + prefsScoreBonus(sticker.id, prefs);
+      // 偏爱组只提升已经命中语义的图，不把无关图带入候选。
+      const groupBonus = semanticScore > 0 && baseScore > 0
         ? getGroupPreferenceBonus(sticker, groupConfig, knownGroupIds)
         : 0;
       const score = baseScore + groupBonus;
@@ -478,8 +526,22 @@ export function scoreStickers(stickers, emotion, excludeIds, prefs, bias = null,
     .sort((a, b) => b._score - a._score);
 }
 
+// 前三名保留一点随机性，但高分候选应更常出现。
+export function pickTopCandidate(scored, random = Math.random) {
+  const top = scored.slice(0, 3);
+  if (!top.length) return null;
+  const floor = Math.min(...top.map(s => s._score));
+  const weights = top.map(s => Math.max(1, s._score - floor + 5));
+  let ticket = random() * weights.reduce((sum, n) => sum + n, 0);
+  for (let i = 0; i < top.length; i++) {
+    ticket -= weights[i];
+    if (ticket < 0) return top[i];
+  }
+  return top[top.length - 1];
+}
+
 export const name = "express";
-export const description = "用表情包表达你自己的情绪。当你回复用户时，如果自己感受到了开心、委屈、心疼、无奈、感动、得意、无语等情绪，想用一张图片来表达自己的感受，就调用这个工具。只需要传一个情绪词，比如 express({ emotion: '开心' }) 或 express({ emotion: '心疼想抱抱你' })。这是你自己的情绪表达方式，不是必须执行的任务。当前伙伴的分组白名单会自动生效，标为偏爱的分组只会小幅提高出现机会。";
+export const description = "用表情包表达你自己的情绪。当你回复用户时，如果自己感受到了开心、委屈、心疼、无奈、感动、得意、无语等情绪，想用一张图片来表达自己的感受，就调用这个工具。传一个情绪词，比如 express({ emotion: '开心' })；如果想让图更贴当前话题，再带上 keywords，填对话里正在说的具体人事物，比如 express({ emotion: '无语', keywords: '加班,老板,下班' })。这是你自己的情绪表达方式，不是必须执行的任务。当前伙伴的分组白名单会自动生效，标为偏爱的分组只会小幅提高出现机会。";
 export const sessionPermission = { kind: "session_file_output" };
 
 export const parameters = {
@@ -489,6 +551,13 @@ export const parameters = {
       type: "string",
       description: "你想表达的情绪或感受，一个词或短句。如：开心、委屈、心疼、想抱抱你、得意、无语、感动、治愈、吃瓜、撒娇、社死、emo"
     },
+    keywords: {
+      type: "string",
+      description: "可选：跟当前对话直接相关的具体词，逗号分隔，如 '加班,老板,下班' 或 '放鸽子,约饭'。从对话里正在说的人、事、物取，越具体越能选中贴题的图；不要填情绪词（情绪交给 emotion）。"
+    },
+    scene: { type: "string", description: "可选：具体使用情境，如等回复、催回复、加班（图库有对应场景标签时加分）" },
+    tone: { type: "string", description: "可选：表达姿态，如自嘲、调侃、撒娇；仅在图的标签或语义描述明确匹配时加分" },
+    intensity: { type: "string", enum: ["light", "medium", "strong"], description: "可选：期望情绪强度；图库未标注强度的图不受影响" },
     exclude_ids: {
       type: "array",
       items: { type: "string" },
@@ -503,10 +572,16 @@ export const parameters = {
 };
 
 export async function execute(input, ctx) {
-  const { emotion, exclude_ids = [], stickerId } = input || {};
+  const { emotion, exclude_ids = [], stickerId, keywords, scene, tone, intensity } = input || {};
   if (!emotion) return reply({ ok: false, error: '请传入你想表达的情绪' });
 
-  ctx?.log?.info?.(`[biaoqingbao] express 被调用: emotion="${emotion}"${stickerId ? `, stickerId="${stickerId}"` : ''}`);
+  // v0.34.51 - 情境关键词：字符串（逗号分隔）或数组都收，清洗后交给打分器
+  const kwList = (Array.isArray(keywords) ? keywords : String(keywords || '').split(/[,，、]/))
+    .map(k => sanitizeTag(k, 12))
+    .filter(Boolean)
+    .slice(0, 6);
+
+  ctx?.log?.info?.(`[biaoqingbao] express 被调用: emotion="${emotion}"${kwList.length ? `, keywords="${kwList.join('、')}"` : ''}${stickerId ? `, stickerId="${stickerId}"` : ''}`);
 
   // 主动调用不再重复抽概率，只遵守自动配图总闸与每位助手自己的允许状态。
   const agentId = resolveAgentId(null, ctx);
@@ -574,12 +649,15 @@ export async function execute(input, ctx) {
   } else {
     const allExclude = [...new Set([...(exclude_ids || []), ...getRecent(agentId)])];
 
-    // 打分匹配（v0.27.0：传入方言气质权重）
-    let scored = scoreStickers(stickers, emotion, allExclude, effectivePrefs, expressionBias, groupConfig, knownGroupIds);
+    // 打分匹配（v0.27.0：传入方言气质权重；v0.34.51：传入情境关键词）
+    const scenes = (Array.isArray(scene) ? scene : String(scene || '').split(/[,，、]/))
+      .map(s => sanitizeTag(s, 12)).filter(Boolean).slice(0, 6);
+    const query = { scene: scenes, tone: sanitizeTag(tone || '', 12), intensity: ['light', 'medium', 'strong'].includes(intensity) ? intensity : '' };
+    let scored = scoreStickers(stickers, emotion, allExclude, effectivePrefs, expressionBias, groupConfig, knownGroupIds, kwList, query);
 
     if (scored.length === 0) {
       // 放宽限制：不排除最近用过的，再试一次
-      const relaxed = scoreStickers(stickers, emotion, [], effectivePrefs, expressionBias, groupConfig, knownGroupIds);
+      const relaxed = scoreStickers(stickers, emotion, [], effectivePrefs, expressionBias, groupConfig, knownGroupIds, kwList, query);
       scored.push(...relaxed);
     }
 
@@ -607,9 +685,8 @@ export async function execute(input, ctx) {
     });
     scored = reranked.scored;
 
-    // 从 top 3 里随机选一张（避免每次都发同一张）
-    const topN = scored.slice(0, Math.min(3, scored.length));
-    best = topN[Math.floor(Math.random() * topN.length)];
+    // 前三名按匹配分加权抽样：保留变化，但不抹平排序判断。
+    best = pickTopCandidate(scored);
     if (!reranked.explored || !['fresh', 'unseen', 'underexposed'].includes(best._explorationKind)) {
       best._explorationKind = null;
     }

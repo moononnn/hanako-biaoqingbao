@@ -21,7 +21,7 @@ test('四条选图工具链实际遵守伙伴分组白名单与安全图片读�
     fs.writeFileSync(path.join(stickersDir, 'blocked.png'), png);
     fs.writeFileSync(path.join(dataDir, 'stickers.json'), JSON.stringify([
       { id: 'allowed', file: 'allowed.png', description: '允许开心图', tags: { emotion: ['开心'] }, groupIds: ['allowed-group'] },
-      { id: 'legacy', file: 'legacy.png', description: '旧字段开心图', tags: { emotion: ['开心'] }, group_ids: ['allowed-group'] },
+      { id: 'legacy', file: 'legacy.png', description: '旧字段开心图', tags: { emotion: ['开心'], scene: ['等回复'] }, _source: { intensity: 'light' }, group_ids: ['allowed-group'] },
       { id: 'blocked', file: 'blocked.png', description: '禁止开心图', tags: { emotion: ['开心'] }, groupIds: ['blocked-group'] },
     ]));
     fs.writeFileSync(path.join(dataDir, 'sticker-groups.json'), JSON.stringify({
@@ -51,12 +51,16 @@ test('四条选图工具链实际遵守伙伴分组白名单与安全图片读�
     };
     const parse = (value) => JSON.parse(value.content[0].text);
     const searchResult = parse(await search({ emotion: '开心' }, ctx));
+    const contextualSearch = parse(await search({ emotion: '开心', keywords: '旧字段', scene: '等回复,回复', intensity: 'light' }, ctx));
     const listResult = parse(await list({ emotion: '开心' }, ctx));
     const peekAllowed = parse(await peek({ id: 'allowed' }, ctx));
     const peekBlocked = parse(await peek({ id: 'blocked' }, ctx));
     const expressResult = parse(await express({ emotion: '开心' }, ctx));
     console.log(JSON.stringify({
       searchIds: searchResult.data.map((item) => item.id),
+      contextualIds: contextualSearch.data.map((item) => item.id),
+      contextualScore: contextualSearch.data[0]?.score,
+      contextualMatches: contextualSearch.data[0]?.matched,
       listIds: listResult.data.map((item) => item.id),
       peekAllowed: peekAllowed.ok,
       peekBlocked: peekBlocked.ok,
@@ -80,6 +84,10 @@ test('四条选图工具链实际遵守伙伴分组白名单与安全图片读�
     const output = child.stdout.trim().split(/\r?\n/).at(-1);
     const result = JSON.parse(output);
     assert.deepEqual(result.searchIds, ['allowed', 'legacy']);
+    assert.deepEqual(result.contextualIds, ['legacy', 'allowed'], '搜图与 express 共用情境得分');
+    assert.equal(result.contextualScore, 29, '情绪 11 + 关键词 5 + 精确场景 8 + 近似场景 2 + 强度 3');
+    assert.ok(result.contextualMatches.includes('scene:回复'), '近似场景命中不能在说明中消失');
+    assert.ok(result.contextualMatches.includes('intensity:light'), '强度参与排序时应在说明中出现');
     assert.deepEqual(result.listIds, ['allowed', 'legacy']);
     assert.equal(result.peekAllowed, true);
     assert.equal(result.peekBlocked, false);

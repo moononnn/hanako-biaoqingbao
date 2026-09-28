@@ -1741,7 +1741,8 @@
       if (data.ok) {
         closeEditor();
         toast('已保存');
-        loadStickers();
+        await loadStickers();
+        await refreshPreferences();
       } else {
         toast('保存失败: ' + (data.error || ''), true);
       }
@@ -1899,6 +1900,7 @@
   var visionConfig = window.__VISION_CONFIG__ || {};
   var textModels = window.__TEXT_MODELS__ || [];
   var textConfig = window.__TEXT_CONFIG__ || { enabled: false, source: 'hana' };
+  var jevConfig = window.__JEV_CONFIG__ || { enabled: false, baseUrl: 'https://api.typesafe.ai', model: 'jev-latest', apiKey: '' };
 
   function hasConfiguredModel(cfg) {
     if (!cfg) return false;
@@ -1969,6 +1971,16 @@
     $('text-custom-model').value = tCfg.customModel || '';
     $('text-test-result').textContent = '';
     toggleTextBlocks();
+
+    // v0.34.49 - Jev 专用决策 API
+    $('jev-enabled').checked = jevConfig.enabled === true;
+    $('jev-shadow-enabled').checked = jevConfig.shadowEnabled === true;
+    $('jev-shadow-limit').value = jevConfig.shadowMaxCalls || 100;
+    $('jev-base-url').value = jevConfig.baseUrl || 'https://api.typesafe.ai';
+    $('jev-api-key').value = jevConfig.keyStored ? '********' : '';
+    $('jev-api-key').dataset.clear = 'false';
+    $('jev-model').value = jevConfig.model || 'jev-latest';
+    $('jev-test-result').textContent = '';
 
     // v0.16.0 - 加载 Embedding 配置
     loadEmbeddingConfig();
@@ -2203,6 +2215,18 @@
       customBaseUrl: source === 'custom' ? $('text-custom-url').value : '',
       customApiKey: $('text-custom-key').value,
       customModel: source === 'custom' ? $('text-custom-model').value : '',
+    };
+  }
+
+  function buildJevConfigFromForm() {
+    return {
+      enabled: $('jev-enabled').checked,
+      shadowEnabled: $('jev-shadow-enabled').checked,
+      shadowMaxCalls: Number($('jev-shadow-limit').value) || 100,
+      baseUrl: $('jev-base-url').value,
+      apiKey: $('jev-api-key').value,
+      model: $('jev-model').value,
+      clearKey: $('jev-api-key').dataset.clear === 'true',
     };
   }
 
@@ -2464,6 +2488,7 @@
 
     // 保存分析模型
     var tCfg = buildTextConfigFromForm();
+    var jCfg = buildJevConfigFromForm();
 
     try {
       // 保存识图
@@ -2482,11 +2507,19 @@
       });
       var data2 = await resp2.json();
 
+      // 保存 Jev 配置
+      var resp3 = await apiFetch(withAuth(API + '/api/jev-config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(jCfg),
+      });
+      var data3 = await resp3.json();
+
       // v0.16.0 - 保存 Embedding 配置
       var embOk = await saveEmbeddingConfig();
 
       // v0.18.3 - 全部成功才算保存成功，否则报错且不关弹窗
-      if (data1.ok && data2.ok && embOk) {
+      if (data1.ok && data2.ok && data3.ok && embOk) {
         visionConfig = vCfg;
         if (vCfg.customApiKey === '********') {
           visionConfig.customApiKey = window.__VISION_CONFIG__?.customApiKey || '';
@@ -2495,6 +2528,7 @@
         if (tCfg.customApiKey === '********') {
           textConfig.customApiKey = window.__TEXT_CONFIG__?.customApiKey || '';
         }
+        jevConfig = data3.data || { ...jCfg, apiKey: jCfg.apiKey === '********' ? '********' : jCfg.apiKey };
         updateModelGuide();
         closeModal('settings-modal');
         toast('设置已保存');
@@ -2502,6 +2536,7 @@
         var failed = [];
         if (!data1.ok) failed.push('识图');
         if (!data2.ok) failed.push('分析');
+        if (!data3.ok) failed.push('Jev');
         if (!embOk) failed.push('向量');
         toast('保存失败: ' + failed.join(' / ') + '，请看控制台日志', true);
       }
@@ -2532,6 +2567,70 @@
     } catch (e) {
       statusEl.textContent = '❌ ' + e.message;
       statusEl.style.color = 'var(--danger)';
+    }
+  }
+
+  // v0.34.49 - 读取 Jev 旁路实验摘要
+  async function viewJevShadowLog() {
+    var el = $('jev-shadow-summary');
+    el.textContent = '读取中...';
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/jev-shadow-log?limit=20'));
+      var data = await resp.json();
+      if (!data.ok) throw new Error(data.error || '读取失败');
+      var info = data.data || {};
+      var entries = info.entries || [];
+      var latest = entries.find(function (item) { return item.jev || item.error; });
+      if (!latest) {
+        el.textContent = '还没有旁路结果。打开旁路观察后，配图决策现场产生时才会记录。';
+        return;
+      }
+      if (latest.error) {
+        el.textContent = '累计 ' + info.total + ' 条，今日 ' + info.todayCalls + ' 次；最近一次失败：' + latest.error;
+        return;
+      }
+      var j = latest.jev || {};
+      var a = latest.actual || {};
+      var decisionText = { injected: '发了图', rejected: '被频率拦下', no_emotion: '判定无情绪' };
+      var sendScore = j.should_send == null ? '?' : Math.round(j.should_send * 100) + '%';
+      el.textContent = '累计 ' + info.total + ' 条，今日 ' + info.todayCalls + ' 次；最近：Jev 该发概率=' + sendScore
+        + '，现有判定=' + (decisionText[a.decision] || a.decision || '未知')
+        + '，情绪=' + (a.emotion || '未知')
+        + '，场景=' + (a.scene_type || '未知')
+        + '，情绪分析耗时=' + (a.emotion_latency_ms == null ? '?' : a.emotion_latency_ms) + 'ms'
+        + '，Jev 耗时=' + (latest.latency_ms || '?') + 'ms';
+    } catch (e) {
+      el.textContent = '读取旁路结果失败：' + e.message;
+    }
+  }
+
+  // v0.34.49 - Jev API 连通测试；只测表单临时配置，不自动保存
+  async function testJevConfig() {
+    var statusEl = $('jev-test-result');
+    var btn = $('jev-test-btn');
+    statusEl.textContent = '测试中...';
+    statusEl.style.color = 'var(--text-muted)';
+    if (btn) btn.disabled = true;
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/jev-test'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(buildJevConfigFromForm()),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        var d = data.data || {};
+        statusEl.textContent = '✅ ' + (d.model || 'Jev') + ' · 连通成功';
+        statusEl.style.color = 'var(--success)';
+      } else {
+        statusEl.textContent = '❌ ' + (data.error || '连接失败');
+        statusEl.style.color = 'var(--danger)';
+      }
+    } catch (e) {
+      statusEl.textContent = '❌ ' + e.message;
+      statusEl.style.color = 'var(--danger)';
+    } finally {
+      if (btn) btn.disabled = false;
     }
   }
 
@@ -2627,6 +2726,43 @@
     }
     var validIds = new Set(allStickers.map(function (s) { return s.id; }));
 
+    // v0.34.45 - 茶话会来源单独展示：记录由茶话会写入自己的 dataDir，表情包插件只读。
+    var chahuahuiRows = Array.isArray(window.__CHAHUAHUI_USAGE__) ? window.__CHAHUAHUI_USAGE__ : [];
+    var chahuahuiHtml = '';
+    if (chahuahuiRows.length === 0) {
+      chahuahuiHtml = '<div style="color:var(--text-muted);padding:14px 0">茶话会还没有发过表情包。</div>';
+    } else {
+      chahuahuiHtml = '<div style="display:flex;flex-direction:column;gap:6px">';
+      for (var ci = 0; ci < chahuahuiRows.length; ci++) {
+        var cr = chahuahuiRows[ci] || {};
+        var csticker = allStickers.find(function (s) { return s.id === cr.stickerId; });
+        var ctags = csticker && csticker.tags ? csticker.tags : {};
+        var cemotion = Array.isArray(ctags.emotion) ? ctags.emotion.slice(0, 2).join('、') : '';
+        var cscene = Array.isArray(ctags.scene) ? ctags.scene.slice(0, 1).join('') : '';
+        var ctime = cr.lastSentAt ? String(cr.lastSentAt).slice(0, 16).replace('T', ' ') : '';
+        var cdesc = csticker && csticker.description ? csticker.description : '表情包';
+        chahuahuiHtml += '<div style="display:flex;align-items:center;gap:8px;padding:7px 8px;background:var(--surface-alt);border:1px solid var(--border-light);border-radius:6px;min-width:0">';
+        if (validIds.has(cr.stickerId)) {
+          chahuahuiHtml += '<img class="log-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(cr.stickerId)) + '" alt="' + escHtml(cdesc) + '" title="' + escHtml(cdesc) + '">';
+        } else {
+          chahuahuiHtml += '<span class="log-thumb-wrap log-deleted" title="这张图已经从图库删除"><span class="log-thumb-deleted">✕</span></span>';
+        }
+        chahuahuiHtml += '<span style="flex:1;min-width:0;overflow:hidden">';
+        chahuahuiHtml += '<span style="display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escHtml(cdesc) + '</span>';
+        chahuahuiHtml += '<span style="display:block;color:var(--text-muted);font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">';
+        chahuahuiHtml += escHtml([cemotion, cscene].filter(Boolean).join(' · ') || cr.stickerId);
+        chahuahuiHtml += ' · 发过 ' + Number(cr.count || 1) + ' 次 · ' + escHtml(ctime) + '</span></span>';
+        if (validIds.has(cr.stickerId)) {
+          chahuahuiHtml += '<button class="pref-feedback-btn pref-edit-btn" data-act="open-editor" data-sticker="' + escHtml(cr.stickerId) + '" title="直接编辑这张图的标签">编辑标签</button>';
+          chahuahuiHtml += '<button class="pref-feedback-btn pref-chat-btn" data-act="open-chat" data-sticker="' + escHtml(cr.stickerId) + '" title="和小花聊聊这张图哪里不对">和小花聊聊</button>';
+        }
+        chahuahuiHtml += '</div>';
+      }
+      chahuahuiHtml += '</div>';
+    }
+    var chahuahuiLog = $('chahuahui-sticker-log');
+    if (chahuahuiLog) chahuahuiLog.innerHTML = chahuahuiHtml;
+
     var totalDecisions = entries.length;
     var feedbacks = entries.filter(function (e) { return e.type === 'user_feedback'; });
     var statsHtml = ''
@@ -2655,6 +2791,9 @@
     }
 
     // v0.34.18 - 旧首页偏好卡片副标题已随新布局移除，此处不再更新
+
+    // 先绑定整个偏好视图，避免没有决策日志时提前 return 导致茶话会记录按钮失效。
+    bindPreferenceActions();
 
     var recent = entries.slice(-20).reverse();
     if (recent.length === 0) {
@@ -2872,7 +3011,7 @@
   }
 
   function bindPreferenceActions() {
-    var container = $('pref-log');
+    var container = $('view-preferences');
     if (!container || container.__prefBound) return;
     container.__prefBound = true;
     container.addEventListener('click', function (e) {
@@ -2942,6 +3081,13 @@
           return;
         }
         callQuickFeedback({ sticker_id: stickerId, feedback_type: fb, context_emotion: emotion, context_keywords: kws, agent: agent || undefined }, rollbackFbBtn);
+        return;
+      }
+
+      if (act === 'open-editor') {
+        var editStickerId = btn.getAttribute('data-sticker');
+        var editSticker = allStickers.find(function (s) { return s.id === editStickerId; });
+        if (editSticker) openEditor(editSticker);
         return;
       }
 
@@ -5622,6 +5768,14 @@
     // 设置弹窗
     $('settings-save').addEventListener('click', saveAllSettings);
     $('text-test-btn').addEventListener('click', testTextConfig);
+    $('jev-test-btn').addEventListener('click', testJevConfig);
+    $('jev-shadow-view-btn').addEventListener('click', viewJevShadowLog);
+    $('jev-clear-key').addEventListener('click', function () {
+      $('jev-api-key').value = '';
+      $('jev-api-key').dataset.clear = 'true';
+      $('jev-test-result').textContent = '已标记，点击「保存」后清除';
+      $('jev-test-result').style.color = 'var(--text-muted)';
+    });
     $('vision-test-btn').addEventListener('click', testVisionConfig);
     $('vision-source').addEventListener('change', toggleVisionBlocks);
     // v0.34.37 - 批量识图自动应用开关（即时保存，不用点整体保存）

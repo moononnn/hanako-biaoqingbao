@@ -743,14 +743,12 @@ test('向量补充通道同样吃偏好惩罚：veto/不喜欢的图不能绕道
     v2: [0.1, 0.1, 0.9],
   };
 
-  // v1 被硬拉黑：即使语义相似度极高（sim>0.35 会被补充），也要被 -20 拉回来
+  // v1 被硬拉黑：语义相似度再高也不得进入候选。
   const scored = [];
   const withVeto = applyVectorBonus(scored, stickers, tiredVec, vectors, [], {
     preferred: [], vetoed: ['v1'], dislikes: {},
   });
-  assert.equal(withVeto.length, 1);
-  assert.equal(withVeto[0].id, 'v1');
-  assert.ok(withVeto[0]._score < 0, 'veto 惩罚应盖过向量加分，分数为负');
+  assert.equal(withVeto.length, 0, '硬拉黑图不能被向量补充重新带入');
 
   // v1 被不喜欢 2 次：同样不能靠向量通道翻身
   const scored2 = [];
@@ -823,8 +821,8 @@ test('识图 prompt：含知名角色/梗图规则与防幻觉约束（v0.26.0�
   assert.ok(AUTOTAG_PROMPT.includes('月薪喵'), 'prompt 应示范新梗名');
   assert.ok(AUTOTAG_PROMPT.includes('猫meme'), 'prompt 应示范系列梗图名');
   assert.ok(AUTOTAG_PROMPT.includes('熊猫头'), 'prompt 应示范表情包系列名');
-  assert.ok(AUTOTAG_PROMPT.includes('角色名、梗名或系列名'), 'keywords 应要求报名字/系列名');
-  assert.ok(AUTOTAG_PROMPT.includes('外观描述词同样保留'), '外观描述词应与角色名共存');
+  assert.ok(AUTOTAG_PROMPT.includes('角色名/梗名/系列名'), 'keywords 应要求报名字/系列名');
+  assert.ok(AUTOTAG_PROMPT.includes('画面元素词'), '画面元素词应与角色名共存');
   // 防幻觉：报名前核对至少两个独有特征，对不上不写名字
   assert.ok(AUTOTAG_PROMPT.includes('核对至少两个独有特征'), '应有特征核对要求');
   assert.ok(AUTOTAG_PROMPT.includes('只写外观描述，不要猜测'), '应有防幻觉约束');
