@@ -124,6 +124,8 @@ import { readStyleProfile, readStyleFeedback, mergeDiffIntoFeedback } from '../l
 import { diffTemplateFeedback } from '../lib/style-distill.js';
 import { callConfiguredTextModel, extractTextResponse } from '../lib/text-model.js';
 import { readHiddenAgents, hideAgent, unhideAgent, filterHiddenAgents } from '../lib/hidden-agents.js';
+import { readSafeJevConfig, writeJevConfig, testJevConfig, evaluateJev } from '../lib/jev.js';
+import { readJevShadowLog } from '../lib/jev-shadow.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const EXPORT_CONFIG_FILE = path.join(DATA_DIR, EXPORT_CONFIG_FILE_NAME);
@@ -1700,6 +1702,46 @@ export default async function registerRoutes(app, ctx) {
     }
   });
 
+  // ═══ Jev 决策模型配置与测试（独立于普通聊天模型）═══
+  app.get('/api/jev-config', () => {
+    return json({ ok: true, data: readSafeJevConfig() });
+  });
+
+  app.post('/api/jev-config', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const cfg = writeJevConfig(body || {});
+      return json({
+        ok: true,
+        data: { ...readSafeJevConfig(), enabled: cfg.enabled, baseUrl: cfg.baseUrl, model: cfg.model },
+        message: 'Jev 配置已保存',
+      });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 400);
+    }
+  });
+
+  app.post('/api/jev-test', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      return json(await testJevConfig(body || {}));
+    } catch (e) {
+      ctx?.log?.error?.('[biaoqingbao] Jev 测试失败:', e.message);
+      return json({ ok: false, error: e.message }, 200);
+    }
+  });
+
+  // 供后续自动配图决策链使用；当前仅提供接口，不自动接管现有判断。
+  app.post('/api/jev-evaluate', async (c) => {
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      const result = await evaluateJev({ state: body.state, questions: body.questions });
+      return json(result, result.ok ? 200 : 400);
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 400);
+    }
+  });
+
   // ════════════════════════════════════════════════════════════════
   //  v0.8 缺图统计和 bad match API
   // ════════════════════════════════════════════════════════════════
@@ -1895,6 +1937,9 @@ export default async function registerRoutes(app, ctx) {
       if (!analysis) {
         return json({ ok: false, error: '模型返回格式无法解析', raw: analysisText.substring(0, 300) }, 200);
       }
+
+      // v0.34.54 - Jev 旁路观测点已移到 extensions/observer.js 的真实决策现场，
+      // 这里不再重复调用，避免同一轮花两次钱、拿到对不上账的对照组。
 
       return json({ ok: true, data: analysis });
     } catch (e) {
@@ -2141,6 +2186,11 @@ export default async function registerRoutes(app, ctx) {
     }
   });
 
+  // ═══ GET /api/jev-shadow-log — 读取 Jev 旁路实验结果 ═══
+  app.get('/api/jev-shadow-log', (c) => {
+    return json({ ok: true, data: readJevShadowLog(c.req.query('limit') || 50) });
+  });
+
   // ═══ GET /api/decision-log — 读取决策日志 ═══
   app.get('/api/decision-log', (c) => {
     const agent = c.req.query('agent') || '';
@@ -2317,7 +2367,7 @@ export default async function registerRoutes(app, ctx) {
 - semantic_description: 30-50 字，描述这张图适合在什么场景回复什么内容
 - emotion: 1-3 个具体情绪词（委屈、撒娇、得意、社死），不要行为描述
 - scene: 每个不超过 4 个字（催回复、吐槽、早安、安慰）
-- keywords: 4-8 个具体画面元素词
+- keywords: 6-10 个词，画面元素词 + 使用情境词（这张图适合在聊什么话题/情境时发，如 加班、早起、催回复）
 
 注意：
 - 没变化的字段也要写，保持 JSON 完整

@@ -15,6 +15,8 @@ import {
   consumeAgentStickerCooldown, resolveAgentId, matchRitualWord, sanitizeTag,
   DATA_DIR, HANA_HOME,
 } from '../lib/shared.js';
+// v0.34.54 - Jev 旁路挂到 observer 的真实判断现场：同一轮、同一份情绪、同一句决策。
+import { runJevShadow, shouldSampleNegative } from '../lib/jev-shadow.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_INFO = join(HANA_HOME, 'server-info.json');
@@ -41,18 +43,25 @@ export function getConditionalScenePercent(sceneFreq, preFreq) {
 }
 
 // ── v3 情绪感知 prompt（新增 scene_type）──
-const EMOTION_DETECT_PROMPT = `你是一个情绪感知器。分析对话上下文，判断助手在回复用户时可能感受到什么情绪，以及当前对话的场景类型。
+// v0.34.51 - 新增 keywords 输出：完整语境的信息不再只压进一个情绪词，
+//   改由 keywords 承载「此刻在聊什么具体事」，供 express 的情境通道检索用。
+//   emotion 仍要求是纯感受词，禁止把事件塞进情绪词里（实测长句向量匹配会退化成近随机）。
+const EMOTION_DETECT_PROMPT = `你是一个情绪感知器。分析对话上下文，判断助手在回复用户时可能感受到什么情绪、此刻在聊什么具体的事，以及当前对话的场景类型。
 
 只返回纯JSON（不要markdown代码块）：
-{"has_emotion": true/false, "emotion": "", "scene_type": "", "reason": ""}
+{"has_emotion": true/false, "emotion": "", "keywords": [], "scene": "", "tone": "", "intensity": "", "scene_type": "", "reason": ""}
 
 - has_emotion：助手在回复时是否有情绪波动（true=有，false=没有）
 - emotion：助手可能感受到的情绪，一个词或短句。必须是情绪感受词，不要行为描述。
   ✅ 正确：兴奋、得意、委屈、心疼、无奈、感动、无语、治愈、吃瓜、撒娇、社死、emo、想抱抱你、哭笑不得、偷着乐
   ❌ 错误：耐心解释、正在思考、认真分析、努力帮忙（这些是行为，不是情绪）
-  注意：尽量用具体的情绪词（如"兴奋""得意"）而不是泛词（如"开心"）
+  注意：尽量用具体的情绪词（如"兴奋""得意"）而不是泛词（如"开心"）。只写感受本身，不要把发生的事情塞进这个词里（写"哭笑不得"，不要写"被连续放鸽子的哭笑不得"）。
+- keywords：3-6 个具体词，从对话里正在说的人、事、物中提取（如"加班""放鸽子""生日""猫""赶论文"）。这些词会拿去表情包库里找同一话题的图，越具体越好；不要放情绪词（"开心""难过"这类不要），不要抽象概念，不要长句。
+- scene：这张图要回应的具体情境，最多4字（如"等回复""加班"）；不明确就留空。与 scene_type 的聊天类型不同。
+- tone：回复时的表达姿态，如"自嘲""调侃""撒娇""安慰"；不明确就留空，不要把用户情绪误当伙伴的语气。
+- intensity：伙伴这次表达的情绪强度，light / medium / strong；拿不准就留空。
 - scene_type：当前对话场景，三选一："闲聊"（日常聊天、吐槽、玩梗、情感交流）、"正事"（技术讨论、写代码、查资料、工作执行）、"中性"（介于两者之间，或难以判断时）
-- reason：一句话说明为什么
+- reason：一句话说明为什么（说清是什么事引发了什么情绪）
 
 判断标准：
 - 关注的是"助手在回复时会感受到什么情绪"，不是用户的状态
@@ -61,7 +70,7 @@ const EMOTION_DETECT_PROMPT = `你是一个情绪感知器。分析对话上下�
 - 情绪不需要很强烈，只要有"想表达点什么"的感觉就行`;
 
 // ── HTTP 调用自己的 /api/text-analysis ──
-async function callEmotionAnalysis(messages) {
+async function callEmotionAnalysis(messages, agentId = 'unknown') {
   const server = getServerInfo();
   if (!server?.port || !server?.token) {
     return { ok: false, error: 'server-info 读取失败' };
@@ -71,13 +80,59 @@ async function callEmotionAnalysis(messages) {
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages, prompt: EMOTION_DETECT_PROMPT }),
+      body: JSON.stringify({ messages, agentId, prompt: EMOTION_DETECT_PROMPT }),
       signal: AbortSignal.timeout(15000),
     });
     return await resp.json();
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+// ── Jev 旁路观测点 ──
+// v0.34.54：这里采样，判出来的分才有对照物。正样本（真贴了图）必采，
+// 负样本抽 25%，正负都有才判得出 Jev 到底更准还是只是更敢发。
+const JEV_STATE_TURNS = 6;
+
+function extractMsgText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.find(part => part?.type === 'text' && typeof part.text === 'string')?.text || '';
+  }
+  return '';
+}
+
+export function buildJevState(messages) {
+  if (!Array.isArray(messages)) return '';
+  return messages
+    .filter(m => m?.role === 'user' || m?.role === 'assistant')
+    .slice(-JEV_STATE_TURNS)
+    .map(m => {
+      const text = extractMsgText(m.content);
+      return text ? `${m.role === 'user' ? '用户' : '助手'}：${text}` : '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function observeJev(logPath, event, ctx, { decision, data, emotion, sceneType, agentId, emotionLatencyMs, positive }) {
+  if (!positive && !shouldSampleNegative()) return;
+  void runJevShadow({
+    state: buildJevState(event?.messages),
+    actual: {
+      decision,
+      has_emotion: data?.has_emotion === true,
+      emotion: emotion || data?.emotion || '',
+      scene_type: sceneType || data?.scene_type || '',
+      intensity: data?.intensity || '',
+      emotion_latency_ms: emotionLatencyMs,
+    },
+    agentId,
+    sessionId: event?.sessionId || event?.session_id || ctx?.sessionId || '',
+    positive,
+  }).catch((error) => {
+    appendLog(logPath, `[context] Jev 旁路失败: ${error.message}`);
+  });
 }
 
 // ── ritual 词表（问候词短路）──
@@ -127,13 +182,43 @@ function appendLog(logPath, line) {
   } catch {}
 }
 
+// v0.34.51 - 关键词清洗：数组或逗号分隔字符串都收，去重、截长、限个数
+const MAX_KEYWORDS = 6;
+const KEYWORD_MAX_LEN = 12;
+export function sanitizeKeywords(raw, maxCount = MAX_KEYWORDS) {
+  const list = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(/[,，、]/) : []);
+  const out = [];
+  for (const item of list) {
+    const k = sanitizeTag(item, KEYWORD_MAX_LEN);
+    if (!k || out.includes(k)) continue;
+    out.push(k);
+    if (out.length >= maxCount) break;
+  }
+  return out;
+}
+
 // ── 注入提示（双通道）──
-function injectPrompt(event, emotion) {
+// v0.34.51 - 带上 keywords 与 reason：keywords 让 express 的情境通道有东西可查，
+//   reason 是这个压缩环节里最便宜却一直在被丢弃的上下文。
+function injectPrompt(event, emotion, keywords = [], reason = '', query = {}) {
+  const kwList = keywords.join('、');
+  const because = reason ? `（${reason}）` : '';
+  const kwCallArg = keywords.length ? `, keywords: '${kwList}'` : '';
+  const queryArgs = kwCallArg + (query.scene ? `, scene: '${query.scene}'` : '')
+    + (query.tone ? `, tone: '${query.tone}'` : '')
+    + (query.intensity ? `, intensity: '${query.intensity}'` : '');
+
   // 通道 A：system 消息
-  event.messages.push({ role: 'system', content: `表情包插件检测到你此刻可能有些${emotion}。你可以调用 express 工具发一张表情包来表达这个感受。` });
+  event.messages.push({
+    role: 'system',
+    content: `表情包插件感知到你此刻可能有些${emotion}${because}。你可以调用 express 工具发一张表情包来表达这个感受。`
+      + (queryArgs ? `想发图时可带上已识别的情境信息：express({ emotion: '${emotion}'${queryArgs} })。` : ''),
+  });
 
   // 通道 B：用户消息尾部行动提示
-  const nudge = `\n\n💡 你似乎有些${emotion}，调用 express({ emotion: '${emotion}' }) 发一张表情包表达这个感受`;
+  const nudge = `\n\n💡 你似乎有些${emotion}。想发图的话，调用 express({ emotion: '${emotion}'${queryArgs} }) 表达这个感受${keywords.length ? '，keywords 传的是刚聊到的具体事物' : ''}`;
   let lastUserIdx = -1;
   for (let i = event.messages.length - 1; i >= 0; i--) {
     if (event.messages[i]?.role === 'user') { lastUserIdx = i; break; }
@@ -221,16 +306,19 @@ export default function (pi) {
         return;
       }
 
-      // 6. 调辅助模型分析情绪 + 场景
-      const result = await callEmotionAnalysis(event.messages);
+      // 6. 调辅助模型分析情绪 + 场景（v0.34.54 - 记录耗时，供 Jev 对比速度）
+      const emotionStartedAt = Date.now();
+      const result = await callEmotionAnalysis(event.messages, agentId);
+      const emotionLatencyMs = Date.now() - emotionStartedAt;
       if (!result.ok) {
-        appendLog(debugLogPath, `[context] 情绪分析失败: ${result.error}`);
+        appendLog(debugLogPath, `[context] 情绪分析失败: ${result.error} | 耗时 ${emotionLatencyMs}ms`);
         return;
       }
 
       const data = result.data;
       if (!data?.has_emotion) {
-        appendLog(debugLogPath, `[context] 无情绪波动，跳过：${data?.reason || 'unknown'}`);
+        appendLog(debugLogPath, `[context] 无情绪波动，跳过：${data?.reason || 'unknown'} | 耗时 ${emotionLatencyMs}ms`);
+        observeJev(debugLogPath, event, ctx, { decision: 'no_emotion', data, agentId, emotionLatencyMs, positive: false });
         return;
       }
 
@@ -241,18 +329,29 @@ export default function (pi) {
         return;
       }
 
+      // v0.34.51 - 关键词与 reason：一起注入，让配图检索有情境信息可用
+      const keywords = sanitizeKeywords(data.keywords);
+      const reason = sanitizeTag(data.reason || '', 40);
+      const query = {
+        scene: sanitizeTag(data.scene || '', 4),
+        tone: sanitizeTag(data.tone || '', 12),
+        intensity: ['light', 'medium', 'strong'].includes(data.intensity) ? data.intensity : '',
+      };
+
       // 7. B 方案第二阶段：按 sceneFreq / preFreq 校准，使最终概率恰好等于场景频率
       const sceneType = data.scene_type || '中性';
       const sceneFreq = sceneType === '正事' ? freqSettings.task : freqSettings.daily;
       const conditionalPercent = getConditionalScenePercent(sceneFreq, preFreq);
       if (!passesFrequency(conditionalPercent)) {
-        appendLog(debugLogPath, `[context] 情绪=${emotion} 场景=${sceneType} 目标=${sceneFreq}% 校准未通过`);
+        appendLog(debugLogPath, `[context] 情绪=${emotion} 场景=${sceneType} 目标=${sceneFreq}% 校准未通过 | 耗时 ${emotionLatencyMs}ms`);
+        observeJev(debugLogPath, event, ctx, { decision: 'rejected', data, emotion, sceneType, agentId, emotionLatencyMs, positive: false });
         return;
       }
 
       // 8. 注入提示
-      if (injectPrompt(event, emotion)) {
-        appendLog(debugLogPath, `[context] ✅ 情绪感知: ${emotion} | 场景: ${sceneType} | freq: ${sceneFreq} | reason: ${data.reason || ''}`);
+      if (injectPrompt(event, emotion, keywords, reason, query)) {
+        appendLog(debugLogPath, `[context] ✅ 情绪感知: ${emotion} | 关键词数: ${keywords.length} | 场景: ${sceneType} | freq: ${sceneFreq} | 耗时 ${emotionLatencyMs}ms`);
+        observeJev(debugLogPath, event, ctx, { decision: 'injected', data, emotion, sceneType, agentId, emotionLatencyMs, positive: true });
         console.log(`[biaoqingbao] ✅ 情绪感知: ${emotion} (场景:${sceneType} freq:${sceneFreq})`);
         return { messages: event.messages };
       }

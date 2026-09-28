@@ -13,9 +13,11 @@ import {
   escapeHtml,
 } from '../lib/shared.js';
 import { AUTO_FIT_MAX } from '../lib/smart-fit.js';
+import { readSafeJevConfig } from '../lib/jev.js';
 import { readContextFeedback } from '../lib/context-feedback.js';
 import { EXPORT_CONFIG_FILE_NAME, readLastExportDir } from '../lib/sticker-transfer.js';
 import { safeStickerPath } from '../lib/ball-core.js';
+import { readChahuahuiUsage, summarizeChahuahuiUsage } from '../lib/chahuahui-usage.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ASSETS_DIR = path.join(__dirname, '..', 'assets');
@@ -35,6 +37,7 @@ function renderPage() {
   const textModels = getAvailableTextModels();
   const embeddingConfig = readEmbeddingConfig();
   const embeddingModels = getAvailableEmbeddingModels();
+  const jevConfig = readSafeJevConfig();
   // v0.30.1：学我说话展示名固定（入口按钮/标题统一叫「学我说话」）
   const userstyleName = '学我说话';
   // v0.31.0：学我说话总结前置依赖「内容分析模型」——未配置时页面顶部直接给引导条
@@ -46,6 +49,7 @@ function renderPage() {
   const safeVisionConfig = { ...visionConfig, customApiKey: visionConfig.customApiKey ? '********' : '' };
   const safeTextConfig = { ...textConfig, customApiKey: textConfig.customApiKey ? '********' : '' };
   const safeEmbeddingConfig = { ...embeddingConfig, customApiKey: embeddingConfig.customApiKey ? '********' : '' };
+  const safeJevConfig = jevConfig;
   const exportConfigPath = path.join(DATA_DIR, EXPORT_CONFIG_FILE_NAME);
   const defaultExportDir = readLastExportDir(exportConfigPath, path.join(homedir(), 'Downloads'));
 
@@ -55,6 +59,8 @@ function renderPage() {
   try { logData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'decision-log.json'), 'utf-8')); } catch {}
   // v0.33.63 - 应景账本注入管理页，偏好区展示“这次很应景”记录
   const contextFeedbackData = readContextFeedback({ dataDir: DATA_DIR });
+  // v0.34.45 - 茶话会自己的来源记录：可选读取，和 Hana 主对话配图账本分开。
+  const chahuahuiUsageData = summarizeChahuahuiUsage(readChahuahuiUsage());
   // v0.24.0 - 配图卡片显示配置（小图自适应开关）
   // v0.28.0 - 新增 showFeedbackButtons：聊天卡片下方喜欢/不喜欢按钮显示开关
   let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true, sizeMode: 'auto' };
@@ -838,6 +844,13 @@ function renderPage() {
     + '</div>'
     + '</div>'
 
+    // v0.34.45 - 茶话会来源记录：只展示茶话会实际发过的图，不混入 Hana 主对话账本。
+    + '<div class="pref-section">'
+    + '<h3>☕ 茶话会发过的表情包</h3>'
+    + '<div class="section-desc">这里单独记着茶话会里实际发出去的图。点「和小花聊聊」就能直接调整这张，不用重新找图库。</div>'
+    + '<div id="chahuahui-sticker-log" style="font-size:12px">加载中...</div>'
+    + '</div>'
+
     // 决策日志 + 偏好映射
     + '<div class="pref-section">'
     + '<h3>📊 配图决策日志</h3>'
@@ -1170,6 +1183,24 @@ function renderPage() {
     + '<span id="text-test-result" style="font-size:12px;color:var(--text-muted);flex:1;min-width:120px"></span></div>'
     + '</div>'
 
+    // v0.34.49 - Jev 专用决策 API：只做接口与连通测试，暂不接管自动配图
+    + '<div class="settings-section" id="jev-settings-section">'
+    + '<h3>⚡ Jev 决策模型（实验）</h3>'
+    + '<div class="settings-desc">给插件做快速结构化判断，例如“要不要发表情包”。它不是聊天模型，当前只保存配置和测试连通，不会改变现有自动配图。</div>'
+    + '<div class="form-group"><label><input type="checkbox" id="jev-enabled" style="vertical-align:middle;width:auto;margin-right:6px;accent-color:var(--primary)">启用 Jev 接口（实验）</label></div>'
+    + '<div class="form-group"><label><input type="checkbox" id="jev-shadow-enabled" style="vertical-align:middle;width:auto;margin-right:6px;accent-color:var(--primary)">开启旁路观察（只记录，不影响实际发图）</label></div>'
+    + '<div class="form-group"><label>每天最多旁路调用次数</label><input type="number" id="jev-shadow-limit" min="1" max="1000" step="1" placeholder="100"></div>'
+    + '<div class="form-group"><label>API 地址</label><input type="text" id="jev-base-url" placeholder="https://api.typesafe.ai"></div>'
+    + '<div class="form-group"><label>API Key</label><input type="password" id="jev-api-key" placeholder="填入你自己的 TypeSafe Key"></div>'
+    + '<button class="btn btn-secondary" id="jev-clear-key" type="button" style="width:auto;font-size:11px;margin-top:-4px">清除已保存 Key</button>'
+    + '<div class="form-group"><label>模型名</label><input type="text" id="jev-model" placeholder="jev-latest"></div>'
+    + '<div style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:-2px">Windows 下 Key 由系统加密保存；不会显示在页面、日志或导出数据里。请求会把状态发送到 TypeSafe 云端。</div>'
+    + '<div class="select-group" style="margin-top:8px"><button class="btn btn-secondary" id="jev-test-btn" style="width:auto;font-size:12px">测试 Jev 连通</button>'
+    + '<button class="btn btn-secondary" id="jev-shadow-view-btn" style="width:auto;font-size:12px">查看旁路结果</button>'
+    + '<span id="jev-test-result" style="font-size:12px;color:var(--text-muted);flex:1;min-width:120px"></span></div>'
+    + '<div id="jev-shadow-summary" style="font-size:11px;color:var(--text-muted);line-height:1.5;margin-top:6px"></div>'
+    + '</div>'
+
     // v0.18.0 Embedding 向量检索：与识图/内容模型完全对称
     + '<div class="settings-section">'
     + '<h3>🔮 向量检索</h3>'
@@ -1278,10 +1309,12 @@ function renderPage() {
     + '<script>window.__VISION_MODELS__=' + JSON.stringify(visionModels).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__TEXT_CONFIG__=' + JSON.stringify(safeTextConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__TEXT_MODELS__=' + JSON.stringify(textModels).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__JEV_CONFIG__=' + JSON.stringify(safeJevConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__PREFERENCES__=' + JSON.stringify(prefsData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__DISPLAY_CONFIG__=' + JSON.stringify(displayCfg).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__DECISION_LOG__=' + JSON.stringify(logData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__CONTEXT_FEEDBACK__=' + JSON.stringify(contextFeedbackData).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__CHAHUAHUI_USAGE__=' + JSON.stringify(chahuahuiUsageData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_CONFIG__=' + JSON.stringify(safeEmbeddingConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_MODELS__=' + JSON.stringify(embeddingModels).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EXPORT_CONFIG__=' + JSON.stringify({ lastExportDir: defaultExportDir, defaultExportDir: path.join(homedir(), 'Downloads') }).replace(/</g, '\\u003c') + ';</script>'
