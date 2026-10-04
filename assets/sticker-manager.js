@@ -2673,6 +2673,7 @@
   // ═══════════════════════════════════
   function initPreferencesView() {
     renderPreferences();
+    renderAgentFitLog();
   }
 
   // v0.19.5 - 查这条决策日志对应的反馈状态。匹配口径：
@@ -2710,6 +2711,103 @@
       }
     }
     return null;
+  }
+
+  // v0.34.57 - 伙伴配图自评：开关 + 只读记录（伙伴自己给发出去的图留的一笔）
+  function syncAgentSelfNoteToggle() {
+    var t = $('agent-self-note-toggle');
+    if (!t) return;
+    var cfg = window.__DISPLAY_CONFIG__ || {};
+    var on = cfg.agentSelfNote !== false;
+    t.classList.toggle('on', on);
+    t.setAttribute('aria-checked', on ? 'true' : 'false');
+  }
+  async function toggleAgentSelfNote() {
+    var t = $('agent-self-note-toggle');
+    if (!t) return;
+    var next = !t.classList.contains('on');
+    t.classList.toggle('on', next);
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/display-config'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentSelfNote: next }),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        window.__DISPLAY_CONFIG__ = data.data;
+        t.setAttribute('aria-checked', next ? 'true' : 'false');
+        toast(next ? '自评已开启：伙伴可以给自己配的图留一笔' : '自评已关闭：不再记录也不再影响选图，已记的保留');
+      } else {
+        t.classList.toggle('on', !next);
+        toast('保存失败：' + (data.error || '出错了'), true);
+      }
+    } catch (e) {
+      t.classList.toggle('on', !next);
+      toast('保存失败，网络开小差了', true);
+    }
+  }
+  async function refreshAgentFitNotes() {
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/agent-fit-notes'));
+      var data = await resp.json();
+      if (data.ok) window.__AGENT_FIT_NOTES__ = (data.data && data.data.rows) || [];
+    } catch (e) {}
+  }
+  var AGENT_FIT_LABEL_CACHE = {};
+  function agentFitLabel(agentId) {
+    var id = agentId || 'default';
+    if (AGENT_FIT_LABEL_CACHE[id]) return AGENT_FIT_LABEL_CACHE[id];
+    var name = (window.__AGENT_NAMES__ || {})[id] || id;
+    AGENT_FIT_LABEL_CACHE[id] = name;
+    return name;
+  }
+  function renderAgentFitLog() {
+    var box = $('agent-fit-log');
+    if (!box) return;
+    var rows = Array.isArray(window.__AGENT_FIT_NOTES__) ? window.__AGENT_FIT_NOTES__ : [];
+    if (rows.length === 0) {
+      box.innerHTML = '<div class="section-hint" style="margin-top:6px">还没有伙伴给自己配的图留过一笔。</div>';
+      return;
+    }
+    var html = '<div style="display:flex;flex-direction:column;gap:6px;margin-top:6px">';
+    for (var i = 0; i < rows.length; i++) {
+      var r = rows[i];
+      var off = Number(r.off) || 0;
+      var on = Number(r.on) || 0;
+      var tag = off > 0
+        ? '<span style="color:var(--danger);font-weight:600">跑偏 ×' + off + '</span>'
+        : '<span style="color:var(--success);font-weight:600">到位 ×' + on + '</span>';
+      html += '<div style="display:flex;align-items:center;gap:8px">'
+        + '<img class="pref-thumb" src="' + withAuth(API + '/api/image?id=' + encodeURIComponent(r.stickerId)) + '" onerror="this.style.display=\'none\'" alt="">'
+        + '<span style="flex:1;min-width:0;overflow-wrap:anywhere">'
+        + '<b>' + escHtml(agentFitLabel(r.agentId)) + '</b> · 「' + escHtml(r.emotion) + '」 · ' + tag
+        + (r.note ? '<br><span style="color:var(--text-light)">' + escHtml(r.note) + '</span>' : '')
+        + '</span>'
+        + '<button class="pref-x" data-act="remove-agent-fit" data-agent="' + escHtml(r.agentId) + '" data-emotion="' + escHtml(r.emotion) + '" data-sticker="' + escHtml(r.stickerId) + '" title="移除这条自评记录">×</button>'
+        + '</div>';
+    }
+    html += '</div>';
+    box.innerHTML = html;
+  }
+  async function callRemoveAgentFit(body) {
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/agent-fit-notes/remove'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      var data = await resp.json();
+      if (data.ok) {
+        await refreshAgentFitNotes();
+        renderAgentFitLog();
+        toast('已移除这条自评');
+      } else {
+        toast('移除失败: ' + (data.error || ''), true);
+      }
+    } catch (err) {
+      toast('移除出错: ' + err.message, true);
+    }
   }
 
   async function renderPreferences() {
@@ -5012,6 +5110,8 @@
     if (modal) { modal.hidden = true; modal.style.display = ''; }
     stopBatchPolling();
     currentBatchTaskId = null;
+    batchFailureView = false;
+    batchViewGeneration++;
   }
 
   function addModalCloseButton() {
@@ -5035,10 +5135,18 @@
   var currentBatchTaskId = null;
   var batchTaskNotified = {};
   var batchTasksData = [];
+  var batchFailuresData = { total: 0, items: [] };
+  var batchFailureView = false;
+  var batchFailureRetryBusy = false;
+  var batchViewGeneration = 0;
+  var batchTasksRequestGeneration = 0;
 
   async function batchAutoTag() {
     if (selectedIds.size === 0) { toast('请先勾选表情包', true); return; }
     var ids = Array.from(selectedIds);
+    batchFailureView = false;
+    batchViewGeneration++;
+    if ($('batch-failure-actions')) $('batch-failure-actions').hidden = true;
     // v0.25.1 - 不再限制 200 张：任务本身是流式队列，几百张一个任务直接跑，用户不用自己分批
 
     var modal = $('batch-modal');
@@ -5078,9 +5186,11 @@
 
   // v0.25.1 - 轮询走精简接口（不拉 results，省带宽）；任务结束后拉一次完整数据渲染结果视图
   async function pollBatchTask(taskId) {
+    var generation = batchViewGeneration;
     try {
       var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId)), { cache: 'no-store' });
       var data = await resp.json();
+      if (generation !== batchViewGeneration || batchFailureView || currentBatchTaskId !== taskId) return;
       if (!data.ok) {
         $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(data.error || '任务不存在') + '</div>';
         $('batch-summary').innerHTML = '';
@@ -5109,15 +5219,18 @@
 
   // v0.26.0 - 抽取：拉取任务完整数据并渲染结果视图（结束态与收尾兜底共用）
   async function loadFullBatchResult(taskId) {
+    var generation = batchViewGeneration;
     try {
       var fullResp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(taskId) + '?full=1'), { cache: 'no-store' });
       var fullData = await fullResp.json();
+      if (generation !== batchViewGeneration || batchFailureView || currentBatchTaskId !== taskId) return;
       if (fullData.ok) {
         renderBatchResultView(fullData.data);
       } else {
         $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ ' + escHtml(fullData.error || '读取任务失败') + '</div>';
       }
     } catch (e2) {
+      if (generation !== batchViewGeneration || batchFailureView || currentBatchTaskId !== taskId) return;
       console.warn('[batch] fetch full detail error:', e2);
       $('batch-list').innerHTML = '<div style="color:var(--danger);padding:20px">❌ 读取任务详情失败</div>';
     }
@@ -5387,6 +5500,7 @@
   }
 
   async function retryGridItem(id, item) {
+    if (batchFailureView) { await retryBatchFailures([id]); return; }
     var button = item && item.querySelector('[data-g-act="retry"]');
     if (button) { button.disabled = true; button.textContent = '加入中...'; }
     var oldTaskId = currentResultTask ? currentResultTask.id : null;
@@ -5446,7 +5560,9 @@
     var pendingApply = (task.completed || []).filter(function (id) { return !appliedSet.has(id); });
     if (pendingApply.length === 0 && (task.failed || []).length === 0) {
       var doneCount = (task.applied || []).length;
+      var generation = batchViewGeneration;
       setTimeout(function () {
+        if (generation !== batchViewGeneration || batchFailureView) return;
         closeBatchModal();
         toast(doneCount > 0 ? '识别结果已写入图库（' + doneCount + ' 张）' : '已全部完成');
       }, 400);
@@ -5455,9 +5571,11 @@
 
   async function refreshBatchResultView() {
     if (!currentResultTask) return;
+    var generation = batchViewGeneration;
     try {
       var resp = await apiFetch(withAuth(API + '/api/batch-task/' + encodeURIComponent(currentResultTask.id) + '?full=1'), { cache: 'no-store' });
       var data = await resp.json();
+      if (generation !== batchViewGeneration || batchFailureView) return;
       if (data.ok) { renderBatchResultView(data.data); checkBatchTasks(); maybeCloseResultIfDone(); }
     } catch (e) { console.warn('[batch] refresh result error:', e); }
   }
@@ -5505,15 +5623,17 @@
   //  后台任务角标
   // ═══════════════════════════════════
   async function checkBatchTasks() {
+    var requestGeneration = ++batchTasksRequestGeneration;
     try {
       var resp = await apiFetch(withAuth(API + '/api/batch-tasks'));
       var data = await resp.json();
-      if (!data.ok || !data.data || data.data.length === 0) {
-        renderBatchTasksBadge([]);
-        return;
-      }
+      if (requestGeneration !== batchTasksRequestGeneration) return;
+      if (!resp.ok || !data.ok || !Array.isArray(data.data) || !data.failures) return;
       batchTasksData = data.data;
-      renderBatchTasksBadge(data.data);
+      var failuresChanged = JSON.stringify(batchFailuresData) !== JSON.stringify(data.failures);
+      batchFailuresData = data.failures;
+      renderBatchTasksBadge(data.data, data.failures);
+      if (batchFailureView && failuresChanged && !batchFailureRetryBusy) renderBatchFailures(data.failures);
 
       for (var i = 0; i < data.data.length; i++) {
         var t = data.data[i];
@@ -5541,7 +5661,7 @@
 
   // v0.25.1 - 角标反映「点开会看到什么」：第一个正在跑的任务；全部待应用任务的聚合数量；
   // 全部失败任务的聚合数量。数字和弹窗内容一致，历史任务不会累加进来。
-  function renderBatchTasksBadge(tasks) {
+  function renderBatchTasksBadge(tasks, failures) {
     var badge = $('batch-tasks-badge');
     if (!badge) return;
     for (var i = 0; i < tasks.length; i++) {
@@ -5571,14 +5691,8 @@
       badge.innerHTML = '⚠️ ' + pendingTotal + ' 张识别结果未写入 · 点这里保存';
       return;
     }
-    // v0.26.0 - 失败数也聚合
-    var failedTotal = 0;
-    for (var k = 0; k < tasks.length; k++) {
-      var t3 = tasks[k];
-      if ((t3.status === 'completed' || t3.status === 'failed') && t3.failed > 0) {
-        failedTotal += t3.failed;
-      }
-    }
+    // 数字与点开的清单同源：当前仍失败的图片去重计数。
+    var failedTotal = failures ? failures.total : 0;
     if (failedTotal > 0) {
       badge.hidden = false;
       badge.className = 'badge-btn';
@@ -5598,12 +5712,15 @@
     if (running.length > 0) { openBatchTaskDetail(running[0].id); return; }
     var pendingApply = batchTasksData.filter(function (t) { return t.status === 'completed' && t.applied < t.completed; });
     if (pendingApply.length > 0) { openBatchTaskDetail(pendingApply[0].id); return; }
-    var failedTasks = batchTasksData.filter(function (t) { return (t.status === 'completed' || t.status === 'failed') && t.failed > 0; });
-    if (failedTasks.length > 0) { openBatchTaskDetail(failedTasks[0].id); return; }
+    if (batchFailuresData.total > 0) { openBatchFailures(); return; }
     toast('当前没有识图任务');
   }
 
   function openBatchTaskDetail(taskId) {
+    batchFailureView = false;
+    batchViewGeneration++;
+    currentResultTask = null;
+    if ($('batch-failure-actions')) $('batch-failure-actions').hidden = true;
     var modal = $('batch-modal');
     var summary = $('batch-summary');
     var list = $('batch-list');
@@ -5617,6 +5734,81 @@
     if (batchPollTimer) clearInterval(batchPollTimer);
     batchPollTimer = setInterval(function () { pollBatchTask(taskId); }, 1500);
     pollBatchTask(taskId);
+  }
+
+  // 全局失败视图只列当前失败图，沿用结果缩略图，不混入成功项。
+  async function openBatchFailures() {
+    batchTasksRequestGeneration++;
+    stopBatchPolling();
+    currentBatchTaskId = null;
+    currentResultTask = null;
+    batchFailureView = true;
+    var generation = ++batchViewGeneration;
+    var modal = $('batch-modal');
+    modal.hidden = false;
+    modal.style.cssText = 'display:flex;position:fixed;inset:0;background:rgba(45,58,53,.45);align-items:center;justify-content:center;z-index:99999;pointer-events:auto';
+    $('batch-summary').innerHTML = '<div class="batch-progress"><span class="spinner"></span>正在读取所有失败图片...</div>';
+    $('batch-list').innerHTML = '';
+    $('batch-failure-actions').hidden = true;
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/batch-failures'), { cache: 'no-store' });
+      var data = await resp.json();
+      if (generation !== batchViewGeneration || !batchFailureView) return;
+      if (!resp.ok || !data.ok || !data.data) throw new Error(data.error || '读取失败图片失败');
+      // 本次手动刷新落定后，废弃同时在飞的自动轮询，防旧名单覆盖。
+      batchTasksRequestGeneration++;
+      batchFailuresData = data.data;
+      renderBatchTasksBadge(batchTasksData, data.data);
+      renderBatchFailures(data.data);
+    } catch (error) {
+      if (generation !== batchViewGeneration || !batchFailureView) return;
+      $('batch-summary').textContent = '读取失败图片失败：' + error.message;
+      $('batch-list').innerHTML = '';
+      $('batch-failure-actions').hidden = false;
+      $('batch-retry-all-failures').disabled = true;
+      $('batch-retry-all-failures').textContent = '全部重新识图';
+      toast('读取失败，请点击刷新列表重试', true);
+    }
+  }
+
+  function renderBatchFailures(failures) {
+    currentResultTask = null;
+    var items = failures.items || [];
+    $('batch-summary').innerHTML = '<b>当前识图失败 ' + items.length + ' 张</b><div style="font-size:12px;margin-top:4px">只列尚未成功的图片，同一张图只算一次；已在重试的图暂不列入。</div>';
+    $('batch-list').innerHTML = items.length ? '<div class="batch-result-grid">' + items.map(function (item) {
+      return renderBatchGridItem(item.id, { ok: false, error: item.error }, 'failed');
+    }).join('') + '</div>' : '<div class="batch-progress-tip">当前没有待重试的失败图片。已提交的任务会继续在后台识别。</div>';
+    $('batch-failure-actions').hidden = false;
+    var button = $('batch-retry-all-failures');
+    button.disabled = batchFailureRetryBusy || !items.length;
+    button.textContent = batchFailureRetryBusy ? '正在加入队列...' : '全部重新识图 (' + items.length + ')';
+    bindBatchGridActions();
+  }
+
+  async function retryBatchFailures(ids) {
+    if (batchFailureRetryBusy || !ids.length) return;
+    batchFailureRetryBusy = true;
+    var generation = batchViewGeneration;
+    var button = $('batch-retry-all-failures');
+    button.disabled = true;
+    button.textContent = '正在加入队列...';
+    $('batch-list').querySelectorAll('[data-g-act="retry"]').forEach(function (btn) { btn.disabled = true; });
+    try {
+      var resp = await apiFetch(withAuth(API + '/api/batch-failures/retry'), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sticker_ids: ids }),
+      });
+      var data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || '提交重试失败');
+      toast(data.message || '已加入重新识图队列');
+      await checkBatchTasks();
+      if (generation === batchViewGeneration && batchFailureView) renderBatchFailures(batchFailuresData);
+    } catch (error) {
+      toast('重试未确认成功：' + error.message + '；可刷新列表后再试', true);
+    } finally {
+      batchFailureRetryBusy = false;
+      if (generation === batchViewGeneration && batchFailureView) renderBatchFailures(batchFailuresData);
+    }
   }
 
   // ═══════════════════════════════════
@@ -5958,6 +6150,10 @@
     // 批量任务角标
     var badge = $('batch-tasks-badge');
     if (badge) badge.addEventListener('click', openBatchTasksModal);
+    $('batch-refresh-failures').addEventListener('click', function () { if (!batchFailureRetryBusy) openBatchFailures(); });
+    $('batch-retry-all-failures').addEventListener('click', function () {
+      retryBatchFailures(batchFailuresData.items.map(function (item) { return item.id; }));
+    });
 
     // 批量 summary 事件委托
     var batchSummaryEl = $('batch-summary');
@@ -6030,6 +6226,25 @@
     if (fbToggleEl) {
       fbToggleEl.addEventListener('click', toggleFbButtons);
       syncFbToggle();
+    }
+
+    // v0.34.57 - 偏好设置页：伙伴配图自评开关 + 记录行上的移除按钮
+    var agentSelfNoteEl = $('agent-self-note-toggle');
+    if (agentSelfNoteEl) {
+      agentSelfNoteEl.addEventListener('click', toggleAgentSelfNote);
+      syncAgentSelfNoteToggle();
+    }
+    var agentFitLogEl = $('agent-fit-log');
+    if (agentFitLogEl) {
+      agentFitLogEl.addEventListener('click', function (e) {
+        var btn = e.target.closest('[data-act="remove-agent-fit"]');
+        if (!btn) return;
+        callRemoveAgentFit({
+          agentId: btn.getAttribute('data-agent') || 'default',
+          emotion: btn.getAttribute('data-emotion') || '',
+          stickerId: btn.getAttribute('data-sticker') || '',
+        });
+      });
     }
 
     // 点击图片放大

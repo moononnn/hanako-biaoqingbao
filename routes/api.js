@@ -106,6 +106,7 @@ import { isCodexVisionProvider } from '../lib/vision-codex.js';
 import { applyPreferenceFeedback, mutatePreferences } from '../lib/feedback.js';
 import { removeStickerExposure } from '../lib/exposure.js';
 import { removeStickerContextFeedback, readContextFeedback, removeContextFitEntry, applyContextFit } from '../lib/context-feedback.js';
+import { readAgentFitNotes, listAgentFitNotes, removeAgentFitEntry, removeStickerAgentFitNotes } from '../lib/agent-fit-notes.js';
 import { removeStickerRecentMatches } from '../lib/recent-match.js';
 import {
   startBall, stopBall, getBallState, checkBallDeps, readBallConfig, setBallPinned,
@@ -237,6 +238,7 @@ function mergeMigrationData(key, incoming) {
     preferences: 'preferences.json',
     teaching: 'teaching-samples.json',
     contextFeedback: 'context-feedback.json',
+    agentFitNotes: 'agent-fit-notes.json',
     exposure: 'exposure-stats.json',
     styleTemplate: 'style-template.json',
     styleProfile: 'style-profile.json',
@@ -256,6 +258,9 @@ function mergeMigrationData(key, incoming) {
   }
   if (key === 'contextFeedback' || key === 'exposure') {
     return mergeAgentScopedData(current, incoming, 'byAgent');
+  }
+  if (key === 'agentFitNotes') {
+    return mergeAgentScopedData(current, { ...(incoming || {}), version: 1 }, 'byAgent');
   }
   if (key === 'teaching') {
     return {
@@ -1135,6 +1140,7 @@ export default async function registerRoutes(app, ctx) {
                 preferences: 'preferences.json',
                 teaching: 'teaching-samples.json',
                 contextFeedback: 'context-feedback.json',
+                agentFitNotes: 'agent-fit-notes.json',
                 exposure: 'exposure-stats.json',
                 styleTemplate: 'style-template.json',
                 styleProfile: 'style-profile.json',
@@ -1325,6 +1331,7 @@ export default async function registerRoutes(app, ctx) {
       // v0.33.53 - 删除图片时同步清理曝光账本与场景正反馈，避免留下孤儿统计。
       try { await removeStickerExposure({ dataDir: DATA_DIR, stickerId: id }); } catch {}
       try { await removeStickerContextFeedback({ dataDir: DATA_DIR, stickerId: id }); } catch {}
+      try { await removeStickerAgentFitNotes({ dataDir: DATA_DIR, stickerId: id }); } catch {}
       try { await removeStickerRecentMatches({ dataDir: DATA_DIR, stickerId: id }); } catch {}
 
       const msg = cleanedRefs > 0 ? `已删除（清理了 ${cleanedRefs} 条偏好引用）` : '已删除';
@@ -1568,6 +1575,7 @@ export default async function registerRoutes(app, ctx) {
         return json({ ok: false, error: result.error || '识图失败' });
       }
       const sug = result.data || {};
+      const visionSucceededAt = new Date().toISOString();
       if (preview) {
         ctx?.log?.info?.('[biaoqingbao] 单张识图预览:', id);
         return json({ ok: true, data: sug, message: '识别完成（预览，点保存才生效）' });
@@ -1583,6 +1591,7 @@ export default async function registerRoutes(app, ctx) {
         if (Array.isArray(sug.scene)) latest[idx].tags.scene = sug.scene.filter(Boolean);
         if (Array.isArray(sug.keywords)) latest[idx].tags.keywords = sug.keywords.filter(Boolean);
         latest[idx].tagged_at = new Date().toISOString();
+        latest[idx].vision_succeeded_at = visionSucceededAt;
         writeMeta(latest);
         ctx?.log?.info?.('[biaoqingbao] 单张识图并应用:', id);
         return json({ ok: true, data: sug, message: '识图完成，标签已应用' });
@@ -1968,7 +1977,7 @@ export default async function registerRoutes(app, ctx) {
 
   // ═══ GET /api/display-config — 读取配图卡片显示配置 ═══
   app.get('/api/display-config', (c) => {
-    let cfg = { smallImageFit: true, sizeMode: 'auto' };
+    let cfg = { smallImageFit: true, sizeMode: 'auto', agentSelfNote: true };
     try {
       cfg = { ...cfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) };
     } catch {}
@@ -1990,6 +1999,8 @@ export default async function registerRoutes(app, ctx) {
         smallImageThreshold: threshold,
         showFeedbackButtons: typeof body.showFeedbackButtons === 'boolean' ? body.showFeedbackButtons : (typeof old.showFeedbackButtons === 'boolean' ? old.showFeedbackButtons : true),
         sizeMode: validModes.includes(body.sizeMode) ? body.sizeMode : (validModes.includes(old.sizeMode) ? old.sizeMode : 'auto'),
+        // v0.34.57 - 伙伴配图自评总闸：默认开；关掉后自评既不产生也不生效，已记的账保留
+        agentSelfNote: typeof body.agentSelfNote === 'boolean' ? body.agentSelfNote : (typeof old.agentSelfNote === 'boolean' ? old.agentSelfNote : true),
       };
       atomicWriteJson(path.join(DATA_DIR, 'display-config.json'), cfg);
       return json({ ok: true, data: cfg });
@@ -2158,7 +2169,27 @@ export default async function registerRoutes(app, ctx) {
         }
         if (cleanedContext > 0) atomicWriteJson(ctxFile, ctxData);
       } catch {}
-      return json({ ok: true, cleanedReferences: cleanedPrefs, cleanedMappings, cleanedContext, message: `已清理 ${cleanedPrefs} 条引用、${cleanedMappings} 条空映射` });
+      // v0.34.57 - 伙伴自评账本里已删除表情包的引用一并清理
+      let cleanedAgentFit = 0;
+      try {
+        const fitFile = path.join(DATA_DIR, 'agent-fit-notes.json');
+        const fitData = JSON.parse(fs.readFileSync(fitFile, 'utf-8'));
+        for (const contexts of Object.values(fitData?.byAgent || {})) {
+          if (!contexts || typeof contexts !== 'object') continue;
+          for (const [emotion, bucket] of Object.entries(contexts)) {
+            if (!bucket || typeof bucket !== 'object') continue;
+            for (const k of Object.keys(bucket)) {
+              if (!validIds.has(k)) {
+                delete bucket[k];
+                cleanedAgentFit += 1;
+              }
+            }
+            if (Object.keys(bucket).length === 0) delete contexts[emotion];
+          }
+        }
+        if (cleanedAgentFit > 0) atomicWriteJson(fitFile, fitData);
+      } catch {}
+      return json({ ok: true, cleanedReferences: cleanedPrefs, cleanedMappings, cleanedContext, cleanedAgentFit, message: `已清理 ${cleanedPrefs} 条引用、${cleanedMappings} 条空映射` });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -2178,6 +2209,34 @@ export default async function registerRoutes(app, ctx) {
         dataDir: DATA_DIR,
         agentId: body?.agentId || 'default',
         contextEmotion: body?.contextEmotion ?? body?.context ?? '',
+        stickerId: body?.stickerId,
+      });
+      return json(result, result.ok ? 200 : (result.status || 400));
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  });
+
+  // ═══ GET /api/agent-fit-notes — 读取伙伴配图自评记录（管理页只读展示） ═══
+  // v0.34.57 - 结构：byAgent[agentId][contextEmotion][stickerId] = { off, on, lastAt, note }
+  app.get('/api/agent-fit-notes', (c) => {
+    return json({
+      ok: true,
+      data: {
+        raw: readAgentFitNotes({ dataDir: DATA_DIR }),
+        rows: listAgentFitNotes({ dataDir: DATA_DIR, limit: Number(c.req.query('limit')) || 200 }),
+      },
+    });
+  });
+
+  // ═══ POST /api/agent-fit-notes/remove — 删除单条自评记录（管理页手动移除） ═══
+  app.post('/api/agent-fit-notes/remove', async (c) => {
+    try {
+      const body = await c.req.json();
+      const result = await removeAgentFitEntry({
+        dataDir: DATA_DIR,
+        agentId: body?.agentId || 'default',
+        emotion: body?.emotion ?? body?.contextEmotion ?? '',
         stickerId: body?.stickerId,
       });
       return json(result, result.ok ? 200 : (result.status || 400));

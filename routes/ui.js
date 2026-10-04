@@ -15,7 +15,8 @@ import {
 import { AUTO_FIT_MAX } from '../lib/smart-fit.js';
 import { readSafeJevConfig } from '../lib/jev.js';
 import { readContextFeedback } from '../lib/context-feedback.js';
-import { EXPORT_CONFIG_FILE_NAME, readLastExportDir } from '../lib/sticker-transfer.js';
+import { listAgentFitNotes } from '../lib/agent-fit-notes.js';
+import { EXPORT_CONFIG_FILE_NAME, readLastExportDir, readAgentCatalog } from '../lib/sticker-transfer.js';
 import { safeStickerPath } from '../lib/ball-core.js';
 import { readChahuahuiUsage, summarizeChahuahuiUsage } from '../lib/chahuahui-usage.js';
 
@@ -59,11 +60,17 @@ function renderPage() {
   try { logData = JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'decision-log.json'), 'utf-8')); } catch {}
   // v0.33.63 - 应景账本注入管理页，偏好区展示“这次很应景”记录
   const contextFeedbackData = readContextFeedback({ dataDir: DATA_DIR });
+  // v0.34.57 - 伙伴配图自评记录（只读展示，拍平成行 + 伙伴名对照）
+  const agentFitRows = listAgentFitNotes({ dataDir: DATA_DIR, limit: 200 });
+  const agentNames = {};
+  for (const item of readAgentCatalog()) {
+    if (item?.id) agentNames[item.id] = item.name || item.id;
+  }
   // v0.34.45 - 茶话会自己的来源记录：可选读取，和 Hana 主对话配图账本分开。
   const chahuahuiUsageData = summarizeChahuahuiUsage(readChahuahuiUsage());
   // v0.24.0 - 配图卡片显示配置（小图自适应开关）
   // v0.28.0 - 新增 showFeedbackButtons：聊天卡片下方喜欢/不喜欢按钮显示开关
-  let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true, sizeMode: 'auto' };
+  let displayCfg = { smallImageFit: true, smallImageThreshold: 200, showFeedbackButtons: true, sizeMode: 'auto', agentSelfNote: true };
   try { displayCfg = { ...displayCfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'display-config.json'), 'utf-8')) }; } catch {}
 
   return '<!DOCTYPE html>'
@@ -507,7 +514,9 @@ function renderPage() {
     + '.paste-zone.active{border-style:solid;border-color:var(--success);background:var(--surface-alt)}'
     + '.paste-zone.active .paste-zone-title{color:var(--success)}'
     + '.paste-zone img{max-width:100%;max-height:150px;border-radius:8px;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,0,0,.12);margin-bottom:8px;display:block;margin-left:auto;margin-right:auto;background:#fff}'
-    + '.batch-backdrop-tip{font-size:11px;color:var(--text-muted);background:var(--surface-alt);border:1px dashed var(--border);border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:10px;line-height:1.6}'
+    + '.batch-backdrop-tip{font-size:11px;color:var(--text-muted);background:var(--surface-alt);border:1px solid var(--border);border-radius:var(--radius-sm);padding:8px 12px;margin-bottom:10px;line-height:1.6}'
+    + '.batch-failure-actions{display:flex;gap:10px;justify-content:flex-end;flex-wrap:nowrap;flex-shrink:0;padding-top:14px}'
+    + '.batch-failure-actions button{flex:none;white-space:nowrap}'
     + 'button:disabled{opacity:.45;cursor:not-allowed}'
     + '.select-group{display:flex;gap:6px;align-items:center;margin-bottom:8px}'
     + '.select-group select{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;background:var(--surface-alt);color:var(--text);font-family:inherit}'
@@ -842,6 +851,17 @@ function renderPage() {
     + '<span class="fit-track"><span class="fit-knob"></span></span>'
     + '<span class="fit-label">显示反馈按钮</span>'
     + '</div>'
+    + '</div>'
+
+    // v0.34.57 - 伙伴配图自评：伙伴自己给发出去的图留一笔（默认开，用户可关）
+    + '<div class="pref-section">'
+    + '<h3>💭 伙伴配图自评</h3>'
+    + '<div class="section-desc">每次配图，伙伴可以自己记一笔「这张贴不贴我想表达的」。记过「跑偏」的图，以后在这个伙伴的这种情绪下会少出现；记「到位」只做记录，不改选图。关掉后不再记也不再生效，已经记下的都留着。</div>'
+    + '<div class="fit-toggle" id="agent-self-note-toggle" role="switch" aria-checked="true" title="开 = 伙伴可以给自己发出去的图留一笔，并影响 ta 自己的选图；关 = 不再记录也不再影响，已记的保留">'
+    + '<span class="fit-track"><span class="fit-knob"></span></span>'
+    + '<span class="fit-label">允许伙伴给自己配的图留一笔</span>'
+    + '</div>'
+    + '<div id="agent-fit-log" style="font-size:12px">加载中...</div>'
     + '</div>'
 
     // v0.34.45 - 茶话会来源记录：只展示茶话会实际发过的图，不混入 Hana 主对话账本。
@@ -1261,6 +1281,10 @@ function renderPage() {
     + '<div class="batch-backdrop-tip">识别在后台运行，关掉这个窗口或切去聊天都不会中断。图库上方会出现「识图中」按钮，随时点回来看进度。</div>'
     + '<div class="batch-summary" id="batch-summary"></div>'
     + '<div class="batch-list" id="batch-list"></div>'
+    + '<div class="batch-failure-actions" id="batch-failure-actions" hidden>'
+    + '<button class="btn btn-secondary" id="batch-refresh-failures">刷新列表</button>'
+    + '<button class="btn btn-primary" id="batch-retry-all-failures">全部重新识图</button>'
+    + '</div>'
     + '</div></div></div>'
 
     // ═══════════════════════════════════
@@ -1314,6 +1338,8 @@ function renderPage() {
     + '<script>window.__DISPLAY_CONFIG__=' + JSON.stringify(displayCfg).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__DECISION_LOG__=' + JSON.stringify(logData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__CONTEXT_FEEDBACK__=' + JSON.stringify(contextFeedbackData).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__AGENT_FIT_NOTES__=' + JSON.stringify(agentFitRows).replace(/</g, '\\u003c') + ';</script>'
+    + '<script>window.__AGENT_NAMES__=' + JSON.stringify(agentNames).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__CHAHUAHUI_USAGE__=' + JSON.stringify(chahuahuiUsageData).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_CONFIG__=' + JSON.stringify(safeEmbeddingConfig).replace(/</g, '\\u003c') + ';</script>'
     + '<script>window.__EMBEDDING_MODELS__=' + JSON.stringify(embeddingModels).replace(/</g, '\\u003c') + ';</script>'
@@ -1614,6 +1640,7 @@ export default async function registerRoutes(app, ctx) {
       var invite = document.getElementById('chat-invite');
       var chatPanel = document.getElementById('chat-panel');
       var pending = false;
+      var queuedTap = null;
       var toastTimer = null;
       // v0.25.0 - 不喜欢累计次数（多轮不喜欢 → 频率衰减）
       var dislikeCount = cfg.dislikes || 0;
@@ -1788,8 +1815,20 @@ export default async function registerRoutes(app, ctx) {
         return '已取消这次反馈';
       }
 
+      // v0.34.61 - 后端原话太内部，翻成人话；未知错误仍原样带出，方便报障。
+      function friendlyFbError(raw) {
+        var text = String(raw || '');
+        if (text.indexOf('这段对话当前不可用于配图反馈') >= 0) {
+          return '没认出这段对话，可能窗口刚切换过。点一下「全部」重新打开手帐再试';
+        }
+        if (text.indexOf('没有找到对应的配图记录') >= 0) return '这张图不在最近的配图记录里了';
+        return '没记上：' + (text || '出错了');
+      }
+
       async function sendFb(tappedKind) {
-        if (pending) return;
+        // v0.34.61 - 过去 pending 期间直接 return，连点「喜欢」再点「应景」第二次被静默吞掉，
+        // 看着就像“必须等后台记上才能点下一个”。改成只保留最后一次点击，锁开后接着发。
+        if (pending) { queuedTap = tappedKind; return; }
         var nextKind = nextPositiveKind(tappedKind);
         var isNegTap = tappedKind === 'negative';
         var nextFeedback;
@@ -1838,13 +1877,18 @@ export default async function registerRoutes(app, ctx) {
             showToast(toastFor(nextFeedback, nextFbKind));
           } else {
             rollbackFb();
-            showToast('没记上：' + (data.error || '出错了'), true);
+            showToast(friendlyFbError(data.error), true);
           }
         } catch (e) {
           rollbackFb();
           showToast('没记上，网络开小差了', true);
         }
         pending = false;
+        if (queuedTap) {
+          var next = queuedTap;
+          queuedTap = null;
+          sendFb(next);
+        }
       }
 
       // ── 内联聊天（v0.25.0：点「聊聊」在卡片里直接跟小花说） ──
