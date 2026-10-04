@@ -47,8 +47,8 @@ class DpiAwarenessTests(unittest.TestCase):
         user32 = SimpleNamespace(SetProcessDPIAware=Mock(return_value=True))
         shcore = SimpleNamespace(SetProcessDpiAwareness=Mock(return_value=0))
         with patch.object(ball_app.sys, "platform", "win32"), patch(
-            "ctypes.WinDLL", side_effect=lambda name, **_kwargs: user32 if name == "user32" else shcore
-        ):
+            "ctypes.WinDLL", side_effect=lambda name, **_kwargs: user32 if name == "user32" else shcore, create=True
+        ):  # create=True：非 Windows 平台（CI runner）没有 ctypes.WinDLL 属性
             self.assertTrue(ball_app._set_windows_dpi_awareness())
         shcore.SetProcessDpiAwareness.assert_called_once_with(2)
 
