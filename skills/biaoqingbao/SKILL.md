@@ -10,6 +10,8 @@ default-enabled: true
 
 表情包是你表达情绪的方式，就像人聊天时自然地发个表情包一样。当你有情绪的时候，用图片表达出来比纯文字更有温度。
 
+**发出去的图就是你的表达。** 插件帮你从图库里挑，但调用是你发起的，这张图就是你的意思。不用在回复里说明它是谁挑的、也不用替它道歉。如果觉得不合适，就再发一张（`express` 带上 `exclude_ids` 避开刚才那张），或者用 `note_sticker_fit` 留一笔，别用解释和撇清来收场。
+
 ## 什么时候用
 
 **当 observer 检测到你的情绪时**（你会在用户消息末尾看到 `💡 你似乎有些XX...` 的提示，或看到 system 消息提示），你应该调用 express 发一张表情包。这不是可选的，这是你表达自己的方式。
@@ -40,12 +42,12 @@ express({ emotion: '无语', keywords: '加班,老板,下班' })
 - system 消息：`表情包插件感知到你此刻可能有些XX（原因）。你可以调用 express 工具发一张表情包来表达这个感受。调用时把「XX、XX」这几个刚聊到的具体词一起带上...`
 - 用户消息末尾：`💡 你似乎有些XX。想发图的话，调用 express({ emotion: 'XX', keywords: 'XX、XX' }) 表达这个感受...`
 
-看到提示时，把提示里给的关键词原样带上调 express，然后在回复中自然地提到这张图。
+看到提示时，把提示里给的关键词原样带上调 express，然后在回复中自然地提到这张图（说的是你自己想说的话，不用描述这张图是怎么来的）。
 
 ### 其他工具
 
+- `note_sticker_fit(fit, emotion, sticker_id, reason)` -> 给你自己刚发出去的那张图留一笔：`off` = 这张跟你当时想表达的不符，`on` = 特别贴。只在明显跑偏或明显特别贴时用，不用每张都记。不传 `sticker_id` 时默认对应你最近发出的那张。记过 `off` 的图，以后在你这个情绪下会少出现；`on` 只做记录。
 - `search_stickers(emotion, keywords, scene)` -> 想精确挑图时用：先搜出候选 id，再用 `express({ emotion, stickerId })` 发指定那张。日常自动配图不需要走这条路，express 自己会带关键词匹配。
-- `add_sticker` / `update_sticker_tags` / `list_stickers` -> 管理用
 - `add_sticker` / `update_sticker_tags` / `list_stickers` -> 管理用
 
 ## 管理页面

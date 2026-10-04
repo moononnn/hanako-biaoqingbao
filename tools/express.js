@@ -24,6 +24,7 @@ import { imageSizeFromBuffer } from '../lib/image-size.js';
 import { safeStickerPath } from '../lib/ball-core.js';
 import { recordRecentMatch } from '../lib/recent-match.js';
 import { readContextFits } from '../lib/context-feedback.js';
+import { readAgentFits } from '../lib/agent-fit-notes.js';
 import { readExposureStats, recordSuccessfulExposure, rerankWithExploration } from '../lib/exposure.js';
 import {
   readGroupStore,
@@ -185,6 +186,25 @@ function normalizeCardEmotionLabel(value) {
 export function primaryEmotionOf(sticker) {
   const emotions = Array.isArray(sticker?.tags?.emotion) ? sticker.tags.emotion : [];
   return emotions.find((tag) => normalizeCardEmotionLabel(tag)) || '';
+}
+
+// v0.34.57 - 给模型的「这张图的档案」：让 ta 知道自己发的是什么，而不是只看见一个标题。
+// 只给判断需要的信息（画面 / 适合表达 / 情绪），分数、ID、分组这类内部字段不外露。
+// 顺带把归属还给伙伴，并给一条退路，省得 ta 用「这是插件挑的」这类撇清的话。
+export function buildStickerArchiveText(sticker, emotion) {
+  const lines = ['你发出了这张表情包（这是这张图的档案，供你判断贴不贴你想表达的；别把它当成新话题来回应）：'];
+  const description = String(sticker?.description || '').replace(/[\r\n\t]+/g, ' ').trim();
+  if (description) lines.push(`· 画面：${description}`);
+  const semantic = String(sticker?.semantic_description || '').replace(/[\r\n\t]+/g, ' ').trim();
+  if (semantic) lines.push(`· 适合表达：${semantic}`);
+  const emotions = (Array.isArray(sticker?.tags?.emotion) ? sticker.tags.emotion : [])
+    .map((tag) => String(tag || '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  if (emotions.length) lines.push(`· 情绪：${emotions.join('、')}`);
+  lines.push('这张图就是你自己的表达，不用交代来历。觉得不合适，直接再调一次 express 换一张（带上 exclude_ids 避开这张），不用解释。');
+  lines.push('明显跑偏或特别贴的时候，可以用 note_sticker_fit 留一笔；不用每张都记。');
+  return lines.join('\n');
 }
 
 export function buildStickerCard({
@@ -631,6 +651,8 @@ export async function execute(input, ctx) {
   const effectivePrefs = {
     ...prefs,
     contextFits: readContextFits({ dataDir, agentId, contextEmotion: emotion }),
+    // v0.34.57 - 伙伴自评「跑偏」的降权（用户关掉自评时 readAgentFits 返回空对象，自然失效）
+    agentFits: readAgentFits({ dataDir, agentId, contextEmotion: emotion }),
   };
 
   // v0.32.3 - stickerId 指定路径：跳过打分/向量匹配，直接用指定图
@@ -786,7 +808,7 @@ export async function execute(input, ctx) {
     }).catch((error) => ctx?.log?.warn?.('[biaoqingbao] 最近配图记录失败:', error?.message || error));
     ctx?.log?.debug?.(`[biaoqingbao] express 交付协议: ${delivery}${hostVersion ? ` (Hana ${hostVersion})` : ' (未知版本)'}`);
     return {
-      content: [{ type: 'text', text: `已发送表情包「${best.description}」（匹配度 ${best._score}）` }],
+      content: [{ type: 'text', text: buildStickerArchiveText(best, emotion) }],
       details,
     };
   }

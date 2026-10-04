@@ -384,11 +384,11 @@ test('管理页把完整搬家包放在数据与迁移页，图库保留普通�
 test('导出内容分组：组 id 解析成具体数据键，未知组忽略且顺序稳定', () => {
   assert.deepEqual(resolveExportDataKeys(null), []);
   assert.deepEqual(resolveExportDataKeys([]), []);
-  assert.deepEqual(resolveExportDataKeys(['preference']), ['preferences', 'teaching', 'contextFeedback', 'exposure']);
+  assert.deepEqual(resolveExportDataKeys(['preference']), ['preferences', 'teaching', 'contextFeedback', 'agentFitNotes', 'exposure']);
   assert.deepEqual(resolveExportDataKeys(['style']), ['styleTemplate', 'styleProfile', 'styleFeedback']);
   assert.deepEqual(resolveExportDataKeys(['dialect']), ['dialectConfig']);
   assert.deepEqual(resolveExportDataKeys(['interface']), ['agentFreq', 'displayConfig', 'ballConfig']);
-  assert.deepEqual(resolveExportDataKeys(['dialect', 'bogus', 'preference']), ['dialectConfig', 'preferences', 'teaching', 'contextFeedback', 'exposure']);
+  assert.deepEqual(resolveExportDataKeys(['dialect', 'bogus', 'preference']), ['dialectConfig', 'preferences', 'teaching', 'contextFeedback', 'agentFitNotes', 'exposure']);
 });
 
 test('buildMigrationPayload 只带 includeDataKeys 指定的键，null 则带全部', async () => {
