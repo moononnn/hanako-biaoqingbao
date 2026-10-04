@@ -8,7 +8,32 @@
 npm test
 ```
 
-当前覆盖（422 项 Node 测试、78 项 Python 测试；2026-09-28 两套测试均已实跑）：
+当前覆盖（465 项 Node 测试、81 项 Python 测试；2026-10-04 发布 v0.34.61 前两套均已实跑，全绿）：
+
+- 2026-10-02（v0.34.61）：新增 `tests/feedback-locator.test.js` 4 项。现场：卡片点喜欢/应景一律回 409「这段对话当前不可用于配图反馈」。覆盖同一文件的两种路径写法（junction 旧入口 vs 宿主真实根）判为同一处、按旧入口路径提交的反馈能记上（修前 409）、路径确实指向另一段对话时仍拦下、`session:get` 抛错时日志留下原因而非静默失败。修法：`samePath` 先 normalize 再 realpath 归一；`isDesktopSessionPath` 字面检查不过时把两边都解析成真实路径重试；`sessionForFeedback` 每处拒绝写明 reason + ask/got 现场。前端另把 pending 期间的连点改为排队最后一次点击（`queuedTap`），锁开后接着发，不再静默吞掉第二次点击。独立复核发现“白名单未命中就拒绝”会堵掉宿主列表省略 sessionId 时的 `session:get` 兜底，已改回不早退。全量 465/465 通过，零跳过（Python 81 项本轮未重跑）。另补 2 项「没挪过家的人」回归：路径字面一致时直接放行、不碰文件系统（用不存在的合法路径证明没做多余校验），以及 agents 之外的路径、长得像但不在 agents 下的路径、非 jsonl 一律仍拒绝——确认新增的真实路径回退没有翻口子。宿主 0.1059.0 整目录迁到 D:\HanaHome 后以 junction 保留 C 盘旧入口，真实卡上的点按需实机验收。
+
+专项命令：`node --test tests/feedback-locator.test.js tests/ball.test.js tests/home-migration.test.js`。
+
+- 2026-10-02（v0.34.60）：新增 `tests/observer-prompt.test.js` 7 项。修前新增的前6项全失败，修后7项通过；与自动配图总闸、Jev旁路专项合计17/17通过，全量459/459通过（零跳过）。覆盖完整提醒经过AgentMessage转换保留、两条通道的tool_search/tool_call调用路线、关键词/场景/语气/强度保留、无真实用户或不可追加内容时不写半份提醒、背景/工具结果隔离、多模态原内容保留；隔离子进程执行真实observer，固定随机数验证daily=50抽样、task=0正事门禁与问候不调辅助模型。当前宿主0.1059.0真实 `convertToLlm` 复验：修前system提醒被过滤，修后custom提醒转换为user文本块，完整提醒与工具发现路线均保留。本轮不更改频率、自评、模型、图库或伙伴人格，不调用真实收费模型。重启后的聊天自然带图尚待实机验收，不能把消息转换通过等同于模型一定调用工具。
+
+专项命令：`node --test tests/observer-prompt.test.js tests/auto-image-gate.test.js tests/jev-shadow.test.js`。运行前将HANA_HOME、TEMP、TMP指向隔离测试目录。
+
+- 2026-10-02（v0.34.59）：新增当前失败清单专项16项（tests/batch-failures.test.js 9项、batch-failure-ui.test.js 6项、batch-failures-api.test.js 1项）。覆盖跨批次去重/最新成功接管/删图/重试排队/取消/旧字符串/人工编辑不冒充AI成功、角标与清单同源、仅失败网格、固定操作区、重复点击与HTTP失败保留、任务晚回包与手动刷新/自动轮询竞态；隔离API实链路验证回查交集、低并发、旧账保留、重复请求409、坏任务/坏图库500、真实页面脚本编译。修前UI2项全失败，修后专项16项全绿，npm test 452/452，零跳过。运行环境 HANA_HOME/TEMP/TMP 指向工作台 _tmp_bqb_failures_test，模型网络被模拟/worker调度被拦截，不改真实数据、不执行收费识图。语法检查覆盖 lib/batch-failures.js、routes/_batch-tasks.js、routes/api.js、routes/ui.js、assets/sticker-manager.js。重启后仍需实机验收失败网格、底部按钮和真实重试；30秒网络超时原因未在本轮修复。
+
+专项命令：`node --test tests/batch-failures.test.js tests/batch-failure-ui.test.js tests/batch-failures-api.test.js`。
+
+- 2026-10-01（v0.34.58）：`node --check lib/shared.js`、`node --check tests/home-migration.test.js`、`node --test tests/home-migration.test.js` 和 `npm test` 通过，Node 436/436，零跳过。测试临时目录与 HANA_HOME 指向隔离工作区，未使用真实图库配置。新增 3 项：宿主整体 junction 搬家仅图库地址规范化、HANA_HOME/DATA_DIR 保持宿主字面量并可读原图且内部外链仍拒绝；图库单独被 junction 替换仍拒绝；尚未创建的宿主目录可初始化。修前新增测试 1 失败/2 通过，修后 3 全过；独立复核发现初稿规范化全局 HANA_HOME 会影响会话词法比较，已收窄为仅 STICKERS_DIR 使用真实宿主根。真实图库只读复验 337/337 路径可读；管理页最终显示待重启 Hana 后实机验收。
+
+- 2026-09-30：伙伴配图自评 + 配图回包改版；Node 433 项通过（含新增 11 项自评回归）。工具是否被模型实际调用、回包信封的真实效果、设置页开关与记录列表仍待重启 Hana 后实机验收。
+
+本轮新增（v0.34.56 → v0.34.57）：
+
+- Node：伙伴自评账本（`tests/agent-fit-notes.test.js` 11 项）：按伙伴/情绪隔离、off 计数封顶、「到位」不参与降权、降权只减不增且与用户偏好叠加不互相覆盖、开关关闭后不记录也不生效且数据保留、重开恢复、非法参数拒绝不落脏数据、并发写入不丢、删图跨伙伴跨情境清理、管理页移除为整条删除且列表按时间倒序。
+- Node：配图回包契约：包含画面/适合表达/情绪三行与「不用交代来历」归属句及 `note_sticker_fit` 提示；不再出现匹配分、内部 ID 与 keywords 全量；缺语义描述时不凑空行。
+- Node：搬家导出分组键补上 `agentFitNotes`（`tests/sticker-transfer.test.js`）。
+- 命令：`node --check` 覆盖 `lib/agent-fit-notes.js`、`tools/note-sticker-fit.js`、`tools/express.js`、`routes/api.js`、`routes/ui.js`、`lib/shared.js`、`lib/sticker-transfer.js`、`assets/sticker-manager.js`，加 `manifest.json` 解析与 `npm test`。
+
+- 2026-09-28：纸飞机悬浮球增加 Per-Monitor DPI Aware V2 启动设置；Node 422 项、Python 81 项通过（含 V2 初始化和旧系统 V1 回退），Python 编译通过。125%/200% 实际缩放下的点击仍待界面验收。
 
 本轮新增（v0.34.53 → v0.34.55）：
 
@@ -78,6 +103,8 @@ Python 离屏测试在插件 `python` 目录下运行：
 $env:QT_QPA_PLATFORM = "offscreen"
 python -m unittest test_ball_app.py -v
 ```
+
+悬浮球 DPI 启动声明另覆盖：Windows 优先使用 Per-Monitor V2，上代系统缺少 V2 API 时回退 Per-Monitor V1；非 Windows 不调用 Win32 API。实际缩放下的按钮点击仍需在对应 Windows 缩放比例下人工验收。
 
 
 - Observer 两阶段频率抽样
