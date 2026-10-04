@@ -55,7 +55,7 @@
 
 - `manifest.json`、`package.json`、`index.js`
 - `lib/`、`routes/`、`tools/`、`extensions/`、`assets/`、`python/`、`skills/`、`scripts/`
-- `README.md`、`CHANGELOG.md`、`TESTING.md`、`THIRD_PARTY_NOTICES.md`
+- `README.md`、`CHANGELOG.md`、`TESTING.md`、`THIRD_PARTY_NOTICES.md`、`PUBLIC-INDEX.md`（对外快照的格式契约，给读 public-index.json 的消费方）
 - `LICENSE`、`NOTICE`、`COMMERCIAL-LICENSE.md`
 
 明确排除：
