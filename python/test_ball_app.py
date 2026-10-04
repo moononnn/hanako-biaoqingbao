@@ -6,7 +6,8 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["BIAOQINGBAO_BALL_STATE_PATH"] = os.path.join(
@@ -34,6 +35,27 @@ def rendered_bytes(animator):
     animator.paint(painter, QRectF(0, 0, ball_app.BALL_SIZE, ball_app.BALL_SIZE))
     painter.end()
     return bytes(image.bits().asstring(image.sizeInBytes()))
+
+
+class DpiAwarenessTests(unittest.TestCase):
+    def test_windows_uses_per_monitor_v2_context(self):
+        setter = Mock(return_value=True)
+        self.assertTrue(ball_app._set_windows_dpi_awareness(setter, "win32"))
+        self.assertEqual(setter.call_args.args[0].value, __import__("ctypes").c_void_p(-4).value)
+
+    def test_older_windows_falls_back_to_per_monitor_v1(self):
+        user32 = SimpleNamespace(SetProcessDPIAware=Mock(return_value=True))
+        shcore = SimpleNamespace(SetProcessDpiAwareness=Mock(return_value=0))
+        with patch.object(ball_app.sys, "platform", "win32"), patch(
+            "ctypes.WinDLL", side_effect=lambda name, **_kwargs: user32 if name == "user32" else shcore
+        ):
+            self.assertTrue(ball_app._set_windows_dpi_awareness())
+        shcore.SetProcessDpiAwareness.assert_called_once_with(2)
+
+    def test_non_windows_skips_windows_api(self):
+        setter = Mock()
+        self.assertFalse(ball_app._set_windows_dpi_awareness(setter, "linux"))
+        setter.assert_not_called()
 
 
 class BallLayoutTests(unittest.TestCase):

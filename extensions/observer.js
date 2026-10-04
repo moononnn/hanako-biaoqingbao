@@ -205,30 +205,39 @@ export function sanitizeKeywords(raw, maxCount = MAX_KEYWORDS) {
 function injectPrompt(event, emotion, keywords = [], reason = '', query = {}) {
   const kwList = keywords.join('、');
   const because = reason ? `（${reason}）` : '';
-  const kwCallArg = keywords.length ? `, keywords: '${kwList}'` : '';
-  const queryArgs = kwCallArg + (query.scene ? `, scene: '${query.scene}'` : '')
-    + (query.tone ? `, tone: '${query.tone}'` : '')
-    + (query.intensity ? `, intensity: '${query.intensity}'` : '');
-
-  // 通道 A：system 消息
-  event.messages.push({
-    role: 'system',
-    content: `表情包插件感知到你此刻可能有些${emotion}${because}。你可以调用 express 工具发一张表情包来表达这个感受。`
-      + (queryArgs ? `想发图时可带上已识别的情境信息：express({ emotion: '${emotion}'${queryArgs} })。` : ''),
-  });
-
-  // 通道 B：用户消息尾部行动提示
-  const nudge = `\n\n💡 你似乎有些${emotion}。想发图的话，调用 express({ emotion: '${emotion}'${queryArgs} }) 表达这个感受${keywords.length ? '，keywords 传的是刚聊到的具体事物' : ''}`;
+  // 先确认有可追加的真实用户消息，失败时不留下半份提醒。
   let lastUserIdx = -1;
   for (let i = event.messages.length - 1; i >= 0; i--) {
     if (event.messages[i]?.role === 'user') { lastUserIdx = i; break; }
   }
   if (lastUserIdx === -1) return false;
-
   const userMsg = event.messages[lastUserIdx];
+  if (typeof userMsg.content !== 'string' && !Array.isArray(userMsg.content)) return false;
+
+  const args = { emotion };
+  if (keywords.length) args.keywords = kwList;
+  if (query.scene) args.scene = query.scene;
+  if (query.tone) args.tone = query.tone;
+  if (query.intensity) args.intensity = query.intensity;
+  const toolRoute = '发图工具已经提供时直接调用；尚未提供时，先用 tool_search 搜索「biaoqingbao_express」，'
+    + '再用 tool_call 调用 ' + JSON.stringify({ server: 'biaoqingbao', tool: 'biaoqingbao_express', arguments: args }) + '。'
+    + '旧宿主若直接提供 express，则调用同样的参数即可。';
+
+  // 通道 A：Pi 的 context 接收 AgentMessage；system 会被 convertToLlm 丢弃，custom 才能保留。
+  // 仅改请求内存，不写进会话历史；display=false 不额外生成可见聊天消息。
+  event.messages.push({
+    role: 'custom',
+    customType: 'biaoqingbao-expression-hint',
+    display: false,
+    timestamp: Date.now(),
+    content: `表情包插件感知到你此刻可能有些${emotion}${because}。你可以发一张表情包来表达这个感受。` + toolRoute,
+  });
+
+  // 通道 B：保留用户消息尾部行动提示，两条通道都给出完整的工具发现路线。
+  const nudge = `\n\n💡 你似乎有些${emotion}，可以用表情包表达这个感受。` + toolRoute;
   if (typeof userMsg.content === 'string') {
     userMsg.content += nudge;
-  } else if (Array.isArray(userMsg.content)) {
+  } else {
     userMsg.content.push({ type: 'text', text: nudge });
   }
   return true;

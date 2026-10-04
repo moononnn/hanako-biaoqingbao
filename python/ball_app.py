@@ -3509,10 +3509,40 @@ class Ball(QWidget):
         event.accept()
 
 
+def _set_windows_dpi_awareness(setter=None, platform=None):
+    if (platform or sys.platform) != "win32":
+        return False
+    try:
+        import ctypes
+        if setter is None:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            try:
+                setter = user32.SetProcessDpiAwarenessContext
+            except AttributeError:
+                try:
+                    shcore = ctypes.WinDLL("shcore", use_last_error=True)
+                    legacy = shcore.SetProcessDpiAwareness
+                    legacy.argtypes = [ctypes.c_int]
+                    legacy.restype = ctypes.c_long
+                    if legacy(2) == 0:
+                        return True
+                except Exception:
+                    pass
+                fallback = user32.SetProcessDPIAware
+                fallback.restype = ctypes.c_int
+                return bool(fallback())
+            setter.argtypes = [ctypes.c_void_p]
+            setter.restype = ctypes.c_int
+        return bool(setter(ctypes.c_void_p(-4)))
+    except Exception:
+        return False
+
+
 def main():
     if not API_TOKEN:
         print("缺少本地代理令牌", file=sys.stderr)
         return 2
+    _set_windows_dpi_awareness()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     ball = Ball()
