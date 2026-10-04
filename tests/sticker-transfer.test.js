@@ -307,6 +307,7 @@ test('v2 ZIP 可解析，已有同图按哈希复用新 ID并重建全部图片�
       'old-agent': { mappings: [{ context: { emotion: '开心' }, preferred_ids: ['stk_old_a'], vetoed_ids: ['stk_old_b'], dislike_counts: { stk_old_b: 2 } }] },
     } }));
     await fsp.writeFile(path.join(dataDir, 'context-feedback.json'), JSON.stringify({ byAgent: { 'old-agent': { 开心: { stk_old_a: { count: 1, lastAt: '2026-08-01T00:00:00.000Z' } } } } }));
+    await fsp.writeFile(path.join(dataDir, 'agent-fit-notes.json'), JSON.stringify({ version: 1, byAgent: { 'old-agent': { 开心: { stk_old_a: { off: 2, on: 1, lastAt: '2026-08-05T00:00:00.000Z', note: '这张不太搭' } } } } }));
     await fsp.writeFile(path.join(dataDir, 'teaching-samples.json'), JSON.stringify({ samples: { stk_old_a: { description: 'A图', keywords: ['A'], vector: [1] } } }));
 
     const zipPath = path.join(directory, 'move.zip');
@@ -350,6 +351,8 @@ test('v2 ZIP 可解析，已有同图按哈希复用新 ID并重建全部图片�
     assert.deepEqual(mapping.vetoed_ids, ['stk_901']);
     assert.equal(mapping.dislike_counts.stk_901, 2);
     assert.equal(remapped.data.contextFeedback.byAgent['new-agent'].开心.stk_900.count, 1);
+    assert.deepEqual(remapped.data.agentFitNotes.byAgent['new-agent'].开心.stk_900, { off: 2, on: 1, lastAt: '2026-08-05T00:00:00.000Z', note: '这张不太搭' });
+    assert.equal(remapped.report.restored.agentFitNotes, 1);
     assert.equal(Object.hasOwn(remapped.data.teaching.samples, 'stk_900'), true);
     assert.equal('vector' in remapped.data.teaching.samples.stk_900, false);
   });

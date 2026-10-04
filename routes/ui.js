@@ -1363,13 +1363,15 @@ export default async function registerRoutes(app, ctx) {
     const label = c.req.query('label') || '表情包';
     const description = c.req.query('description') || '';
     const score = c.req.query('score') || '';
-    // 临时诊断：确认聊天 iframe 是否真的请求到了插件页面；不记录 token/ticket 原文。
+    // 记录聊天内嵌卡片 iframe 的请求来源（只记 iframe-ticket/query-token/none 三态，不落 token 原文），
+    // 排查「配图卡片不显示」时用得上。
     const authKind = c.req.query('pluginIframeTicket')
       ? 'iframe-ticket'
       : c.req.query('token')
         ? 'query-token'
         : 'none';
     ctx?.log?.info?.(`[biaoqingbao] sticker iframe 请求: id=${id}, auth=${authKind}, surface=${c.req.query('pluginSurfaceSession') ? 'yes' : 'no'}`);
+
 
     if (!id) return c.text('missing id', 400);
 
