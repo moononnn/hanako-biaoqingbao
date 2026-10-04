@@ -10,7 +10,7 @@ npm test
 
 当前覆盖（465 项 Node 测试、81 项 Python 测试；2026-10-04 发布 v0.34.61 前两套均已实跑，全绿）：
 
-- 2026-10-02（v0.34.61）：新增 `tests/feedback-locator.test.js` 4 项。现场：卡片点喜欢/应景一律回 409「这段对话当前不可用于配图反馈」。覆盖同一文件的两种路径写法（junction 旧入口 vs 宿主真实根）判为同一处、按旧入口路径提交的反馈能记上（修前 409）、路径确实指向另一段对话时仍拦下、`session:get` 抛错时日志留下原因而非静默失败。修法：`samePath` 先 normalize 再 realpath 归一；`isDesktopSessionPath` 字面检查不过时把两边都解析成真实路径重试；`sessionForFeedback` 每处拒绝写明 reason + ask/got 现场。前端另把 pending 期间的连点改为排队最后一次点击（`queuedTap`），锁开后接着发，不再静默吞掉第二次点击。独立复核发现“白名单未命中就拒绝”会堵掉宿主列表省略 sessionId 时的 `session:get` 兜底，已改回不早退。全量 465/465 通过，零跳过（Python 81 项本轮未重跑）。另补 2 项「没挪过家的人」回归：路径字面一致时直接放行、不碰文件系统（用不存在的合法路径证明没做多余校验），以及 agents 之外的路径、长得像但不在 agents 下的路径、非 jsonl 一律仍拒绝——确认新增的真实路径回退没有翻口子。宿主 0.1059.0 整目录迁到 D:\HanaHome 后以 junction 保留 C 盘旧入口，真实卡上的点按需实机验收。
+- 2026-10-02（v0.34.61）：新增 `tests/feedback-locator.test.js` 4 项。现场：卡片点喜欢/应景一律回 409「这段对话当前不可用于配图反馈」。覆盖同一文件的两种路径写法（junction 旧入口 vs 宿主真实根）判为同一处、按旧入口路径提交的反馈能记上（修前 409）、路径确实指向另一段对话时仍拦下、`session:get` 抛错时日志留下原因而非静默失败。修法：`samePath` 先 normalize 再 realpath 归一；`isDesktopSessionPath` 字面检查不过时把两边都解析成真实路径重试；`sessionForFeedback` 每处拒绝写明 reason + ask/got 现场。前端另把 pending 期间的连点改为排队最后一次点击（`queuedTap`），锁开后接着发，不再静默吞掉第二次点击。独立复核发现“白名单未命中就拒绝”会堵掉宿主列表省略 sessionId 时的 `session:get` 兜底，已改回不早退。全量 465/465 通过，零跳过（Python 81 项本轮未重跑）。另补 2 项「没挪过家的人」回归：路径字面一致时直接放行、不碰文件系统（用不存在的合法路径证明没做多余校验），以及 agents 之外的路径、长得像但不在 agents 下的路径、非 jsonl 一律仍拒绝——确认新增的真实路径回退没有翻口子。宿主 0.1059.0 整目录迁到新位置后以 junction 保留旧入口，真实卡上的点按需实机验收。
 
 专项命令：`node --test tests/feedback-locator.test.js tests/ball.test.js tests/home-migration.test.js`。
 
