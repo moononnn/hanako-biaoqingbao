@@ -12,6 +12,7 @@ import {
   isAutoApplyEnabled, buildApplyItems, applyItemsToMeta, selectPendingApplyIds,
 } from '../lib/batch-apply.js';
 import { safeStickerPath } from '../lib/ball-core.js';
+import { collectBatchFailures } from '../lib/batch-failures.js';
 import {
   readGroupStore,
   isGroupStoreReadable,
@@ -23,13 +24,17 @@ const BATCH_TASKS_FILE = path.join(DATA_DIR, 'batch-tasks.json');
 
 let moduleCtx = null;  // 在 registerBatchTasksRoutes 里注入
 
-function readBatchTasks() {
+function readBatchTasks(strict = false) {
   try {
     const data = JSON.parse(fs.readFileSync(BATCH_TASKS_FILE, 'utf-8'));
+    if (strict && (!data || !data.tasks || typeof data.tasks !== 'object' || Array.isArray(data.tasks) || !Array.isArray(data.order))) {
+      throw new Error('任务账本格式损坏');
+    }
     if (!data.tasks || typeof data.tasks !== 'object') data.tasks = {};
     if (!Array.isArray(data.order)) data.order = [];
     return data;
-  } catch {
+  } catch (error) {
+    if (strict && error.code !== 'ENOENT') throw error;
     return { version: 1, tasks: {}, order: [] };
   }
 }
@@ -79,6 +84,14 @@ function migrateAppliedState() {
     changed = true;
   }
   if (changed) writeBatchTasks(all);
+}
+
+function readCurrentFailures(all = readBatchTasks(true)) {
+  let meta;
+  try { meta = JSON.parse(fs.readFileSync(META_FILE, 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; meta = []; }
+  if (!Array.isArray(meta)) throw new Error('图库记录格式损坏');
+  return collectBatchFailures(all, meta);
 }
 
 function getTask(id) {
@@ -275,7 +288,7 @@ async function workerLoop(taskId, workerIdx) {
     // 写回结果（v0.19.5 - 走串行队列，mutator 执行前重新读最新任务，避免多 worker 覆盖彼此更新）
     await queuedSave(taskId, (t) => {
       if (t.status !== 'running') return; // 任务已取消/完成，不再写回
-      t.results[stickerId] = result;
+      t.results[stickerId] = { ...result, attempted_at: new Date().toISOString() };
       if (result.ok) {
         t.completed.push(stickerId);
       } else {
@@ -399,8 +412,7 @@ export function requeueFailedItems(task, stickerIds) {
   return { ok: true, requeued };
 }
 
-function listTasks(filter = {}) {
-  const all = readBatchTasks();
+function listTasks(filter = {}, all = readBatchTasks()) {
   let tasks = all.order.map(id => all.tasks[id]).filter(Boolean);
   if (filter.status) {
     tasks = tasks.filter(t => t.status === filter.status);
@@ -568,8 +580,44 @@ export function registerBatchTasksRoutes(app, ctx) {
   // GET /api/batch-tasks — 列出所有任务
   app.get('/api/batch-tasks', async (c) => {
     const status = c.req.query('status') || '';
-    const tasks = listTasks(status ? { status } : {});
-    return jsonResp({ ok: true, data: tasks });
+    try {
+      const all = readBatchTasks(true);
+      const tasks = listTasks(status ? { status } : {}, all);
+      const failures = readCurrentFailures(all);
+      return jsonResp({ ok: true, data: tasks, failures });
+    } catch (error) {
+      return jsonResp({ ok: false, error: '读取识图任务失败：' + error.message }, 500);
+    }
+  });
+
+  // 失败角标与列表使用同一份去重清单，不把已成功或正在重试的图算进去。
+  app.get('/api/batch-failures', async () => {
+    try {
+      return jsonResp({ ok: true, data: readCurrentFailures() });
+    } catch (error) {
+      return jsonResp({ ok: false, error: '读取失败图片失败：' + error.message }, 500);
+    }
+  });
+
+  app.post('/api/batch-failures/retry', async (c) => {
+    try {
+      const body = await c.req.json();
+      if (!Array.isArray(body?.sticker_ids) || body.sticker_ids.some(id => typeof id !== 'string' || !id)) {
+        return jsonResp({ ok: false, error: '缺少有效的 sticker_ids' }, 400);
+      }
+      // 在创建任务前回查当前状态，挡住双击、旧页面和已由别处识别成功的图。
+      const requested = new Set(body.sticker_ids);
+      const failures = readCurrentFailures();
+      const ids = failures.items.map(item => item.id).filter(id => requested.has(id));
+      if (ids.length === 0) return jsonResp({ ok: false, error: '这些图片已成功或已在重试，请刷新列表' }, 409);
+      const taskIds = [];
+      for (let offset = 0; offset < ids.length; offset += 1000) {
+        taskIds.push(createBatchTask(ids.slice(offset, offset + 1000), 2).id);
+      }
+      return jsonResp({ ok: true, data: { taskId: taskIds[0], taskIds, total: ids.length }, message: `已将 ${ids.length} 张失败图片加入重新识图队列` });
+    } catch (error) {
+      return jsonResp({ ok: false, error: '创建重试任务失败：' + error.message }, 500);
+    }
   });
 
   // GET /api/batch-task/:id — 查任务详情
